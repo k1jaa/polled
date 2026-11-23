@@ -54,15 +54,17 @@ To protect your mouse's onboard flash from excessive erase/write cycles:
 
 ---
 
-## Supported Devices
+## Supported Devices & Protocol Families
 
-Every hardware backend in Polled is explicitly labeled by verification status:
+Polled organizes device backends by **protocol family** rather than single models, automatically detecting compatible mice across brands via their USB HID report descriptors and hot-plugging seamlessly when you swap mice. Every backend is labeled by verification status:
 
-| Device | VID:PID | Status | Volatile RAM Writes | Protocol Source & License |
+| Protocol Family / Device | VID:PID | Status | Volatile RAM Writes | Protocol Source & License |
 | --- | --- | --- | :---: | --- |
 | Dry-Run Virtual Mouse | *(simulated)* | Built-in simulator | Configurable | Internal test backend |
-| Pulsar X2 CrazyLight Wireless (8K Dongle) | `3710:5406` | **Implemented from docs** *(awaiting hardware sign-off on Mini)* | No (diffed + rate-limited) | [packerlschupfer/pulsar-mouse-linux](https://github.com/packerlschupfer/pulsar-mouse-linux) (MIT) |
-| Pulsar X2 CrazyLight Wired (USB-C, 1K max) | `3710:3414` | **Implemented from docs** *(awaiting hardware sign-off on Mini)* | No (diffed + rate-limited) | [packerlschupfer/pulsar-mouse-linux](https://github.com/packerlschupfer/pulsar-mouse-linux) (MIT) |
+| **Compx / Nordic 17B (`0xFF02` / Report `0x08`)** — Pulsar X2 CrazyLight Mini (`cid=0x57, mid=0x01`) & X2 CrazyLight | `3710:5406` (8K), `3710:3414` (Wired) | **Implemented from docs** *(read verified on Mini)* | No (diffed + rate-limited) | [packerlschupfer/pulsar-mouse-linux](https://github.com/packerlschupfer/pulsar-mouse-linux) (MIT) |
+| **Compx / Nordic 17B (`0xFF02` / Report `0x08`)** — LAMZU 4K / 1K / Wired & Pulsar Nordic (`X2A`, `Xlite V3`, `X2V2`) | `3554:f510`, `3554:f50d`, `3554:f50f`, `3554:f507..f509` | **Implemented from docs** | No (diffed + rate-limited) | [LeadSun/lamzu-cfg](https://github.com/LeadSun/lamzu-cfg) (MIT/Apache-2.0), [anany1702/lamzu-ctl](https://github.com/anany1702/lamzu-ctl) (MIT) |
+| **Compx / Nordic 17B (`0xFF02` / Report `0x08`)** — Generic Compx `0x3554:*` auto-detected mice | `3554:*` (`0xFF02` 17B) | **Implemented from docs** | No (diffed + rate-limited) | Shared Compx CX52850 protocol |
+| Vancer × Arbiter Studio Akitsu (`0xFFFF` 64B Feature) | `373e:000a` | Planned *(pending USBPcap capture for DPI/LOD/debounce)* | TBD | Not guessed |
 
 > **Protocol policy:** Polled never guesses HID report bytes. Backends are implemented strictly from documented, license-compatible open-source protocols or real USBPcap/Wireshark captures.
 

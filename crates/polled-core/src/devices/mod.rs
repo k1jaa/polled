@@ -2,9 +2,9 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod compx;
 pub mod controller;
 pub mod dry_run;
-pub mod pulsar;
 
 use std::fmt;
 
@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{PolledError, Result};
 
+pub use compx::{CompxDevice, CompxProtocolDriver};
 pub use controller::{ApplyOutcome, SafeDeviceController};
 pub use dry_run::DryRunDevice;
-pub use pulsar::{PulsarX2CrazyLightDevice, PulsarX2CrazyLightDriver};
 
 /// Explicitly communicates how a device backend was verified (surfaced in UI and README).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,13 +257,13 @@ pub trait DeviceDriver: Send + Sync {
     fn detect(&self, api: &HidApi) -> Result<Vec<Box<dyn MouseDevice>>>;
 }
 
-/// Runs all registered hardware drivers against connected USB/HID devices.
+/// Runs all registered protocol-family drivers against connected USB/HID devices.
 pub fn detect_hardware_devices() -> Result<Vec<Box<dyn MouseDevice>>> {
     let api = HidApi::new().map_err(|e| PolledError::Win32 {
         context: "HidApi::new".to_string(),
         message: e.to_string(),
     })?;
-    let drivers: Vec<Box<dyn DeviceDriver>> = vec![Box::new(PulsarX2CrazyLightDriver)];
+    let drivers: Vec<Box<dyn DeviceDriver>> = vec![Box::new(CompxProtocolDriver)];
     let mut devices = Vec::new();
     for driver in &drivers {
         if let Ok(found) = driver.detect(&api) {
@@ -271,4 +271,20 @@ pub fn detect_hardware_devices() -> Result<Vec<Box<dyn MouseDevice>>> {
         }
     }
     Ok(devices)
+}
+
+/// Lightweight fingerprint of currently attached USB HID VID:PID pairs (zero open device handles),
+/// used by the GUI runtime to detect USB mouse plug/unplug events automatically.
+pub fn hid_topology_fingerprint() -> Vec<(u16, u16, u16, u16)> {
+    let Ok(api) = HidApi::new() else {
+        return Vec::new();
+    };
+    let mut fp: Vec<(u16, u16, u16, u16)> = api
+        .device_list()
+        .filter(|d| d.usage_page() >= 0xFF00)
+        .map(|d| (d.vendor_id(), d.product_id(), d.usage_page(), d.usage()))
+        .collect();
+    fp.sort_unstable();
+    fp.dedup();
+    fp
 }

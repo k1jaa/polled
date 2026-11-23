@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Background profile-switching runtime connecting `ForegroundWatcher` -> `FocusDebouncer`
-//! -> `match_profile` -> `SafeDeviceController` (+ optional Windows pointer speed).
+//! -> `match_profile` -> multi-mouse `SafeDeviceController` (+ optional Windows pointer speed),
+//! with automatic USB hot-plug discovery across multiple mice.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -12,20 +13,23 @@ use chrono::Local;
 use eframe::egui;
 use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
-    detect_hardware_devices, match_profile, AppPaths, ApplyOutcome, DeviceCapabilities, DeviceInfo,
-    DryRunDevice, FocusDebouncer, FocusEvent, ForegroundWatcher, GameProfile, MouseDevice,
-    MouseSettings, ProfileStore, SafeDeviceController, Severity,
+    detect_hardware_devices, hid_topology_fingerprint, match_profile, AppPaths, ApplyOutcome,
+    DeviceCapabilities, DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent, ForegroundWatcher,
+    GameProfile, MouseDevice, MouseSettings, ProfileStore, SafeDeviceController, Severity,
 };
 
 use crate::app::WorkerMsg;
 
 const MAX_LOG_ENTRIES: usize = 50;
+const HOTPLUG_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendSelection {
+    /// Automatically detects USB hot-plug changes and applies profiles to all connected supported mice.
+    AutoConnected,
+    HardwareIndex(usize),
     DryRunVolatile,
     DryRunFlashOnly,
-    HardwareIndex(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -36,18 +40,25 @@ pub struct ProfileLogEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConnectedDeviceStatus {
+    pub info: DeviceInfo,
+    pub settings: Option<MouseSettings>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ProfileRuntimeSnapshot {
     pub auto_switch_enabled: bool,
     pub selection: BackendSelection,
     pub detected_hardware: Vec<DeviceInfo>,
-    pub active_device_info: DeviceInfo,
-    pub active_device_caps: DeviceCapabilities,
-    pub current_device_settings: Option<MouseSettings>,
+    pub active_devices: Vec<ConnectedDeviceStatus>,
+    pub primary_caps: DeviceCapabilities,
+    pub any_flash_only: bool,
+    pub flash_warning: Option<String>,
     pub foreground_exe: Option<String>,
     pub pending_exe: Option<String>,
     pub active_profile_id: String,
     pub active_profile_name: String,
-    pub flash_writes_this_session: u64,
+    pub total_flash_writes_session: u64,
     pub log: Vec<ProfileLogEntry>,
 }
 
@@ -93,13 +104,19 @@ impl Drop for ProfileRuntimeHandle {
     }
 }
 
+struct ManagedController {
+    controller: SafeDeviceController,
+    last_settings: Option<MouseSettings>,
+}
+
 struct RuntimeState {
     store: ProfileStore,
     auto_switch_enabled: bool,
     selection: BackendSelection,
     detected_hardware_info: Vec<DeviceInfo>,
-    controller: SafeDeviceController,
-    current_device_settings: Option<MouseSettings>,
+    controllers: Vec<ManagedController>,
+    last_topology: Vec<(u16, u16, u16, u16)>,
+    last_topology_check: Instant,
     debouncer: FocusDebouncer,
     watcher: Option<ForegroundWatcher>,
     focus_rx: Option<Receiver<FocusEvent>>,
@@ -124,18 +141,51 @@ impl RuntimeState {
 
     fn snapshot(&self) -> ProfileRuntimeSnapshot {
         let pending_exe = self.debouncer.pending_exe().flatten().map(str::to_string);
+
+        let active_devices: Vec<ConnectedDeviceStatus> = self
+            .controllers
+            .iter()
+            .map(|m| ConnectedDeviceStatus {
+                info: m.controller.info(),
+                settings: m.last_settings.clone(),
+            })
+            .collect();
+
+        let primary_caps = self
+            .controllers
+            .first()
+            .map(|m| m.controller.capabilities())
+            .unwrap_or_else(|| DryRunDevice::new_volatile().capabilities());
+
+        let any_flash_only = self
+            .controllers
+            .iter()
+            .any(|m| !m.controller.capabilities().supports_volatile_writes);
+
+        let flash_warning = self
+            .controllers
+            .iter()
+            .find_map(|m| m.controller.capabilities().flash_write_warning);
+
+        let total_flash_writes_session = self
+            .controllers
+            .iter()
+            .map(|m| m.controller.flash_writes_this_session())
+            .sum();
+
         ProfileRuntimeSnapshot {
             auto_switch_enabled: self.auto_switch_enabled,
             selection: self.selection.clone(),
             detected_hardware: self.detected_hardware_info.clone(),
-            active_device_info: self.controller.info(),
-            active_device_caps: self.controller.capabilities(),
-            current_device_settings: self.current_device_settings.clone(),
+            active_devices,
+            primary_caps,
+            any_flash_only,
+            flash_warning,
             foreground_exe: self.foreground_exe.clone(),
             pending_exe,
             active_profile_id: self.active_profile_id.clone(),
             active_profile_name: self.active_profile_name.clone(),
-            flash_writes_this_session: self.controller.flash_writes_this_session(),
+            total_flash_writes_session,
             log: self.log.clone(),
         }
     }
@@ -176,11 +226,119 @@ impl RuntimeState {
         self.focus_rx = None;
     }
 
+    fn rebuild_controllers(&mut self, selection: BackendSelection, reason: &str) {
+        let mut hardware = detect_hardware_devices().unwrap_or_default();
+        self.detected_hardware_info = hardware.iter().map(|d| d.info()).collect();
+        self.last_topology = hid_topology_fingerprint();
+        self.last_topology_check = Instant::now();
+
+        let mut next_controllers: Vec<ManagedController> = Vec::new();
+        let effective_selection = match selection {
+            BackendSelection::AutoConnected => {
+                if hardware.is_empty() {
+                    let mut ctrl =
+                        SafeDeviceController::new(Box::new(DryRunDevice::new_volatile()));
+                    let settings = ctrl.read_settings().ok();
+                    next_controllers.push(ManagedController {
+                        controller: ctrl,
+                        last_settings: settings,
+                    });
+                } else {
+                    for dev in hardware {
+                        let mut ctrl = SafeDeviceController::new(dev);
+                        let settings = ctrl.read_settings().ok();
+                        next_controllers.push(ManagedController {
+                            controller: ctrl,
+                            last_settings: settings,
+                        });
+                    }
+                }
+                BackendSelection::AutoConnected
+            }
+            BackendSelection::HardwareIndex(idx) => {
+                if idx < hardware.len() {
+                    let mut ctrl = SafeDeviceController::new(hardware.remove(idx));
+                    let settings = ctrl.read_settings().ok();
+                    next_controllers.push(ManagedController {
+                        controller: ctrl,
+                        last_settings: settings,
+                    });
+                    BackendSelection::HardwareIndex(idx)
+                } else {
+                    self.push_log(
+                        Severity::Warn,
+                        "Selected mouse was disconnected; switching back to Auto (Connected Mice).",
+                    );
+                    return self.rebuild_controllers(BackendSelection::AutoConnected, reason);
+                }
+            }
+            BackendSelection::DryRunVolatile => {
+                let mut ctrl = SafeDeviceController::new(Box::new(DryRunDevice::new_volatile()));
+                let settings = ctrl.read_settings().ok();
+                next_controllers.push(ManagedController {
+                    controller: ctrl,
+                    last_settings: settings,
+                });
+                BackendSelection::DryRunVolatile
+            }
+            BackendSelection::DryRunFlashOnly => {
+                let mut ctrl = SafeDeviceController::new(Box::new(DryRunDevice::new_flash_only()));
+                let settings = ctrl.read_settings().ok();
+                next_controllers.push(ManagedController {
+                    controller: ctrl,
+                    last_settings: settings,
+                });
+                BackendSelection::DryRunFlashOnly
+            }
+        };
+
+        self.selection = effective_selection;
+        self.controllers = next_controllers;
+
+        let summary: Vec<String> = self
+            .controllers
+            .iter()
+            .map(|m| {
+                let info = m.controller.info();
+                match &m.last_settings {
+                    Some(s) => format!("{} ({})", info.name, s.summary_string()),
+                    None => format!("{} (asleep / move mouse to wake)", info.name),
+                }
+            })
+            .collect();
+
+        self.push_log(
+            Severity::Info,
+            format!("Devices ({reason}): {}", summary.join(" | ")),
+        );
+    }
+
+    /// Checks whether USB HID devices were plugged in or unplugged and auto-refreshes when changed.
+    fn check_hotplug(&mut self) -> bool {
+        if !matches!(
+            self.selection,
+            BackendSelection::AutoConnected | BackendSelection::HardwareIndex(_)
+        ) {
+            return false;
+        }
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_topology_check) < HOTPLUG_CHECK_INTERVAL {
+            return false;
+        }
+        self.last_topology_check = now;
+        let current_fp = hid_topology_fingerprint();
+        if current_fp == self.last_topology {
+            return false;
+        }
+        let sel = self.selection.clone();
+        self.rebuild_controllers(sel, "USB hot-plug");
+        true
+    }
+
     fn apply_profile(&mut self, profile: &GameProfile, reason: &str) {
         self.active_profile_id = profile.id.clone();
         self.active_profile_name = profile.name.clone();
 
-        // Optional Windows pointer speed override (user-level SPI, no admin).
         if let Some(speed) = profile.windows_pointer_speed {
             let env = WindowsEnv;
             if let Ok(current) = env.get_mouse_speed() {
@@ -199,95 +357,57 @@ impl RuntimeState {
             }
         }
 
-        // Apply mouse hardware settings through SafeDeviceController (diff + flash guard + read-back).
-        match self.controller.apply_profile_settings(&profile.mouse) {
-            Ok(ApplyOutcome::SkippedNoSettings) => {
-                self.push_log(
-                    Severity::Info,
-                    format!("Profile '{}' ({reason}): no mouse changes.", profile.name),
-                );
-            }
-            Ok(ApplyOutcome::SkippedUnchanged { current }) => {
-                self.current_device_settings = Some(current.clone());
-                self.push_log(
-                    Severity::Ok,
-                    format!(
-                        "Profile '{}' ({reason}): mouse already matches ({}) — 0 writes.",
-                        profile.name,
-                        current.summary_string()
-                    ),
-                );
-            }
-            Ok(ApplyOutcome::Applied {
-                mode,
-                verified,
-                flash_writes_this_session,
-            }) => {
-                self.current_device_settings = Some(verified.clone());
-                self.push_log(
-                    Severity::Ok,
-                    format!(
-                        "Applied '{}' ({reason}) via {mode:?} & verified read-back: {} (session flash writes: {flash_writes_this_session}).",
-                        profile.name,
-                        verified.summary_string()
-                    ),
-                );
-            }
-            Err(err) => {
-                // Re-read current state after an error/rollback so UI reflects hardware truth.
-                if let Ok(actual) = self.controller.read_settings() {
-                    self.current_device_settings = Some(actual);
+        let mut logs: Vec<(Severity, String)> = Vec::new();
+        for managed in &mut self.controllers {
+            let dev_name = managed.controller.info().name;
+            match managed.controller.apply_profile_settings(&profile.mouse) {
+                Ok(ApplyOutcome::SkippedNoSettings) => {
+                    logs.push((
+                        Severity::Info,
+                        format!("[{dev_name}] '{}': no mouse changes.", profile.name),
+                    ));
                 }
-                self.push_log(
-                    Severity::Bad,
-                    format!("Profile '{}' ({reason}): {err}", profile.name),
-                );
+                Ok(ApplyOutcome::SkippedUnchanged { current }) => {
+                    managed.last_settings = Some(current.clone());
+                    logs.push((
+                        Severity::Ok,
+                        format!(
+                            "[{dev_name}] '{}' ({reason}): already matches ({}) — 0 writes.",
+                            profile.name,
+                            current.summary_string()
+                        ),
+                    ));
+                }
+                Ok(ApplyOutcome::Applied {
+                    mode,
+                    verified,
+                    flash_writes_this_session,
+                }) => {
+                    managed.last_settings = Some(verified.clone());
+                    logs.push((
+                        Severity::Ok,
+                        format!(
+                            "[{dev_name}] Applied '{}' ({reason}) via {mode:?} & verified: {} (flash writes: {flash_writes_this_session}).",
+                            profile.name,
+                            verified.summary_string()
+                        ),
+                    ));
+                }
+                Err(err) => {
+                    if let Ok(actual) = managed.controller.read_settings() {
+                        managed.last_settings = Some(actual);
+                    }
+                    logs.push((
+                        Severity::Warn,
+                        format!("[{dev_name}] '{}' ({reason}): {err}", profile.name),
+                    ));
+                }
             }
         }
-    }
 
-    fn select_backend(&mut self, selection: BackendSelection) {
-        let mut hardware = detect_hardware_devices().unwrap_or_default();
-        self.detected_hardware_info = hardware.iter().map(|d| d.info()).collect();
-
-        let (chosen_selection, device): (BackendSelection, Box<dyn MouseDevice>) = match selection {
-            BackendSelection::DryRunVolatile => (
-                BackendSelection::DryRunVolatile,
-                Box::new(DryRunDevice::new_volatile()),
-            ),
-            BackendSelection::DryRunFlashOnly => (
-                BackendSelection::DryRunFlashOnly,
-                Box::new(DryRunDevice::new_flash_only()),
-            ),
-            BackendSelection::HardwareIndex(idx) => {
-                if idx < hardware.len() {
-                    (BackendSelection::HardwareIndex(idx), hardware.remove(idx))
-                } else {
-                    self.push_log(
-                        Severity::Warn,
-                        "Selected hardware mouse is no longer connected; falling back to Dry-Run.",
-                    );
-                    (
-                        BackendSelection::DryRunVolatile,
-                        Box::new(DryRunDevice::new_volatile()),
-                    )
-                }
-            }
-        };
-
-        let info = device.info();
-        self.selection = chosen_selection;
-        self.controller = SafeDeviceController::new(device);
-        self.current_device_settings = self.controller.read_settings().ok();
-
-        self.push_log(
-            Severity::Info,
-            format!(
-                "Selected device: {} [{}]",
-                info.name,
-                info.support_tier.label()
-            ),
-        );
+        for (sev, msg) in logs {
+            self.push_log(sev, msg);
+        }
     }
 }
 
@@ -297,24 +417,7 @@ fn run_runtime_loop(
     ui_tx: Sender<WorkerMsg>,
     ctx: egui::Context,
 ) {
-    let mut hardware = detect_hardware_devices().unwrap_or_default();
-    let detected_hardware_info: Vec<DeviceInfo> = hardware.iter().map(|d| d.info()).collect();
-
-    // Auto-select detected hardware if present; otherwise default safely to Dry-Run simulator.
-    let (selection, initial_device): (BackendSelection, Box<dyn MouseDevice>) =
-        if !hardware.is_empty() {
-            (BackendSelection::HardwareIndex(0), hardware.remove(0))
-        } else {
-            (
-                BackendSelection::DryRunVolatile,
-                Box::new(DryRunDevice::new_volatile()),
-            )
-        };
-
-    let mut controller = SafeDeviceController::new(initial_device);
-    let current_device_settings = controller.read_settings().ok();
     let debounce = Duration::from_millis(initial_store.debounce_ms);
-
     let desktop_name = initial_store
         .profiles
         .iter()
@@ -325,10 +428,11 @@ fn run_runtime_loop(
     let mut state = RuntimeState {
         store: initial_store,
         auto_switch_enabled: false,
-        selection,
-        detected_hardware_info,
-        controller,
-        current_device_settings,
+        selection: BackendSelection::AutoConnected,
+        detected_hardware_info: Vec::new(),
+        controllers: Vec::new(),
+        last_topology: Vec::new(),
+        last_topology_check: Instant::now(),
         debouncer: FocusDebouncer::new(debounce),
         watcher: None,
         focus_rx: None,
@@ -338,30 +442,22 @@ fn run_runtime_loop(
         log: Vec::new(),
     };
 
-    state.push_log(
-        Severity::Info,
-        format!(
-            "Ready on {} ({}). Auto-switching is paused until enabled.",
-            state.controller.info().name,
-            state.controller.info().support_tier.label()
-        ),
-    );
+    state.rebuild_controllers(BackendSelection::AutoConnected, "startup auto-detect");
     state.emit(&ui_tx, &ctx);
 
     loop {
-        // Drain any foreground window events pushed by the Win32 hook thread.
-        let mut focus_changed = false;
+        let mut changed = state.check_hotplug();
+
         if let Some(rx) = &state.focus_rx {
             while let Ok(evt) = rx.try_recv() {
                 state.foreground_exe = evt.exe_name.clone();
                 state
                     .debouncer
                     .observe(evt.exe_name.as_deref(), evt.observed_at);
-                focus_changed = true;
+                changed = true;
             }
         }
 
-        // Check if the debounced focus change is now stable and ready to commit.
         if state.auto_switch_enabled {
             if let Some(committed_exe) = state.debouncer.poll_ready(Instant::now()) {
                 let matched = match_profile(&state.store, committed_exe.as_deref()).cloned();
@@ -371,31 +467,27 @@ fn run_runtime_loop(
                         .map(|e| format!("focus: {e}"))
                         .unwrap_or_else(|| "focus: desktop".to_string());
                     state.apply_profile(&profile, &reason);
-                    focus_changed = true;
+                    changed = true;
                 }
             }
         }
 
-        if focus_changed {
+        if changed {
             state.emit(&ui_tx, &ctx);
         }
 
-        // Choose wait timeout:
-        // - If a focus change is pending debounce, wake precisely when ready (capped at 100ms).
-        // - If watcher is running without a pending change, wake every 150ms to check `focus_rx`.
-        // - If auto-switch is off, block indefinitely on `cmd_rx` (0.0% CPU!).
-        let cmd_result = if !state.auto_switch_enabled {
-            cmd_rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        let wait = if !state.auto_switch_enabled {
+            // Still check USB hot-plug every 2s so plugging in a new mouse updates the UI live.
+            HOTPLUG_CHECK_INTERVAL
         } else {
-            let wait = state
+            state
                 .debouncer
                 .time_until_ready(Instant::now())
                 .map(|rem| rem.min(Duration::from_millis(100)))
-                .unwrap_or(Duration::from_millis(150));
-            cmd_rx.recv_timeout(wait)
+                .unwrap_or(Duration::from_millis(150))
         };
 
-        match cmd_result {
+        match cmd_rx.recv_timeout(wait) {
             Ok(ProfileRuntimeCmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                 state.stop_watcher();
                 break;
@@ -421,12 +513,12 @@ fn run_runtime_loop(
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::SelectBackend(sel)) => {
-                state.select_backend(sel);
+                state.rebuild_controllers(sel, "manual selection");
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::RedetectHardware) => {
-                let current_sel = state.selection.clone();
-                state.select_backend(current_sel);
+                let sel = state.selection.clone();
+                state.rebuild_controllers(sel, "manual redetect");
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::ApplyProfileNow(profile_id)) => {

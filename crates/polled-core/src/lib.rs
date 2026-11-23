@@ -15,9 +15,9 @@ pub use checks::{
     UndoSummary,
 };
 pub use devices::{
-    detect_hardware_devices, ApplyOutcome, DeviceCapabilities, DeviceDriver, DeviceInfo,
-    DryRunDevice, LiftOffDistance, MouseDevice, MouseSettings, PulsarX2CrazyLightDevice,
-    PulsarX2CrazyLightDriver, SafeDeviceController, SupportTier, WriteMode,
+    detect_hardware_devices, hid_topology_fingerprint, ApplyOutcome, CompxDevice,
+    CompxProtocolDriver, DeviceCapabilities, DeviceDriver, DeviceInfo, DryRunDevice,
+    LiftOffDistance, MouseDevice, MouseSettings, SafeDeviceController, SupportTier, WriteMode,
 };
 pub use error::{PolledError, Result};
 pub use hid::{dump_hid_devices, HidDeviceDump, HidDumpReport};

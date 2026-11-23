@@ -148,20 +148,46 @@ impl ProfilesUiState {
 
                 let current_label = snap
                     .as_ref()
-                    .map(|s| {
-                        format!(
-                            "{} [{}]",
-                            s.active_device_info.name,
-                            s.active_device_info.support_tier.label()
-                        )
+                    .map(|s| match s.selection {
+                        BackendSelection::AutoConnected => {
+                            if s.detected_hardware.is_empty() {
+                                "Auto (No hardware — Dry-Run active)".to_string()
+                            } else if s.detected_hardware.len() == 1 {
+                                format!("Auto: {}", s.detected_hardware[0].name)
+                            } else {
+                                format!("Auto ({} mice connected)", s.detected_hardware.len())
+                            }
+                        }
+                        BackendSelection::HardwareIndex(idx) => s
+                            .detected_hardware
+                            .get(idx)
+                            .map(|hw| format!("{} [{}]", hw.name, hw.support_tier.label()))
+                            .unwrap_or_else(|| "Hardware".to_string()),
+                        BackendSelection::DryRunVolatile => {
+                            "Dry-Run Virtual Mouse (Volatile RAM)".to_string()
+                        }
+                        BackendSelection::DryRunFlashOnly => {
+                            "Dry-Run Virtual Mouse (Flash-Only)".to_string()
+                        }
                     })
-                    .unwrap_or_else(|| "Initializing...".to_string());
+                    .unwrap_or_else(|| "Detecting...".to_string());
 
                 egui::ComboBox::from_id_salt("device_selector")
                     .selected_text(current_label)
                     .width(340.0)
                     .show_ui(ui, |ui| {
                         if let Some(s) = &snap {
+                            if ui
+                                .selectable_label(
+                                    s.selection == BackendSelection::AutoConnected,
+                                    "Auto (All Connected Mice — Hot-Plug)",
+                                )
+                                .clicked()
+                            {
+                                runtime.send(ProfileRuntimeCmd::SelectBackend(
+                                    BackendSelection::AutoConnected,
+                                ));
+                            }
                             for (idx, hw) in s.detected_hardware.iter().enumerate() {
                                 let text = format!(
                                     "{} ({}) [{}]",
@@ -249,23 +275,28 @@ impl ProfilesUiState {
                     let fg_text = s.foreground_exe.as_deref().unwrap_or("(none)");
                     status_pill(ui, p, "FOREGROUND", fg_text);
                     status_pill(ui, p, "ACTIVE PROFILE", &s.active_profile_name);
-                    if let Some(cur) = &s.current_device_settings {
-                        status_pill(ui, p, "MOUSE", &cur.summary_string());
+                    for dev in &s.active_devices {
+                        let summary = dev
+                            .settings
+                            .as_ref()
+                            .map(|st| st.summary_string())
+                            .unwrap_or_else(|| "asleep / move mouse".to_string());
+                        status_pill(ui, p, &dev.info.name.to_uppercase(), &summary);
                     }
                     if let Some(pending) = &s.pending_exe {
                         status_pill(ui, p, "DEBOUNCING", pending);
                     }
-                    if !s.active_device_caps.supports_volatile_writes {
+                    if s.any_flash_only {
                         status_pill(
                             ui,
                             p,
                             "FLASH WRITES",
-                            &s.flash_writes_this_session.to_string(),
+                            &s.total_flash_writes_session.to_string(),
                         );
                     }
                 });
 
-                if let Some(warn) = &s.active_device_caps.flash_write_warning {
+                if let Some(warn) = &s.flash_warning {
                     ui.add_space(6.0);
                     semantic_banner(ui, p, mode, Severity::Warn, warn);
                 }
@@ -465,7 +496,7 @@ impl ProfilesUiState {
 
                     ui.add_space(10.0);
 
-                    let caps = snap.as_ref().map(|s| s.active_device_caps.clone());
+                    let caps = snap.as_ref().map(|s| s.primary_caps.clone());
                     let dpi_min = caps.as_ref().map_or(50, |c| c.dpi_min);
                     let dpi_max = caps.as_ref().map_or(32000, |c| c.dpi_max);
                     let dpi_step = caps.as_ref().map_or(10, |c| c.dpi_step);
