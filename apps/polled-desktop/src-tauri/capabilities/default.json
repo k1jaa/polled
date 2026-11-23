@@ -1,9 +1,0 @@
-{
-  "identifier": "default",
-  "description": "Default capability for Polled's main window and regression notifications",
-  "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "notification:default"
-  ]
-}

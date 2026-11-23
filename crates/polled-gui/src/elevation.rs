@@ -37,7 +37,7 @@ fn validate_check_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Locates `polled.exe` beside the desktop binary (or falls back to `polled.exe` in PATH).
+/// Locates `polled.exe` beside `polled-gui.exe` (falling back to `polled.exe` on `PATH`).
 fn find_cli_binary() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -51,7 +51,7 @@ fn find_cli_binary() -> PathBuf {
 }
 
 /// Spawns `polled.exe` with the `"runas"` verb (Windows UAC) for a single explicit action,
-/// forwarding the current user's `--data-dir` so snapshots stay in the user's `%LOCALAPPDATA%\Polled`.
+/// passing the current user's `--data-dir` so snapshots stay in `%LOCALAPPDATA%\Polled`.
 pub fn run_elevated_cli(action: ElevatedAction<'_>, paths: &AppPaths) -> Result<(), String> {
     let data_dir = paths.root().display().to_string();
     let args = match action {
@@ -81,7 +81,7 @@ pub fn run_elevated_cli(action: ElevatedAction<'_>, paths: &AppPaths) -> Result<
         ..Default::default()
     };
 
-    // SAFETY: All wide strings remain alive until after `ShellExecuteExW` returns.
+    // SAFETY: All UTF-16 buffers stay alive until after `ShellExecuteExW` returns.
     if let Err(err) = unsafe { ShellExecuteExW(&mut sei) } {
         if err.code() == ERROR_CANCELLED.to_hresult() {
             return Err("Administrator elevation was cancelled by the user.".to_string());
@@ -96,7 +96,6 @@ pub fn run_elevated_cli(action: ElevatedAction<'_>, paths: &AppPaths) -> Result<
         return Err("Elevated helper launched without a valid process handle.".to_string());
     }
 
-    // Wait for the elevated single-fix CLI invocation to complete, then inspect its exit code.
     // SAFETY: `sei.hProcess` is a valid process handle returned by `ShellExecuteExW`.
     let exit_code = unsafe {
         WaitForSingleObject(sei.hProcess, INFINITE);
@@ -110,7 +109,7 @@ pub fn run_elevated_cli(action: ElevatedAction<'_>, paths: &AppPaths) -> Result<
         Ok(())
     } else {
         Err(format!(
-            "Elevated helper exited with code {exit_code}. Make sure '{}' is present beside the app.",
+            "Elevated helper exited with code {exit_code}. Ensure '{}' is next to polled-gui.exe.",
             cli_path.display()
         ))
     }

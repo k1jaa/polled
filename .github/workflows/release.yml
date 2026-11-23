@@ -18,19 +18,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: apps/polled-desktop/package-lock.json
-
-      - name: Build React frontend
-        working-directory: apps/polled-desktop
-        run: |
-          npm ci
-          npm run build
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -40,8 +27,8 @@ jobs:
       - name: Run tests before packaging
         run: cargo test --workspace
 
-      - name: Build release binaries (CLI + Desktop tray app)
-        run: cargo build --release -p polled-cli -p polled-desktop
+      - name: Build release binaries (CLI + GUI tray app)
+        run: cargo build --release -p polled-cli -p polled-gui
 
       - name: Package portable zip & SHA-256 checksums
         shell: pwsh
@@ -51,7 +38,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
           Copy-Item "target/release/polled.exe" "$stage/polled.exe"
-          Copy-Item "target/release/polled-desktop.exe" "$stage/polled-desktop.exe"
+          Copy-Item "target/release/polled-gui.exe" "$stage/polled-gui.exe"
           Copy-Item "LICENSE" "$stage/LICENSE"
           Copy-Item "README.md" "$stage/README.md"
 

@@ -2,16 +2,19 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
+use eframe::egui;
+use notify_rust::Notification;
 use polled_core::checks::state::PolledState;
 use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{AppPaths, HealthEngine, ScanSummary};
-use tauri::AppHandle;
-use tauri_plugin_notification::NotificationExt;
 
-/// Sends a Windows notification *only* if one or more health checks got worse since the last scan.
-pub fn notify_if_regressed(app: &AppHandle, summary: &ScanSummary) {
+use crate::app::WorkerMsg;
+
+/// Sends a Windows notification *only* if one or more health checks regressed.
+pub fn notify_if_regressed(summary: &ScanSummary) {
     if summary.regressions.is_empty() {
         return;
     }
@@ -21,6 +24,7 @@ pub fn notify_if_regressed(app: &AppHandle, summary: &ScanSummary) {
         .iter()
         .map(|r| r.name.as_str())
         .collect();
+
     let title = if summary.windows_build_changed {
         "Polled: Windows update changed input settings"
     } else {
@@ -40,24 +44,17 @@ pub fn notify_if_regressed(app: &AppHandle, summary: &ScanSummary) {
         )
     };
 
-    let _ = app.notification().builder().title(title).body(body).show();
+    let _ = Notification::new().summary(title).body(&body).show();
 }
 
-/// Starts a lightweight background thread that:
-/// 1. Runs an initial health scan on startup (notifying *only* on regressions).
-/// 2. Periodically checks whether the Windows build/UBR changed (e.g. after Windows Update)
-///    and re-scans if so.
-pub fn spawn_startup_and_build_watcher(app: AppHandle) {
+/// Spawns a lightweight watcher that periodically checks whether the Windows build/UBR
+/// changed (e.g., after a Windows Update) and triggers a re-scan + regression alert.
+pub fn spawn_windows_build_watcher(tx: Sender<WorkerMsg>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let env = WindowsEnv;
         let paths = AppPaths::default_user_dir();
         let engine = HealthEngine::with_default_checks();
 
-        if let Ok(summary) = engine.scan_all(&env, &paths, true) {
-            notify_if_regressed(&app, &summary);
-        }
-
-        // Light, low-overhead build number check every 6 hours (only reads 2 registry values).
         loop {
             std::thread::sleep(Duration::from_secs(6 * 60 * 60));
 
@@ -73,7 +70,12 @@ pub fn spawn_startup_and_build_watcher(app: AppHandle) {
 
             if build_changed {
                 if let Ok(summary) = engine.scan_all(&env, &paths, true) {
-                    notify_if_regressed(&app, &summary);
+                    notify_if_regressed(&summary);
+                    let _ = tx.send(WorkerMsg::ScanFinished {
+                        result: Ok(summary),
+                        notify_regressions: false,
+                    });
+                    ctx.request_repaint();
                 }
             }
         }

@@ -1,9 +1,9 @@
 # Polled
 
-Open-source, lightweight Windows 10/11 utility for competitive mouse input hygiene and per-game peripheral profiles.
+Open-source, lightweight pure-Rust Windows 10/11 utility for competitive mouse input hygiene and per-game peripheral profiles.
 
-- **Small & fast:** Native Rust core with a Tauri v2 + React tray app. Closing the window destroys the WebView2 instance so idle tray memory stays low.
-- **No account, no telemetry, no cloud:** 100% local. Data lives in `%LOCALAPPDATA%\Polled\`.
+- **Small & fast:** 100% pure Rust (`eframe`/`egui` + Windows APIs) — no WebView2, no Electron, no Node.js runtime, low RAM, system tray support.
+- **No account, no telemetry, no cloud:** Fully local. Data lives in `%LOCALAPPDATA%\Polled\`.
 - **Safe & reversible by design:** Before applying any fix, Polled atomically saves the original Windows values to `baseline_snapshot.json` (first-write-wins). One click or `polled --undo-all` restores everything.
 - **No persistent admin rights:** Runs non-elevated. Only requests UAC elevation for the specific check that needs HKLM/power-policy access, explaining why first.
 - **Anti-cheat friendly:** No DLL injection, no hooks into game processes, no reading game memory. Works alongside Vanguard, FACEIT, EAC, and BattlEye.
@@ -86,26 +86,22 @@ Every hardware backend in Polled is explicitly labeled by verification status:
 
 Prerequisites:
 - Rust stable toolchain (`rustup`)
-- Node.js 20+ (for the React frontend)
-- Microsoft Visual Studio C++ Build Tools & WebView2 Runtime (preinstalled on Windows 11)
+- Microsoft Visual Studio C++ Build Tools
 
 ```powershell
-# 1. Build the React UI
-cd apps/polled-desktop
-npm ci
-npm run build
-cd ../..
-
-# 2. Run all checks & unit tests
+# Run all checks & unit tests
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# 3. Build release binaries (CLI + tray app)
-cargo build --release -p polled-cli -p polled-desktop
+# Run the GUI tray app directly
+cargo run -p polled-gui
+
+# Or build optimized release binaries (CLI + GUI tray app)
+cargo build --release -p polled-cli -p polled-gui
 ```
 
-Release binaries are written to `target/release/polled.exe` and `target/release/polled-desktop.exe`. Keep both files in the same folder so the tray app can invoke `polled.exe` on demand when a single fix needs UAC elevation.
+Release binaries are written to `target/release/polled.exe` and `target/release/polled-gui.exe`. Keep both files in the same folder so the tray app can invoke `polled.exe` on demand when a single fix needs UAC elevation.
 
 ---
 
@@ -115,8 +111,7 @@ Release binaries are written to `target/release/polled.exe` and `target/release/
 crates/
   polled-core/         Pure Rust library (Windows API traits, 11 checks, snapshots, state)
   polled-cli/          Standalone console binary (polled.exe) & on-demand UAC helper
-apps/
-  polled-desktop/      Tauri v2 + React + TypeScript system tray app
+  polled-gui/          Pure-Rust native GUI & tray app (eframe/egui + tray-icon)
 ```
 
 ## License

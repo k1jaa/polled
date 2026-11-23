@@ -1,0 +1,21 @@
+[package]
+name = "polled-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Lightweight pure-Rust Windows tray GUI for Polled"
+
+[[bin]]
+name = "polled-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+notify-rust.workspace = true
+polled-core = { path = "../polled-core" }
+tray-icon.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

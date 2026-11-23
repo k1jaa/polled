@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/polled-core",
     "crates/polled-cli",
-    "apps/polled-desktop/src-tauri",
+    "crates/polled-gui",
 ]
 
 [workspace.package]
@@ -17,11 +17,14 @@ authors = ["k1jaa"]
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+notify-rust = "4.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = "0.36"
 tempfile = "3"
 thiserror = "2"
+tray-icon = "0.25"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
