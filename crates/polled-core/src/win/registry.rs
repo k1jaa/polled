@@ -9,8 +9,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, WIN32_ERROR};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_BINARY, REG_DWORD,
-    REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_BINARY,
+    REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
 };
 
 use crate::error::{PolledError, Result};
@@ -46,12 +46,20 @@ fn hive_label(hive: RegHive) -> &'static str {
     }
 }
 
-fn map_reg_error(err: WIN32_ERROR, hive: RegHive, subkey: &str, op: &str) -> PolledError {
+fn map_reg_error(
+    err: WIN32_ERROR,
+    hive: RegHive,
+    subkey: &str,
+    op: &str,
+    is_write: bool,
+) -> PolledError {
     if err == ERROR_ACCESS_DENIED {
+        let access_kind = if is_write { "write" } else { "read" };
         return PolledError::ElevationRequired {
             operation: format!("{op} {}\\{subkey}", hive_label(hive)),
-            reason: "Windows denied write access to this registry location without elevation."
-                .to_string(),
+            reason: format!(
+                "Windows denied {access_kind} access to this registry location with current permissions."
+            ),
         };
     }
     PolledError::Win32 {
@@ -69,7 +77,7 @@ fn open_read(hive: RegHive, subkey: &str) -> Result<Option<OwnedHkey>> {
             root_hkey(hive),
             PCWSTR(subkey_w.as_ptr()),
             Some(0),
-            KEY_READ,
+            KEY_QUERY_VALUE,
             &mut handle,
         )
     };
@@ -77,7 +85,7 @@ fn open_read(hive: RegHive, subkey: &str) -> Result<Option<OwnedHkey>> {
         return Ok(None);
     }
     if status.is_err() {
-        return Err(map_reg_error(status, hive, subkey, "RegOpenKeyExW"));
+        return Err(map_reg_error(status, hive, subkey, "RegOpenKeyExW", false));
     }
     Ok(Some(OwnedHkey(handle)))
 }
@@ -100,7 +108,7 @@ fn create_or_open_write(hive: RegHive, subkey: &str) -> Result<OwnedHkey> {
         )
     };
     if status.is_err() {
-        return Err(map_reg_error(status, hive, subkey, "RegCreateKeyExW"));
+        return Err(map_reg_error(status, hive, subkey, "RegCreateKeyExW", true));
     }
     Ok(OwnedHkey(handle))
 }
@@ -129,7 +137,13 @@ fn query_raw(hive: RegHive, subkey: &str, name: &str) -> Result<Option<(REG_VALU
         return Ok(None);
     }
     if status.is_err() {
-        return Err(map_reg_error(status, hive, subkey, "RegQueryValueExW"));
+        return Err(map_reg_error(
+            status,
+            hive,
+            subkey,
+            "RegQueryValueExW",
+            false,
+        ));
     }
 
     let mut buf = vec![0u8; size as usize];
@@ -145,7 +159,13 @@ fn query_raw(hive: RegHive, subkey: &str, name: &str) -> Result<Option<(REG_VALU
         )
     };
     if status.is_err() {
-        return Err(map_reg_error(status, hive, subkey, "RegQueryValueExW"));
+        return Err(map_reg_error(
+            status,
+            hive,
+            subkey,
+            "RegQueryValueExW",
+            false,
+        ));
     }
     buf.truncate(size as usize);
     Ok(Some((value_type, buf)))
@@ -188,7 +208,7 @@ pub fn set_string(hive: RegHive, subkey: &str, name: &str, value: &str) -> Resul
         )
     };
     if status.is_err() {
-        return Err(map_reg_error(status, hive, subkey, "RegSetValueExW"));
+        return Err(map_reg_error(status, hive, subkey, "RegSetValueExW", true));
     }
     Ok(())
 }
@@ -226,7 +246,7 @@ pub fn set_dword(hive: RegHive, subkey: &str, name: &str, value: u32) -> Result<
         )
     };
     if status.is_err() {
-        return Err(map_reg_error(status, hive, subkey, "RegSetValueExW"));
+        return Err(map_reg_error(status, hive, subkey, "RegSetValueExW", true));
     }
     Ok(())
 }
@@ -259,7 +279,7 @@ pub fn set_binary(hive: RegHive, subkey: &str, name: &str, value: &[u8]) -> Resu
         )
     };
     if status.is_err() {
-        return Err(map_reg_error(status, hive, subkey, "RegSetValueExW"));
+        return Err(map_reg_error(status, hive, subkey, "RegSetValueExW", true));
     }
     Ok(())
 }
@@ -274,7 +294,7 @@ pub fn delete_value(hive: RegHive, subkey: &str, name: &str) -> Result<()> {
         return Ok(());
     }
     if status.is_err() {
-        return Err(map_reg_error(status, hive, subkey, "RegDeleteValueW"));
+        return Err(map_reg_error(status, hive, subkey, "RegDeleteValueW", true));
     }
     Ok(())
 }

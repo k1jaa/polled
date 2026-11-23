@@ -73,7 +73,23 @@ impl HealthEngine {
 
         let mut reports = Vec::with_capacity(self.checks.len());
         for check in &self.checks {
-            reports.push(check.scan(env)?);
+            let report = match check.scan(env) {
+                Ok(report) => report,
+                Err(err) => CheckReport {
+                    id: check.id().to_string(),
+                    name: check.name().to_string(),
+                    current_value: format!("Unavailable ({err})"),
+                    recommended_value: "N/A".to_string(),
+                    reason: "This setting could not be queried under current permissions."
+                        .to_string(),
+                    severity: Severity::Info,
+                    can_fix: false,
+                    requires_elevation: matches!(err, PolledError::ElevationRequired { .. }),
+                    elevation_reason: check.elevation_reason().map(str::to_string),
+                    requires_relogin: false,
+                },
+            };
+            reports.push(report);
         }
 
         let regressions = detect_regressions(prev_state.as_ref(), &reports);
@@ -391,5 +407,27 @@ mod tests {
         );
         assert_eq!(scan2.regressions.len(), 1);
         assert_eq!(scan2.regressions[0].check_id, "dummy_speed");
+    }
+
+    #[test]
+    fn default_engine_registers_all_11_checks_and_roundtrips_safe_fixes() {
+        let dir = TempDir::new().unwrap();
+        let paths = AppPaths::from_root(dir.path());
+        let env = MockEnv::new();
+        env.set_mouse_speed(14).unwrap();
+
+        let engine = HealthEngine::with_default_checks();
+        assert_eq!(engine.checks().len(), 11);
+
+        let initial = engine.scan_all(&env, &paths, true).unwrap();
+        assert_eq!(initial.checks.len(), 11);
+
+        let fixed = engine.fix_all_safe(&env, &paths).unwrap();
+        assert!(fixed.iter().any(|r| r.id == "pointer_speed"));
+        assert_eq!(env.get_mouse_speed().unwrap(), 10);
+
+        let undo = engine.undo_all(&env, &paths).unwrap();
+        assert!(undo.failed.is_empty());
+        assert_eq!(env.get_mouse_speed().unwrap(), 14);
     }
 }

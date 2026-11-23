@@ -8,9 +8,12 @@ pub mod enhance_pointer_precision;
 pub mod game_mode;
 pub mod hags;
 pub mod pointer_speed;
+pub mod power_plan;
 pub mod runner;
 pub mod snapshot;
 pub mod state;
+pub mod usb_selective_suspend;
+pub mod vendor_software;
 
 use serde::{Deserialize, Serialize};
 
@@ -103,16 +106,19 @@ pub trait HealthCheck: Send + Sync {
     }
 }
 
-/// Returns all registered Phase 1 health checks in display order.
+/// Returns all 11 registered Phase 1 health checks in display order.
 pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
     vec![
         Box::new(enhance_pointer_precision::EnhancePointerPrecisionCheck),
         Box::new(pointer_speed::PointerSpeedCheck),
         Box::new(accel_curves::AccelCurvesCheck),
+        Box::new(usb_selective_suspend::UsbSelectiveSuspendCheck),
+        Box::new(power_plan::PowerPlanCheck),
         Box::new(game_mode::GameModeCheck),
         Box::new(hags::HagsCheck),
         Box::new(accessibility_shortcuts::StickyKeysShortcutCheck),
         Box::new(accessibility_shortcuts::FilterKeysShortcutCheck),
         Box::new(accessibility_shortcuts::MouseKeysShortcutCheck),
+        Box::new(vendor_software::VendorSoftwareCheck),
     ]
 }
