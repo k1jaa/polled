@@ -7,7 +7,10 @@
 
 use std::collections::BTreeMap;
 
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
+use eframe::egui::text::LayoutJob;
+use eframe::egui::{
+    self, Color32, CornerRadius, FontId, Margin, RichText, Stroke, TextFormat, Vec2,
+};
 use polled_core::{
     export_profile_json, import_profile_json, AppPaths, DeviceCapabilities, GameProfile,
     LiftOffDistance, MouseSettings, ProfileStore, Severity,
@@ -219,9 +222,13 @@ impl ProfilesUiState {
         mode: ThemeMode,
         runtime: &ProfileRuntimeHandle,
     ) {
+        let content_w = ui.available_width().max(320.0);
+        ui.set_max_width(content_w);
+
         // --- DEVICE & AUTO-SWITCH CONTROL CARD ---
         let snap = self.runtime_snapshot.clone();
         card_frame(ui, p, |ui| {
+            let combo_w = (ui.available_width() * 0.36).clamp(190.0, 310.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Device:").strong().color(p.text));
 
@@ -253,7 +260,7 @@ impl ProfilesUiState {
 
                 egui::ComboBox::from_id_salt("device_selector")
                     .selected_text(current_label)
-                    .width(340.0)
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         if let Some(s) = &snap {
                             if ui
@@ -390,14 +397,27 @@ impl ProfilesUiState {
         ui.add_space(10.0);
 
         // --- TWO-COLUMN LAYOUT: PROFILE LIST + PROFILE EDITOR ---
-        let available_h = (ui.available_height() - 155.0).max(260.0);
+        let gap = 10.0;
+        let left_w = (content_w * 0.26).clamp(210.0, 260.0);
+        let right_w = (content_w - left_w - gap).max(340.0);
+        let rem_h = ui.available_height();
+        let mid_h = if rem_h >= 480.0 {
+            324.0
+        } else {
+            ((rem_h - 10.0) * 0.69).clamp(185.0, 324.0)
+        };
+        let inner_col_h = (mid_h - 24.0).max(160.0);
+
         ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+
             // Left: Profile list
             ui.allocate_ui_with_layout(
-                Vec2::new(235.0, available_h),
+                Vec2::new(left_w, mid_h),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     card_frame(ui, p, |ui| {
+                        ui.set_min_height(inner_col_h);
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Profiles").strong().color(p.text));
                             ui.with_layout(
@@ -445,13 +465,15 @@ impl ProfilesUiState {
 
                         egui::ScrollArea::vertical()
                             .id_salt("profile_list_scroll")
-                            .max_height((available_h - 56.0).max(180.0))
+                            .max_height((inner_col_h - 34.0).max(110.0))
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 for prof in &self.store.profiles {
                                     let selected = prof.id == self.selected_profile_id;
                                     let is_active = prof.id == active_id;
                                     let fill = if selected { p.surface_alt } else { p.surface };
                                     let border = if selected { p.text } else { p.border };
+                                    let item_w = (ui.available_width() - 20.0).max(120.0);
 
                                     let resp = egui::Frame::NONE
                                         .fill(fill)
@@ -459,28 +481,39 @@ impl ProfilesUiState {
                                         .corner_radius(CornerRadius::same(6))
                                         .inner_margin(Margin::symmetric(10, 8))
                                         .show(ui, |ui| {
-                                            ui.set_width(ui.available_width());
+                                            ui.set_width(item_w);
+                                            ui.set_max_width(item_w);
                                             ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new(&prof.name)
-                                                        .strong()
-                                                        .color(p.text),
-                                                );
-                                                if is_active {
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if is_active {
                                                             ui.label(
                                                                 RichText::new("ACTIVE")
                                                                     .size(10.0)
                                                                     .strong()
                                                                     .color(p.ok),
                                                             );
-                                                        },
-                                                    );
-                                                }
+                                                        }
+                                                        ui.with_layout(
+                                                            egui::Layout::left_to_right(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        RichText::new(&prof.name)
+                                                                            .strong()
+                                                                            .color(p.text),
+                                                                    )
+                                                                    .truncate(),
+                                                                );
+                                                            },
+                                                        );
+                                                    },
+                                                );
                                             });
                                             let base_sub = if prof.is_desktop_default {
                                                 "Fallback when no game matches".to_string()
@@ -498,11 +531,14 @@ impl ProfilesUiState {
                                                     if n == 1 { "" } else { "s" }
                                                 )
                                             };
-                                            ui.label(
-                                                RichText::new(sub)
-                                                    .size(11.0)
-                                                    .monospace()
-                                                    .color(p.text_muted),
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(sub)
+                                                        .size(11.0)
+                                                        .monospace()
+                                                        .color(p.text_muted),
+                                                )
+                                                .wrap(),
                                             );
                                         })
                                         .response
@@ -522,299 +558,384 @@ impl ProfilesUiState {
                 },
             );
 
-            ui.add_space(10.0);
-
             // Right: Selected profile editor
-            ui.vertical(|ui| {
-                card_frame(ui, p, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(if self.editor.is_desktop_default {
-                                "Edit Desktop Default Profile"
-                            } else {
-                                "Edit Game Profile"
-                            })
-                            .size(15.0)
-                            .strong()
-                            .color(p.text),
-                        );
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if !self.editor.is_desktop_default
-                                && ui.add(secondary_btn("Delete", p)).clicked()
-                            {
-                                let del_id = self.editor.id.clone();
-                                if self.store.remove_profile(&del_id) {
-                                    self.select_profile("desktop");
-                                    runtime
-                                        .send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
-                                    self.notice = Some((
-                                        Severity::Info,
-                                        format!("Deleted profile '{del_id}'."),
-                                    ));
-                                }
-                            }
-                            if ui.add(secondary_btn("Export JSON", p)).clicked() {
-                                let profile = self.editor.to_profile();
-                                match export_profile_json(&profile) {
-                                    Ok(json) => self.export_modal_json = Some(json),
-                                    Err(err) => {
-                                        self.notice = Some((Severity::Bad, err.to_string()))
-                                    }
-                                }
-                            }
-                            if ui.add(secondary_btn("Test Apply Now", p)).clicked() {
-                                let profile = self.editor.to_profile();
-                                let id = profile.id.clone();
-                                self.store.upsert_profile(profile);
-                                runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
-                                runtime.send(ProfileRuntimeCmd::ApplyProfileNow(id));
-                            }
-                            if ui.add(primary_btn("Save Profile", p)).clicked() {
-                                let profile = self.editor.to_profile();
-                                let name = profile.name.clone();
-                                let id = profile.id.clone();
-                                self.store.upsert_profile(profile);
-                                self.select_profile(&id);
-                                runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
-                                self.notice =
-                                    Some((Severity::Ok, format!("Saved profile '{name}'.")));
-                            }
-                        });
-                    });
-
-                    ui.add_space(10.0);
-
-                    let active_target_caps: Option<DeviceCapabilities> =
-                        self.editor.editing_device_id.as_deref().and_then(|dev_id| {
-                            snap.as_ref().and_then(|s| {
-                                s.active_devices
-                                    .iter()
-                                    .find(|d| d.info.id == dev_id)
-                                    .map(|d| d.caps.clone())
-                            })
-                        });
-                    let dpi_min = active_target_caps.as_ref().map_or(10, |c| c.dpi_min);
-                    let dpi_max = active_target_caps.as_ref().map_or(32000, |c| c.dpi_max);
-                    let dpi_step = active_target_caps.as_ref().map_or(10, |c| c.dpi_step);
-                    let rates = active_target_caps
-                        .as_ref()
-                        .map(|c| c.polling_rates_hz.clone())
-                        .unwrap_or_else(|| vec![125, 250, 500, 1000, 2000, 4000, 8000]);
-                    let lod_options = active_target_caps
-                        .as_ref()
-                        .map(|c| c.lod_options.clone())
-                        .unwrap_or_else(|| LiftOffDistance::ALL.to_vec());
-                    let supports_debounce = active_target_caps
-                        .as_ref()
-                        .is_none_or(|c| c.supports_debounce);
-                    let db_min = active_target_caps.as_ref().map_or(0, |c| c.debounce_min_ms);
-                    let db_max = active_target_caps
-                        .as_ref()
-                        .map_or(20, |c| c.debounce_max_ms);
-
-                    let mut next_target: Option<(Option<String>, Option<DeviceCapabilities>)> =
-                        None;
-                    let mut remove_override = false;
-
-                    egui::Grid::new("profile_editor_grid")
-                        .num_columns(2)
-                        .spacing([14.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Name").color(p.text_muted));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.editor.name)
-                                    .desired_width(280.0),
-                            );
-                            ui.end_row();
-
-                            if !self.editor.is_desktop_default {
-                                ui.label(RichText::new("Executables").color(p.text_muted));
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.editor.executables_csv)
-                                        .desired_width(360.0)
-                                        .hint_text("cs2.exe, valorant-win64-shipping.exe"),
-                                );
-                                ui.end_row();
-                            }
-
-                            ui.label(RichText::new("Mouse Target").color(p.text_muted));
-                            ui.horizontal(|ui| {
-                                let target_label = match &self.editor.editing_device_id {
-                                    None => "All Mice (Default)".to_string(),
-                                    Some(dev_id) => {
-                                        let friendly = snap
-                                            .as_ref()
-                                            .and_then(|s| {
-                                                s.active_devices
-                                                    .iter()
-                                                    .find(|d| d.info.id == *dev_id)
-                                                    .map(|d| d.info.name.clone())
-                                            })
-                                            .unwrap_or_else(|| dev_id.clone());
-                                        format!("{friendly} [Override]")
-                                    }
-                                };
-
-                                egui::ComboBox::from_id_salt("mouse_target_combo")
-                                    .selected_text(target_label)
-                                    .width(260.0)
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                self.editor.editing_device_id.is_none(),
-                                                "All Mice (Default)",
-                                            )
-                                            .clicked()
-                                        {
-                                            next_target = Some((None, None));
+            ui.allocate_ui_with_layout(
+                Vec2::new(right_w, mid_h),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    card_frame(ui, p, |ui| {
+                        ui.set_min_height(inner_col_h);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if !self.editor.is_desktop_default
+                                        && ui.add(secondary_btn("Delete", p)).clicked()
+                                    {
+                                        let del_id = self.editor.id.clone();
+                                        if self.store.remove_profile(&del_id) {
+                                            self.select_profile("desktop");
+                                            runtime.send(ProfileRuntimeCmd::UpdateStore(
+                                                self.store.clone(),
+                                            ));
+                                            self.notice = Some((
+                                                Severity::Info,
+                                                format!("Deleted profile '{del_id}'."),
+                                            ));
                                         }
-
-                                        let mut seen_ids = Vec::new();
-                                        if let Some(s) = &snap {
-                                            for dev in &s.active_devices {
-                                                seen_ids.push(dev.info.id.clone());
-                                                let has_ov = self
-                                                    .editor
-                                                    .device_overrides
-                                                    .contains_key(&dev.info.id);
-                                                let label = if has_ov {
-                                                    format!("{} [Override]", dev.info.name)
-                                                } else {
-                                                    format!("{} (+ add override)", dev.info.name)
-                                                };
-                                                let selected =
-                                                    self.editor.editing_device_id.as_deref()
-                                                        == Some(dev.info.id.as_str());
-                                                if ui.selectable_label(selected, label).clicked() {
-                                                    next_target = Some((
-                                                        Some(dev.info.id.clone()),
-                                                        Some(dev.caps.clone()),
-                                                    ));
-                                                }
+                                    }
+                                    if ui.add(secondary_btn("Export", p)).clicked() {
+                                        let profile = self.editor.to_profile();
+                                        match export_profile_json(&profile) {
+                                            Ok(json) => self.export_modal_json = Some(json),
+                                            Err(err) => {
+                                                self.notice = Some((Severity::Bad, err.to_string()))
                                             }
                                         }
+                                    }
+                                    if ui.add(secondary_btn("Apply Now", p)).clicked() {
+                                        let profile = self.editor.to_profile();
+                                        let id = profile.id.clone();
+                                        self.store.upsert_profile(profile);
+                                        runtime.send(ProfileRuntimeCmd::UpdateStore(
+                                            self.store.clone(),
+                                        ));
+                                        runtime.send(ProfileRuntimeCmd::ApplyProfileNow(id));
+                                    }
+                                    if ui.add(primary_btn("Save", p)).clicked() {
+                                        let profile = self.editor.to_profile();
+                                        let name = profile.name.clone();
+                                        let id = profile.id.clone();
+                                        self.store.upsert_profile(profile);
+                                        self.select_profile(&id);
+                                        runtime.send(ProfileRuntimeCmd::UpdateStore(
+                                            self.store.clone(),
+                                        ));
+                                        self.notice = Some((
+                                            Severity::Ok,
+                                            format!("Saved profile '{name}'."),
+                                        ));
+                                    }
 
-                                        for dev_id in self.editor.device_overrides.keys() {
-                                            if seen_ids.iter().any(|seen| seen == dev_id) {
-                                                continue;
-                                            }
-                                            let selected = self.editor.editing_device_id.as_deref()
-                                                == Some(dev_id.as_str());
-                                            if ui
-                                                .selectable_label(
-                                                    selected,
-                                                    format!("{dev_id} [Override · offline]"),
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(
+                                                        if self.editor.is_desktop_default {
+                                                            "Desktop Default Profile"
+                                                        } else {
+                                                            "Edit Game Profile"
+                                                        },
+                                                    )
+                                                    .size(15.0)
+                                                    .strong()
+                                                    .color(p.text),
                                                 )
-                                                .clicked()
-                                            {
-                                                next_target = Some((Some(dev_id.clone()), None));
-                                            }
-                                        }
-                                    });
-
-                                if self.editor.editing_device_id.is_some()
-                                    && ui.add(secondary_btn("Remove Override", p)).clicked()
-                                {
-                                    remove_override = true;
-                                }
-                            });
-                            ui.end_row();
-
-                            ui.checkbox(&mut self.editor.set_dpi, "DPI");
-                            ui.add_enabled(
-                                self.editor.set_dpi,
-                                egui::DragValue::new(&mut self.editor.dpi)
-                                    .range(dpi_min..=dpi_max)
-                                    .speed(f64::from(dpi_step))
-                                    .suffix(" DPI"),
-                            );
-                            ui.end_row();
-
-                            ui.checkbox(&mut self.editor.set_polling, "Polling Rate");
-                            ui.add_enabled_ui(self.editor.set_polling, |ui| {
-                                egui::ComboBox::from_id_salt("polling_rate_combo")
-                                    .selected_text(format!("{} Hz", self.editor.polling_rate_hz))
-                                    .show_ui(ui, |ui| {
-                                        for hz in &rates {
-                                            ui.selectable_value(
-                                                &mut self.editor.polling_rate_hz,
-                                                *hz,
-                                                format!("{hz} Hz"),
+                                                .truncate(),
                                             );
-                                        }
-                                    });
-                            });
-                            ui.end_row();
+                                        },
+                                    );
+                                },
+                            );
+                        });
 
-                            if lod_options.is_empty() {
-                                ui.label(RichText::new("Lift-Off Distance").color(p.text_muted));
-                                ui.label(
-                                    RichText::new("Not configurable on this mouse")
-                                        .size(12.0)
-                                        .color(p.text_muted),
-                                );
-                            } else {
-                                ui.checkbox(&mut self.editor.set_lod, "Lift-Off Distance");
-                                ui.add_enabled_ui(self.editor.set_lod, |ui| {
-                                    egui::ComboBox::from_id_salt("lod_combo")
-                                        .selected_text(self.editor.lod.label())
-                                        .show_ui(ui, |ui| {
-                                            for opt in &lod_options {
-                                                ui.selectable_value(
-                                                    &mut self.editor.lod,
-                                                    *opt,
-                                                    opt.label(),
-                                                );
+                        ui.add_space(8.0);
+
+                        let active_target_caps: Option<DeviceCapabilities> =
+                            self.editor.editing_device_id.as_deref().and_then(|dev_id| {
+                                snap.as_ref().and_then(|s| {
+                                    s.active_devices
+                                        .iter()
+                                        .find(|d| d.info.id == dev_id)
+                                        .map(|d| d.caps.clone())
+                                })
+                            });
+                        let dpi_min = active_target_caps.as_ref().map_or(10, |c| c.dpi_min);
+                        let dpi_max = active_target_caps.as_ref().map_or(32000, |c| c.dpi_max);
+                        let dpi_step = active_target_caps.as_ref().map_or(10, |c| c.dpi_step);
+                        let rates = active_target_caps
+                            .as_ref()
+                            .map(|c| c.polling_rates_hz.clone())
+                            .unwrap_or_else(|| vec![125, 250, 500, 1000, 2000, 4000, 8000]);
+                        let lod_options = active_target_caps
+                            .as_ref()
+                            .map(|c| c.lod_options.clone())
+                            .unwrap_or_else(|| LiftOffDistance::ALL.to_vec());
+                        let supports_debounce = active_target_caps
+                            .as_ref()
+                            .is_none_or(|c| c.supports_debounce);
+                        let db_min = active_target_caps.as_ref().map_or(0, |c| c.debounce_min_ms);
+                        let db_max = active_target_caps
+                            .as_ref()
+                            .map_or(20, |c| c.debounce_max_ms);
+
+                        let mut next_target: Option<(Option<String>, Option<DeviceCapabilities>)> =
+                            None;
+                        let mut remove_override = false;
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("profile_editor_scroll")
+                            .max_height((inner_col_h - 34.0).max(120.0))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let field_w = (ui.available_width() - 165.0).clamp(170.0, 420.0);
+                                let target_combo_w = (field_w
+                                    - if self.editor.editing_device_id.is_some() {
+                                        80.0
+                                    } else {
+                                        0.0
+                                    })
+                                .clamp(150.0, 310.0);
+
+                                egui::Grid::new("profile_editor_grid")
+                                    .num_columns(2)
+                                    .spacing([14.0, 7.0])
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new("Name").color(p.text_muted));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.editor.name)
+                                                .desired_width(field_w),
+                                        );
+                                        ui.end_row();
+
+                                        if !self.editor.is_desktop_default {
+                                            ui.label(
+                                                RichText::new("Executables").color(p.text_muted),
+                                            );
+                                            ui.add(
+                                                egui::TextEdit::singleline(
+                                                    &mut self.editor.executables_csv,
+                                                )
+                                                .desired_width(field_w)
+                                                .hint_text("cs2.exe, valorant-win64-shipping.exe"),
+                                            );
+                                            ui.end_row();
+                                        }
+
+                                        ui.label(RichText::new("Mouse Target").color(p.text_muted));
+                                        ui.horizontal(|ui| {
+                                            let target_label = match &self.editor.editing_device_id
+                                            {
+                                                None => "All Mice (Default)".to_string(),
+                                                Some(dev_id) => {
+                                                    let friendly = snap
+                                                        .as_ref()
+                                                        .and_then(|s| {
+                                                            s.active_devices
+                                                                .iter()
+                                                                .find(|d| d.info.id == *dev_id)
+                                                                .map(|d| d.info.name.clone())
+                                                        })
+                                                        .unwrap_or_else(|| dev_id.clone());
+                                                    format!("{friendly} [Override]")
+                                                }
+                                            };
+
+                                            egui::ComboBox::from_id_salt("mouse_target_combo")
+                                                .selected_text(target_label)
+                                                .width(target_combo_w)
+                                                .show_ui(ui, |ui| {
+                                                    if ui
+                                                        .selectable_label(
+                                                            self.editor.editing_device_id.is_none(),
+                                                            "All Mice (Default)",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        next_target = Some((None, None));
+                                                    }
+
+                                                    let mut seen_ids = Vec::new();
+                                                    if let Some(s) = &snap {
+                                                        for dev in &s.active_devices {
+                                                            seen_ids.push(dev.info.id.clone());
+                                                            let has_ov = self
+                                                                .editor
+                                                                .device_overrides
+                                                                .contains_key(&dev.info.id);
+                                                            let label = if has_ov {
+                                                                format!(
+                                                                    "{} [Override]",
+                                                                    dev.info.name
+                                                                )
+                                                            } else {
+                                                                format!(
+                                                                    "{} (+ add override)",
+                                                                    dev.info.name
+                                                                )
+                                                            };
+                                                            let selected = self
+                                                                .editor
+                                                                .editing_device_id
+                                                                .as_deref()
+                                                                == Some(dev.info.id.as_str());
+                                                            if ui
+                                                                .selectable_label(selected, label)
+                                                                .clicked()
+                                                            {
+                                                                next_target = Some((
+                                                                    Some(dev.info.id.clone()),
+                                                                    Some(dev.caps.clone()),
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+
+                                                    for dev_id in
+                                                        self.editor.device_overrides.keys()
+                                                    {
+                                                        if seen_ids
+                                                            .iter()
+                                                            .any(|seen| seen == dev_id)
+                                                        {
+                                                            continue;
+                                                        }
+                                                        let selected = self
+                                                            .editor
+                                                            .editing_device_id
+                                                            .as_deref()
+                                                            == Some(dev_id.as_str());
+                                                        if ui
+                                                            .selectable_label(
+                                                                selected,
+                                                                format!(
+                                                                    "{dev_id} [Override · offline]"
+                                                                ),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            next_target =
+                                                                Some((Some(dev_id.clone()), None));
+                                                        }
+                                                    }
+                                                });
+
+                                            if self.editor.editing_device_id.is_some()
+                                                && ui.add(secondary_btn("Remove", p)).clicked()
+                                            {
+                                                remove_override = true;
                                             }
                                         });
-                                });
-                            }
-                            ui.end_row();
+                                        ui.end_row();
 
-                            if !supports_debounce {
-                                ui.label(RichText::new("Debounce").color(p.text_muted));
-                                ui.label(
-                                    RichText::new("Not configurable on this mouse")
-                                        .size(12.0)
-                                        .color(p.text_muted),
-                                );
-                            } else {
-                                ui.checkbox(&mut self.editor.set_debounce, "Debounce");
-                                ui.add_enabled(
-                                    self.editor.set_debounce,
-                                    egui::DragValue::new(&mut self.editor.debounce_ms)
-                                        .range(db_min..=db_max)
-                                        .suffix(" ms"),
-                                );
-                            }
-                            ui.end_row();
+                                        ui.checkbox(&mut self.editor.set_dpi, "DPI");
+                                        ui.add_enabled(
+                                            self.editor.set_dpi,
+                                            egui::DragValue::new(&mut self.editor.dpi)
+                                                .range(dpi_min..=dpi_max)
+                                                .speed(f64::from(dpi_step))
+                                                .suffix(" DPI"),
+                                        );
+                                        ui.end_row();
 
-                            ui.checkbox(&mut self.editor.set_win_speed, "Windows Speed");
-                            ui.add_enabled(
-                                self.editor.set_win_speed,
-                                egui::DragValue::new(&mut self.editor.win_speed)
-                                    .range(1..=20)
-                                    .suffix("/20 (10 = 6/11)"),
-                            );
-                            ui.end_row();
+                                        ui.checkbox(&mut self.editor.set_polling, "Polling Rate");
+                                        ui.add_enabled_ui(self.editor.set_polling, |ui| {
+                                            egui::ComboBox::from_id_salt("polling_rate_combo")
+                                                .selected_text(format!(
+                                                    "{} Hz",
+                                                    self.editor.polling_rate_hz
+                                                ))
+                                                .show_ui(ui, |ui| {
+                                                    for hz in &rates {
+                                                        ui.selectable_value(
+                                                            &mut self.editor.polling_rate_hz,
+                                                            *hz,
+                                                            format!("{hz} Hz"),
+                                                        );
+                                                    }
+                                                });
+                                        });
+                                        ui.end_row();
 
-                            ui.label(RichText::new("Notes (optional)").color(p.text_muted));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.editor.notes)
-                                    .desired_width(360.0)
-                                    .hint_text("Saved in exported profile JSON cards"),
-                            );
-                            ui.end_row();
-                        });
+                                        if lod_options.is_empty() {
+                                            ui.label(
+                                                RichText::new("Lift-Off Distance")
+                                                    .color(p.text_muted),
+                                            );
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new("Not configurable on this mouse")
+                                                        .size(12.0)
+                                                        .color(p.text_muted),
+                                                )
+                                                .wrap(),
+                                            );
+                                        } else {
+                                            ui.checkbox(
+                                                &mut self.editor.set_lod,
+                                                "Lift-Off Distance",
+                                            );
+                                            ui.add_enabled_ui(self.editor.set_lod, |ui| {
+                                                egui::ComboBox::from_id_salt("lod_combo")
+                                                    .selected_text(self.editor.lod.label())
+                                                    .show_ui(ui, |ui| {
+                                                        for opt in &lod_options {
+                                                            ui.selectable_value(
+                                                                &mut self.editor.lod,
+                                                                *opt,
+                                                                opt.label(),
+                                                            );
+                                                        }
+                                                    });
+                                            });
+                                        }
+                                        ui.end_row();
 
-                    if remove_override {
-                        self.editor.remove_current_override();
-                    } else if let Some((target_id, caps)) = next_target {
-                        self.editor.switch_editing_target(target_id, caps.as_ref());
-                    }
-                });
-            });
+                                        if !supports_debounce {
+                                            ui.label(RichText::new("Debounce").color(p.text_muted));
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new("Not configurable on this mouse")
+                                                        .size(12.0)
+                                                        .color(p.text_muted),
+                                                )
+                                                .wrap(),
+                                            );
+                                        } else {
+                                            ui.checkbox(&mut self.editor.set_debounce, "Debounce");
+                                            ui.add_enabled(
+                                                self.editor.set_debounce,
+                                                egui::DragValue::new(&mut self.editor.debounce_ms)
+                                                    .range(db_min..=db_max)
+                                                    .suffix(" ms"),
+                                            );
+                                        }
+                                        ui.end_row();
+
+                                        ui.checkbox(
+                                            &mut self.editor.set_win_speed,
+                                            "Windows Speed",
+                                        );
+                                        ui.add_enabled(
+                                            self.editor.set_win_speed,
+                                            egui::DragValue::new(&mut self.editor.win_speed)
+                                                .range(1..=20)
+                                                .suffix("/20 (10 = 6/11)"),
+                                        );
+                                        ui.end_row();
+
+                                        ui.label(
+                                            RichText::new("Notes (optional)").color(p.text_muted),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.editor.notes)
+                                                .desired_width(field_w)
+                                                .hint_text("Saved in exported profile JSON cards"),
+                                        );
+                                        ui.end_row();
+                                    });
+                            });
+
+                        if remove_override {
+                            self.editor.remove_current_override();
+                        } else if let Some((target_id, caps)) = next_target {
+                            self.editor.switch_editing_target(target_id, caps.as_ref());
+                        }
+                    });
+                },
+            );
         });
 
         ui.add_space(10.0);
@@ -858,29 +979,55 @@ impl ProfilesUiState {
                 });
             });
             ui.add_space(4.0);
+            let log_scroll_h = (ui.available_height() - 4.0).max(60.0);
             egui::ScrollArea::vertical()
                 .id_salt("profile_activity_log")
-                .max_height(105.0)
+                .min_scrolled_height(log_scroll_h)
+                .max_height(log_scroll_h)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    let row_w = ui.available_width().max(120.0);
+                    ui.set_max_width(row_w);
+                    if log_entries.is_empty() {
+                        ui.label(
+                            RichText::new(
+                                "No activity yet. Switch windows or click Apply Now to test.",
+                            )
+                            .size(11.5)
+                            .color(p.text_muted),
+                        );
+                    }
                     for entry in log_entries {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(&entry.timestamp)
-                                    .size(11.0)
-                                    .monospace()
-                                    .color(p.text_muted),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "[{}]",
-                                    entry.severity.as_str().to_uppercase()
-                                ))
-                                .size(11.0)
-                                .strong()
-                                .color(p.severity_fg(entry.severity)),
-                            );
-                            ui.label(RichText::new(&entry.message).size(11.5).color(p.text));
-                        });
+                        let mut job = LayoutJob::default();
+                        job.append(
+                            &format!("{}  ", entry.timestamp),
+                            0.0,
+                            TextFormat {
+                                font_id: FontId::monospace(11.0),
+                                color: p.text_muted,
+                                ..Default::default()
+                            },
+                        );
+                        job.append(
+                            &format!("[{}]  ", entry.severity.as_str().to_uppercase()),
+                            0.0,
+                            TextFormat {
+                                font_id: FontId::monospace(11.0),
+                                color: p.severity_fg(entry.severity),
+                                ..Default::default()
+                            },
+                        );
+                        job.append(
+                            &entry.message,
+                            0.0,
+                            TextFormat {
+                                font_id: FontId::proportional(11.5),
+                                color: p.text,
+                                ..Default::default()
+                            },
+                        );
+                        ui.add(egui::Label::new(job).wrap());
+                        ui.add_space(2.0);
                     }
                 });
         });
@@ -994,13 +1141,15 @@ impl ProfilesUiState {
 }
 
 fn card_frame(ui: &mut egui::Ui, p: Palette, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let inner_w = (ui.available_width() - 24.0).max(120.0);
     egui::Frame::NONE
         .fill(p.surface)
         .stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            ui.set_width(inner_w);
+            ui.set_max_width(inner_w);
             add_contents(ui);
         });
 }
@@ -1023,11 +1172,12 @@ fn status_pill(ui: &mut egui::Ui, p: Palette, label: &str, value: &str) {
         .fill(p.surface_alt)
         .stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::symmetric(8, 3))
+        .inner_margin(Margin::symmetric(7, 3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
                 ui.label(RichText::new(label).size(10.0).strong().color(p.text_muted));
-                ui.label(RichText::new(value).size(11.5).monospace().color(p.text));
+                ui.label(RichText::new(value).size(11.0).monospace().color(p.text));
             });
         });
 }
@@ -1036,21 +1186,34 @@ fn semantic_banner(ui: &mut egui::Ui, p: Palette, mode: ThemeMode, severity: Sev
     let fg = p.severity_fg(severity);
     let bg = p.severity_bg(severity, mode);
     let border = Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 120);
+    let inner_w = (ui.available_width() - 20.0).max(120.0);
     egui::Frame::NONE
         .fill(bg)
         .stroke(Stroke::new(1.0_f32, border))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 7))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(severity.as_str().to_uppercase())
-                        .size(11.0)
-                        .strong()
-                        .color(fg),
-                );
-                ui.label(RichText::new(text).size(12.0).color(p.text));
-            });
+            ui.set_width(inner_w);
+            ui.set_max_width(inner_w);
+            let mut job = LayoutJob::default();
+            job.append(
+                &format!("{}  ", severity.as_str().to_uppercase()),
+                0.0,
+                TextFormat {
+                    font_id: FontId::proportional(11.0),
+                    color: fg,
+                    ..Default::default()
+                },
+            );
+            job.append(
+                text,
+                0.0,
+                TextFormat {
+                    font_id: FontId::proportional(12.0),
+                    color: p.text,
+                    ..Default::default()
+                },
+            );
+            ui.add(egui::Label::new(job).wrap());
         });
 }

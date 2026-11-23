@@ -593,54 +593,33 @@ impl eframe::App for PolledApp {
             .frame(
                 egui::Frame::NONE
                     .fill(p.surface)
-                    .inner_margin(Margin::symmetric(18, 14))
+                    .inner_margin(Margin::symmetric(18, 12))
                     .stroke(Stroke::new(1.0_f32, p.border)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Polled").size(18.0).strong().color(p.text));
-                            if let Some(s) = &self.summary {
-                                pill(
-                                    ui,
-                                    &format!("Win {}", s.windows_version),
-                                    p.surface_alt,
-                                    p.text_muted,
-                                    p.border,
-                                );
-                                if s.windows_build_changed {
-                                    pill(
-                                        ui,
-                                        "Windows Updated",
-                                        p.severity_bg(Severity::Warn, mode),
-                                        p.warn,
-                                        p.border,
-                                    );
-                                }
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            let hc_btn = if self.active_view == ActiveView::HealthCheck {
-                                primary_button("Health Check", p)
-                            } else {
-                                secondary_button("Health Check", p)
-                            };
-                            if ui.add(hc_btn).clicked() {
-                                self.active_view = ActiveView::HealthCheck;
-                            }
+                ui.spacing_mut().item_spacing.y = 8.0;
 
-                            let prof_btn = if self.active_view == ActiveView::Profiles {
-                                primary_button("Profiles", p)
-                            } else {
-                                secondary_button("Profiles", p)
-                            };
-                            if ui.add(prof_btn).clicked() {
-                                self.active_view = ActiveView::Profiles;
-                            }
-                        });
-                    });
+                // Row 1: App title & Windows build (left) | Startup & Theme (right)
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Polled").size(18.0).strong().color(p.text));
+                    if let Some(s) = &self.summary {
+                        pill(
+                            ui,
+                            &format!("Win {}", s.windows_version),
+                            p.surface_alt,
+                            p.text_muted,
+                            p.border,
+                        );
+                        if s.windows_build_changed {
+                            pill(
+                                ui,
+                                "Windows Updated",
+                                p.severity_bg(Severity::Warn, mode),
+                                p.warn,
+                                p.border,
+                            );
+                        }
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(secondary_button(self.theme.label(), p)).clicked() {
@@ -661,8 +640,31 @@ impl eframe::App for PolledApp {
                         {
                             toggle_autostart = true;
                         }
+                    });
+                });
 
-                        if self.active_view == ActiveView::HealthCheck {
+                // Row 2: Navigation tabs (left) | Health Check bulk actions (right)
+                ui.horizontal(|ui| {
+                    let hc_btn = if self.active_view == ActiveView::HealthCheck {
+                        primary_button("Health Check", p)
+                    } else {
+                        secondary_button("Health Check", p)
+                    };
+                    if ui.add(hc_btn).clicked() {
+                        self.active_view = ActiveView::HealthCheck;
+                    }
+
+                    let prof_btn = if self.active_view == ActiveView::Profiles {
+                        primary_button("Profiles", p)
+                    } else {
+                        secondary_button("Profiles", p)
+                    };
+                    if ui.add(prof_btn).clicked() {
+                        self.active_view = ActiveView::Profiles;
+                    }
+
+                    if self.active_view == ActiveView::HealthCheck {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let undo_count = undoable_set.len();
                             if ui
                                 .add_enabled(
@@ -690,8 +692,8 @@ impl eframe::App for PolledApp {
                             {
                                 trigger_rescan = true;
                             }
-                        }
-                    });
+                        });
+                    }
                 });
             });
 
@@ -705,18 +707,24 @@ impl eframe::App for PolledApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("Snapshot: {}", self.snapshot_path))
-                            .size(11.0)
-                            .monospace()
-                            .color(p.text_muted),
-                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new("Close [X] minimizes to tray • No telemetry • GPL-3.0")
                                 .size(11.0)
                                 .color(p.text_muted),
                         );
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("Snapshot: {}", self.snapshot_path))
+                                        .size(11.0)
+                                        .monospace()
+                                        .color(p.text_muted),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&self.snapshot_path);
+                        });
                     });
                 });
             });
@@ -729,6 +737,9 @@ impl eframe::App for PolledApp {
                     .inner_margin(Margin::symmetric(18, 14)),
             )
             .show(ctx, |ui| {
+                let content_w = ui.available_width().max(320.0);
+                ui.set_max_width(content_w);
+
                 if self.active_view == ActiveView::Profiles {
                     self.profiles_ui
                         .render(ctx, ui, p, mode, &self.profile_runtime);
@@ -744,18 +755,24 @@ impl eframe::App for PolledApp {
                             } else {
                                 "Regressions detected since your previous scan:"
                             };
-                            ui.label(RichText::new(heading).strong().color(p.warn));
+                            ui.add(
+                                egui::Label::new(RichText::new(heading).strong().color(p.warn))
+                                    .wrap(),
+                            );
                             for reg in &summary.regressions {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "• {}: {} -> {} ({})",
-                                        reg.name,
-                                        reg.previous.as_str().to_uppercase(),
-                                        reg.current.as_str().to_uppercase(),
-                                        reg.current_value
-                                    ))
-                                    .size(12.5)
-                                    .color(p.text),
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "• {}: {} -> {} ({})",
+                                            reg.name,
+                                            reg.previous.as_str().to_uppercase(),
+                                            reg.current.as_str().to_uppercase(),
+                                            reg.current_value
+                                        ))
+                                        .size(12.5)
+                                        .color(p.text),
+                                    )
+                                    .wrap(),
                                 );
                             }
                         });
@@ -768,13 +785,21 @@ impl eframe::App for PolledApp {
                     let mut dismiss = false;
                     banner_frame(ui, p, None, mode, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&msg).color(p.text));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui.add(secondary_button("Dismiss", p)).clicked() {
                                         dismiss = true;
                                     }
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(RichText::new(&msg).color(p.text))
+                                                    .wrap(),
+                                            );
+                                        },
+                                    );
                                 },
                             );
                         });
@@ -789,13 +814,21 @@ impl eframe::App for PolledApp {
                     let mut dismiss = false;
                     banner_frame(ui, p, Some(p.bad), mode, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&err).color(p.bad));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui.add(secondary_button("Dismiss", p)).clicked() {
                                         dismiss = true;
                                     }
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(RichText::new(&err).color(p.bad))
+                                                    .wrap(),
+                                            );
+                                        },
+                                    );
                                 },
                             );
                         });
@@ -958,7 +991,10 @@ impl eframe::App for PolledApp {
                         );
                     });
                     ui.add_space(8.0);
-                    ui.label(RichText::new(&pending.reason).size(13.0).color(p.text_muted));
+                    ui.add(
+                        egui::Label::new(RichText::new(&pending.reason).size(13.0).color(p.text_muted))
+                            .wrap(),
+                    );
                     ui.add_space(10.0);
 
                     egui::Frame::NONE
@@ -967,12 +1003,15 @@ impl eframe::App for PolledApp {
                         .corner_radius(CornerRadius::same(6))
                         .inner_margin(Margin::same(10))
                         .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(
-                                    "Polled stays non-elevated and launches polled.exe only for this single action. Your original setting is saved to baseline_snapshot.json before any change.",
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        "Polled stays non-elevated and launches polled.exe only for this single action. Your original setting is saved to baseline_snapshot.json before any change.",
+                                    )
+                                    .size(12.0)
+                                    .color(p.text_muted),
                                 )
-                                .size(12.0)
-                                .color(p.text_muted),
+                                .wrap(),
                             );
                         });
 
@@ -1118,6 +1157,7 @@ fn render_check_card(
         && (check.severity >= Severity::Warn
             || (check.id == "power_plan" && check.severity == Severity::Info));
 
+    let inner_w = (ui.available_width() - 26.0).max(160.0);
     let frame = egui::Frame::NONE
         .fill(p.surface)
         .stroke(Stroke::new(1.0_f32, p.border))
@@ -1125,7 +1165,8 @@ fn render_check_card(
         .inner_margin(Margin::same(13));
 
     let resp = frame.show(ui, |ui| {
-        ui.set_width(ui.available_width());
+        ui.set_width(inner_w);
+        ui.set_max_width(inner_w);
 
         ui.horizontal(|ui| {
             pill(
@@ -1189,7 +1230,9 @@ fn render_check_card(
         });
 
         ui.add_space(7.0);
-        ui.label(RichText::new(&check.reason).size(12.2).color(p.text_muted));
+        ui.add(
+            egui::Label::new(RichText::new(&check.reason).size(12.2).color(p.text_muted)).wrap(),
+        );
     });
 
     let rect = resp.response.rect;
@@ -1215,15 +1258,17 @@ fn secondary_button(label: &str, p: Palette) -> egui::Button<'_> {
 }
 
 fn value_box(ui: &mut egui::Ui, p: Palette, label: &str, value: &str, text_color: Color32) {
+    let inner_w = (ui.available_width() - 20.0).max(100.0);
     egui::Frame::NONE
         .fill(p.surface_alt)
         .stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 7))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            ui.set_width(inner_w);
+            ui.set_max_width(inner_w);
             ui.label(RichText::new(label).size(10.0).strong().color(p.text_muted));
-            ui.label(RichText::new(value).size(12.5).color(text_color));
+            ui.add(egui::Label::new(RichText::new(value).size(12.5).color(text_color)).wrap());
         });
 }
 
@@ -1247,13 +1292,15 @@ fn banner_frame(
         }
         None => (p.surface, p.border),
     };
+    let inner_w = (ui.available_width() - 24.0).max(120.0);
     egui::Frame::NONE
         .fill(fill)
         .stroke(Stroke::new(1.0_f32, border))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(12, 9))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            ui.set_width(inner_w);
+            ui.set_max_width(inner_w);
             add_contents(ui);
         });
 }
