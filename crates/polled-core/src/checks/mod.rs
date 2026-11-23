@@ -5,14 +5,20 @@
 pub mod accel_curves;
 pub mod accessibility_shortcuts;
 pub mod enhance_pointer_precision;
+pub mod game_bar_capture;
 pub mod game_mode;
 pub mod hags;
+pub mod monitor_refresh;
+pub mod pcie_aspm;
 pub mod pointer_speed;
 pub mod power_plan;
 pub mod runner;
 pub mod snapshot;
 pub mod state;
+pub mod timer_resolution;
+pub mod usb_power_management;
 pub mod usb_selective_suspend;
+pub mod vbs_memory_integrity;
 pub mod vendor_software;
 
 use serde::{Deserialize, Serialize};
@@ -106,16 +112,22 @@ pub trait HealthCheck: Send + Sync {
     }
 }
 
-/// Returns all 11 registered Phase 1 health checks in display order.
+/// Returns all 17 registered input & performance health checks in display order.
 pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
     vec![
         Box::new(enhance_pointer_precision::EnhancePointerPrecisionCheck),
         Box::new(pointer_speed::PointerSpeedCheck),
         Box::new(accel_curves::AccelCurvesCheck),
         Box::new(usb_selective_suspend::UsbSelectiveSuspendCheck),
+        Box::new(usb_power_management::UsbPowerManagementCheck),
+        Box::new(pcie_aspm::PcieAspmCheck),
         Box::new(power_plan::PowerPlanCheck),
+        Box::new(timer_resolution::TimerResolutionCheck),
+        Box::new(monitor_refresh::MonitorRefreshCheck),
         Box::new(game_mode::GameModeCheck),
+        Box::new(game_bar_capture::GameBarCaptureCheck),
         Box::new(hags::HagsCheck),
+        Box::new(vbs_memory_integrity::VbsMemoryIntegrityCheck),
         Box::new(accessibility_shortcuts::StickyKeysShortcutCheck),
         Box::new(accessibility_shortcuts::FilterKeysShortcutCheck),
         Box::new(accessibility_shortcuts::MouseKeysShortcutCheck),

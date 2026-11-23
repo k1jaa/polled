@@ -7,8 +7,8 @@ use std::sync::Mutex;
 
 use crate::error::{PolledError, Result};
 use crate::win::{
-    AccessibilityKind, MouseAccelParams, PowerSchemeInfo, PowerValueIndex, ProcessSample, RegHive,
-    SystemEnv, WindowsVersion,
+    AccessibilityKind, DisplayModeInfo, MouseAccelParams, PowerSchemeInfo, PowerValueIndex,
+    ProcessSample, RegHive, SystemEnv, TimerResolutionSample, UsbPowerDevice, WindowsVersion,
 };
 
 #[derive(Debug, Clone)]
@@ -29,6 +29,9 @@ struct MockState {
     power_settings: HashMap<(String, String, String), PowerValueIndex>,
     processes: Vec<ProcessSample>,
     windows_version: WindowsVersion,
+    displays: Vec<DisplayModeInfo>,
+    timer_sample: TimerResolutionSample,
+    usb_power_devices: Vec<UsbPowerDevice>,
     require_elevation_for_power_writes: bool,
 }
 
@@ -68,6 +71,24 @@ impl Default for MockState {
                 build: "26200".to_string(),
                 ubr: 1000,
             },
+            displays: vec![DisplayModeInfo {
+                device_name: r"\\.\DISPLAY1".to_string(),
+                friendly_name: "Primary Monitor".to_string(),
+                is_primary: true,
+                width: 2560,
+                height: 1440,
+                current_hz: 240,
+                max_supported_hz: 240,
+            }],
+            timer_sample: TimerResolutionSample {
+                requested_ms: 1,
+                samples: 48,
+                min_ms: 1.01,
+                median_ms: 1.50,
+                p95_ms: 1.98,
+                max_ms: 2.10,
+            },
+            usb_power_devices: Vec::new(),
             require_elevation_for_power_writes: false,
         }
     }
@@ -104,6 +125,18 @@ impl MockEnv {
 
     pub fn set_processes(&self, processes: Vec<ProcessSample>) {
         self.state.lock().unwrap().processes = processes;
+    }
+
+    pub fn set_displays(&self, displays: Vec<DisplayModeInfo>) {
+        self.state.lock().unwrap().displays = displays;
+    }
+
+    pub fn set_timer_sample(&self, sample: TimerResolutionSample) {
+        self.state.lock().unwrap().timer_sample = sample;
+    }
+
+    pub fn set_usb_power_devices(&self, devices: Vec<UsbPowerDevice>) {
+        self.state.lock().unwrap().usb_power_devices = devices;
     }
 
     pub fn set_require_elevation_for_power_writes(&self, required: bool) {
@@ -330,5 +363,17 @@ impl SystemEnv for MockEnv {
 
     fn windows_version(&self) -> Result<WindowsVersion> {
         Ok(self.state.lock().unwrap().windows_version.clone())
+    }
+
+    fn list_display_modes(&self) -> Result<Vec<DisplayModeInfo>> {
+        Ok(self.state.lock().unwrap().displays.clone())
+    }
+
+    fn measure_timer_resolution(&self) -> Result<TimerResolutionSample> {
+        Ok(self.state.lock().unwrap().timer_sample.clone())
+    }
+
+    fn list_usb_power_devices(&self) -> Result<Vec<UsbPowerDevice>> {
+        Ok(self.state.lock().unwrap().usb_power_devices.clone())
     }
 }

@@ -2,7 +2,7 @@
 
 A small, fast Windows 10/11 tray utility that does two things:
 
-1. **Input Health Check** — finds Windows settings that hurt mouse input (pointer acceleration, pointer speed, USB selective suspend, accessibility shortcuts, power plan, Game Mode, etc.) and fixes them with one click and a full undo.
+1. **Input Health Check** — audits Windows settings that affect mouse input and responsiveness (pointer acceleration, pointer speed, USB selective suspend & hub power saving, PCIe ASPM, timer wake jitter, monitor refresh rate, Game Bar capture, accessibility shortcuts, power plan, etc.) with one-click fixes and full undo.
 2. **Per-Game Mouse Profiles** — automatically switches DPI, polling rate, lift-off distance, and debounce when a game takes focus, then restores your desktop settings when you tab out.
 
 - **Lightweight & local:** Pure Rust tray app (~6 MB, no WebView2/Electron, no account, no telemetry, no cloud).

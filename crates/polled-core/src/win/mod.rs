@@ -2,6 +2,8 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(windows)]
+pub mod display;
 pub mod mock;
 #[cfg(windows)]
 pub mod os_info;
@@ -12,6 +14,10 @@ pub mod processes;
 pub mod registry;
 #[cfg(windows)]
 pub mod spi;
+#[cfg(windows)]
+pub mod timer;
+#[cfg(windows)]
+pub mod usb_power;
 
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +87,46 @@ impl WindowsVersion {
     }
 }
 
+/// Active display resolution and refresh-rate metadata returned by `EnumDisplaySettingsW`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayModeInfo {
+    pub device_name: String,
+    pub friendly_name: String,
+    pub is_primary: bool,
+    pub width: u32,
+    pub height: u32,
+    pub current_hz: u32,
+    pub max_supported_hz: u32,
+}
+
+/// Statistics from a short non-elevated Windows 1 ms timer wake-jitter micro-test.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimerResolutionSample {
+    pub requested_ms: u32,
+    pub samples: usize,
+    pub min_ms: f64,
+    pub median_ms: f64,
+    pub p95_ms: f64,
+    pub max_ms: f64,
+}
+
+/// Distinguishes connected mice/receivers from USB root hubs in USB power inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsbPowerDeviceKind {
+    MouseOrDongle,
+    RootHub,
+}
+
+/// Power-saving state inspected from a USB mouse/dongle or USB Root Hub device node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbPowerDevice {
+    pub name: String,
+    pub kind: UsbPowerDeviceKind,
+    pub power_saving_enabled: bool,
+    pub detail: String,
+}
+
 /// Abstraction over all Windows system APIs used by Polled.
 ///
 /// Production code passes `WindowsEnv` (real `windows-rs` + `sysinfo` calls);
@@ -128,9 +174,12 @@ pub trait SystemEnv: Send + Sync {
         values: PowerValueIndex,
     ) -> Result<()>;
 
-    // --- Process & OS inspection ---
+    // --- Process, display, timer & USB power inspection ---
     fn list_processes(&self) -> Result<Vec<ProcessSample>>;
     fn windows_version(&self) -> Result<WindowsVersion>;
+    fn list_display_modes(&self) -> Result<Vec<DisplayModeInfo>>;
+    fn measure_timer_resolution(&self) -> Result<TimerResolutionSample>;
+    fn list_usb_power_devices(&self) -> Result<Vec<UsbPowerDevice>>;
 }
 
 /// Real Windows implementation backed by `windows-rs` and `sysinfo`.
@@ -229,5 +278,17 @@ impl SystemEnv for WindowsEnv {
 
     fn windows_version(&self) -> Result<WindowsVersion> {
         os_info::read_windows_version()
+    }
+
+    fn list_display_modes(&self) -> Result<Vec<DisplayModeInfo>> {
+        display::list_display_modes()
+    }
+
+    fn measure_timer_resolution(&self) -> Result<TimerResolutionSample> {
+        timer::measure_timer_resolution()
+    }
+
+    fn list_usb_power_devices(&self) -> Result<Vec<UsbPowerDevice>> {
+        usb_power::list_usb_power_devices()
     }
 }

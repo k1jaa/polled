@@ -40,6 +40,10 @@ pub enum SavedValue {
         auto_game_mode_enabled: Option<u32>,
         allow_auto_game_mode: Option<u32>,
     },
+    GameDvr {
+        app_capture_enabled: Option<u32>,
+        game_dvr_enabled: Option<u32>,
+    },
     AccessibilityFlags {
         kind: AccessibilityKind,
         flags: u32,

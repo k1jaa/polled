@@ -410,24 +410,41 @@ mod tests {
     }
 
     #[test]
-    fn default_engine_registers_all_11_checks_and_roundtrips_safe_fixes() {
+    fn default_engine_registers_all_17_checks_and_roundtrips_safe_fixes() {
         let dir = TempDir::new().unwrap();
         let paths = AppPaths::from_root(dir.path());
         let env = MockEnv::new();
         env.set_mouse_speed(14).unwrap();
+        env.reg_set_dword(
+            crate::win::RegHive::Hkcu,
+            r"Software\Microsoft\Windows\CurrentVersion\GameDVR",
+            "AppCaptureEnabled",
+            1,
+        )
+        .unwrap();
 
         let engine = HealthEngine::with_default_checks();
-        assert_eq!(engine.checks().len(), 11);
+        assert_eq!(engine.checks().len(), 17);
 
         let initial = engine.scan_all(&env, &paths, true).unwrap();
-        assert_eq!(initial.checks.len(), 11);
+        assert_eq!(initial.checks.len(), 17);
 
         let fixed = engine.fix_all_safe(&env, &paths).unwrap();
         assert!(fixed.iter().any(|r| r.id == "pointer_speed"));
+        assert!(fixed.iter().any(|r| r.id == "game_bar_capture"));
         assert_eq!(env.get_mouse_speed().unwrap(), 10);
 
         let undo = engine.undo_all(&env, &paths).unwrap();
         assert!(undo.failed.is_empty());
         assert_eq!(env.get_mouse_speed().unwrap(), 14);
+        assert_eq!(
+            env.reg_get_dword(
+                crate::win::RegHive::Hkcu,
+                r"Software\Microsoft\Windows\CurrentVersion\GameDVR",
+                "AppCaptureEnabled"
+            )
+            .unwrap(),
+            Some(1)
+        );
     }
 }

@@ -5,12 +5,15 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, WIN32_ERROR};
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, WIN32_ERROR,
+};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_BINARY,
-    REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_ENUMERATE_SUB_KEYS,
+    KEY_QUERY_VALUE, KEY_SET_VALUE, REG_BINARY, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+    REG_VALUE_TYPE,
 };
 
 use crate::error::{PolledError, Result};
@@ -297,4 +300,57 @@ pub fn delete_value(hive: RegHive, subkey: &str, name: &str) -> Result<()> {
         return Err(map_reg_error(status, hive, subkey, "RegDeleteValueW", true));
     }
     Ok(())
+}
+
+/// Lists direct child subkey names under `hive\subkey`. Returns an empty list if the key is absent.
+pub fn list_subkeys(hive: RegHive, subkey: &str) -> Result<Vec<String>> {
+    let subkey_w = to_wide_null(subkey);
+    let mut handle = HKEY::default();
+    // SAFETY: `subkey_w` is null-terminated UTF-16 and `handle` is valid out-pointer storage.
+    let status = unsafe {
+        RegOpenKeyExW(
+            root_hkey(hive),
+            PCWSTR(subkey_w.as_ptr()),
+            Some(0),
+            KEY_ENUMERATE_SUB_KEYS,
+            &mut handle,
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(Vec::new());
+    }
+    if status.is_err() {
+        return Err(map_reg_error(status, hive, subkey, "RegOpenKeyExW", false));
+    }
+    let key = OwnedHkey(handle);
+
+    let mut names = Vec::new();
+    let mut index: u32 = 0;
+    let mut buf = vec![0u16; 256];
+    loop {
+        let mut len = buf.len() as u32;
+        // SAFETY: `key.0` is open with `KEY_ENUMERATE_SUB_KEYS`; `buf` holds `len` UTF-16 code units.
+        let status = unsafe {
+            RegEnumKeyExW(
+                key.0,
+                index,
+                Some(PWSTR(buf.as_mut_ptr())),
+                &mut len,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if status == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if status.is_err() {
+            return Err(map_reg_error(status, hive, subkey, "RegEnumKeyExW", false));
+        }
+        names.push(String::from_utf16_lossy(&buf[..len as usize]));
+        index += 1;
+    }
+
+    Ok(names)
 }
