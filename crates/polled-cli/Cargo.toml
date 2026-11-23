@@ -1,0 +1,17 @@
+[package]
+name = "polled-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Command-line interface and on-demand elevation helper for Polled"
+
+[[bin]]
+name = "polled"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+polled-core = { path = "../polled-core" }
+serde_json.workspace = true
