@@ -2499,6 +2499,7 @@ dependencies = [
 name = "polled-gui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "eframe",
  "notify-rust",
  "polled-core",

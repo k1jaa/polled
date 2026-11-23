@@ -9,6 +9,8 @@ mod app;
 mod elevation;
 mod icon;
 mod notifications;
+mod profile_runtime;
+mod profiles_ui;
 mod theme;
 mod tray;
 
@@ -19,8 +21,8 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title("Polled")
-            .with_inner_size([960.0, 700.0])
-            .with_min_inner_size([720.0, 500.0])
+            .with_inner_size([980.0, 720.0])
+            .with_min_inner_size([760.0, 540.0])
             .with_icon(icon::window_icon()),
         ..Default::default()
     };

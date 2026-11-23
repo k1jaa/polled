@@ -12,6 +12,7 @@ name = "polled-gui"
 path = "src/main.rs"
 
 [dependencies]
+chrono.workspace = true
 eframe.workspace = true
 notify-rust.workspace = true
 polled-core = { path = "../polled-core" }

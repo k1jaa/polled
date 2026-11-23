@@ -2,18 +2,18 @@
 
 Open-source, lightweight pure-Rust Windows 10/11 utility for competitive mouse input hygiene and per-game peripheral profiles.
 
-- **Small & fast:** 100% pure Rust (`eframe`/`egui` + Windows APIs) — no WebView2, no Electron, no Node.js runtime, low RAM, system tray support.
+- **Small & fast:** 100% pure Rust (`eframe`/`egui` + `hidapi` + `windows-rs`) — no WebView2, no Electron, no Node.js runtime, monochrome Dark/Light UI, system tray support.
 - **No account, no telemetry, no cloud:** Fully local. Data lives in `%LOCALAPPDATA%\Polled\`.
-- **Safe & reversible by design:** Before applying any fix, Polled atomically saves the original Windows values to `baseline_snapshot.json` (first-write-wins). One click or `polled --undo-all` restores everything.
-- **No persistent admin rights:** Runs non-elevated. Only requests UAC elevation for the specific check that needs HKLM/power-policy access, explaining why first.
-- **Anti-cheat friendly:** No DLL injection, no hooks into game processes, no reading game memory. Works alongside Vanguard, FACEIT, EAC, and BattlEye.
+- **Safe & reversible by design:** Before applying any Windows fix, Polled atomically saves original values to `baseline_snapshot.json` (first-write-wins). One click or `polled --undo-all` restores everything. Nothing touches device firmware.
+- **No persistent admin rights:** Runs non-elevated. Only requests UAC elevation for the specific fix that needs HKLM/power-policy access, explaining why first.
+- **Anti-cheat friendly:** No DLL injection, no hooks into game processes, no reading game memory. Per-game detection uses an out-of-context `SetWinEventHook` (`EVENT_SYSTEM_FOREGROUND`) + `PROCESS_QUERY_LIMITED_INFORMATION`. Works alongside Vanguard, FACEIT, EAC, and BattlEye.
 - **License:** GNU GPL-3.0-or-later.
 
 ---
 
 ## Features
 
-### Phase 1 — Input Settings Health Check *(Implemented)*
+### Phase 1 — Input Settings Health Check
 
 | Check ID | Setting | Auto-Fix | Admin Needed |
 | --- | --- | :---: | :---: |
@@ -29,36 +29,72 @@ Open-source, lightweight pure-Rust Windows 10/11 utility for competitive mouse i
 | `mouse_keys_shortcut` | Mouse Keys shortcut (Left Alt + Left Shift + NumLock) | Yes | No |
 | `vendor_software` | Running peripheral suites (G Hub, Synapse, iCUE, SteelSeries GG, Armoury Crate) CPU & RAM footprint | Report only | No |
 
-Additional Phase 1 behavior:
 - **Baseline undo snapshot:** `%LOCALAPPDATA%\Polled\baseline_snapshot.json` records true original pre-Polled values before any mutation.
-- **Update & regression alerts:** Re-scans on startup and when the Windows build/UBR changes (`CurrentBuildNumber.UBR`), notifying **only** if a setting got worse.
+- **Update & regression alerts:** Re-scans on startup and when `CurrentBuildNumber.UBR` changes, notifying **only** if a setting got worse.
 
-### Phase 2 — Per-Game Peripheral Profiles *(Upcoming)*
+### Phase 2 — Per-Game Peripheral Profiles
 
-- Out-of-context foreground window detection (`SetWinEventHook EVENT_SYSTEM_FOREGROUND`) with 1–2 s focus debounce.
-- Versioned, exportable/importable JSON profiles (DPI, polling rate, LOD, debounce, optional Windows pointer speed) with automatic desktop fallback.
-- Flash-wear protection (volatile RAM writes when supported; diff-before-write + rate limiting + warnings on flash-only devices) and mandatory read-back verification with automatic rollback.
-- `--dump` HID interface & capability dumper for community device submissions.
+- **Event-driven game detection:** Uses `SetWinEventHook` (`EVENT_SYSTEM_FOREGROUND`, `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`) — zero polling loops, zero admin.
+- **Focus debouncing:** Waits for the focused app to stay in the foreground (default `1500 ms`, configurable `500–5000 ms`) before switching, so alt-tab spam triggers zero device writes.
+- **Versioned JSON profiles + export/import:** Stored in `%LOCALAPPDATA%\Polled\profiles.json` (`schema_version: 1`) with single-profile `polled.profile.v1` JSON export/import ready for shareable settings cards, plus a fallback `"Desktop (Default)"` profile.
+- **Mandatory read-back verification + rollback:** After every mouse write, Polled reads settings back from the mouse. If they do not match the target, Polled automatically rolls back to the pre-write values and logs an error.
+- **Dry-run simulator:** Built-in `Dry-Run Virtual Mouse` (both volatile RAM and flash-only modes) for testing profile switching without hardware.
+
+---
+
+## Flash-Wear Warning (Read Before Auto-Switching)
+
+Some wireless gaming mice expose volatile RAM-only write commands, while others — including the **Pulsar X2 CrazyLight** — write `CMD_MEM_SET (0x07)` changes directly to persistent onboard memory (flash/NVRAM).
+
+To protect your mouse's onboard flash from excessive erase/write cycles:
+1. **Register-level diffing:** Polled reads the mouse first and writes **only** registers whose value actually changed (0 writes when settings already match).
+2. **Focus debounce:** Quick alt-tabs cancel pending switches before any HID packet is sent.
+3. **Flash write rate-limiter:** On flash-only devices (`supports_volatile_writes = false`), Polled enforces a cooldown between onboard flash writes (default 15 s) and tracks session flash writes visibly in the UI.
+4. **Recommendation:** Keep your desktop and game profiles sharing the same baseline settings where possible (only varying what you actually change per game) to minimize onboard flash writes.
+
+---
+
+## Supported Devices
+
+Every hardware backend in Polled is explicitly labeled by verification status:
+
+| Device | VID:PID | Status | Volatile RAM Writes | Protocol Source & License |
+| --- | --- | --- | :---: | --- |
+| Dry-Run Virtual Mouse | *(simulated)* | Built-in simulator | Configurable | Internal test backend |
+| Pulsar X2 CrazyLight Wireless (8K Dongle) | `3710:5406` | **Implemented from docs** *(awaiting hardware sign-off on Mini)* | No (diffed + rate-limited) | [packerlschupfer/pulsar-mouse-linux](https://github.com/packerlschupfer/pulsar-mouse-linux) (MIT) |
+| Pulsar X2 CrazyLight Wired (USB-C, 1K max) | `3710:3414` | **Implemented from docs** *(awaiting hardware sign-off on Mini)* | No (diffed + rate-limited) | [packerlschupfer/pulsar-mouse-linux](https://github.com/packerlschupfer/pulsar-mouse-linux) (MIT) |
+
+> **Protocol policy:** Polled never guesses HID report bytes. Backends are implemented strictly from documented, license-compatible open-source protocols or real USBPcap/Wireshark captures.
+
+### Submitting Data for an Unsupported Mouse
+
+Run `--dump` (serial numbers are redacted automatically by default) and attach the JSON output to a GitHub issue:
+
+```powershell
+# Human-readable list of HID interfaces and usage pages
+polled --dump
+
+# Filter by Vendor ID (hex) and output JSON
+polled --dump --vid 3710 --json
+```
 
 ---
 
 ## CLI Usage
 
 ```powershell
-# Scan all 11 input health checks (human-readable)
+# Phase 1: Health checks
 polled --scan
-
-# Machine-readable JSON scan output
 polled --scan --json
-
-# Fix a single check (saves baseline snapshot first)
 polled --fix mouse_keys_shortcut
-
-# Undo a single check from the saved snapshot
 polled --undo mouse_keys_shortcut
-
-# Restore every setting changed by Polled
 polled --undo-all
+
+# Phase 2: HID discovery & hardware verification (read-only)
+polled --dump
+polled --dump --vid 3710 --json
+polled --detect
+polled --detect --json
 ```
 
 Exit codes:
@@ -69,19 +105,6 @@ Exit codes:
 
 ---
 
-## Supported Devices *(Phase 2)*
-
-Every hardware backend in Polled is explicitly labeled by verification status:
-
-| Device | Support Status | Volatile RAM Writes | Notes |
-| --- | --- | :---: | --- |
-| Dry-Run Virtual Mouse | Built-in simulator *(Phase 2)* | Yes | Logs operations for hardware-free testing |
-| Pulsar X2 Crazylight Mini | Planned — *Tested on hardware* *(Phase 2)* | TBD (pending `--dump` / capture) | First real hardware target |
-
-> **Protocol policy:** Polled never guesses HID report bytes. Backends are implemented strictly from verified open-source protocol documentation (with source & license attribution) or real USBPcap/Wireshark captures.
-
----
-
 ## Building from Source (Windows 10/11)
 
 Prerequisites:
@@ -89,7 +112,7 @@ Prerequisites:
 - Microsoft Visual Studio C++ Build Tools
 
 ```powershell
-# Run all checks & unit tests
+# Format, lint & run all unit tests
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -109,9 +132,11 @@ Release binaries are written to `target/release/polled.exe` and `target/release/
 
 ```text
 crates/
-  polled-core/         Pure Rust library (Windows API traits, 11 checks, snapshots, state)
+  polled-core/         Pure Rust core (Windows API traits, 11 checks, snapshots,
+                       HID --dump, MouseDevice trait, SafeDeviceController,
+                       Pulsar X2 CrazyLight backend, profiles, debouncer, watcher)
   polled-cli/          Standalone console binary (polled.exe) & on-demand UAC helper
-  polled-gui/          Pure-Rust native GUI & tray app (eframe/egui + tray-icon)
+  polled-gui/          Pure-Rust monochrome Dark/Light GUI & tray app (eframe/egui)
 ```
 
 ## License

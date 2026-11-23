@@ -13,8 +13,16 @@ use polled_core::{AppPaths, CheckReport, HealthEngine, PolledError, ScanSummary,
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
 use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
+use crate::profile_runtime::{ProfileRuntimeHandle, ProfileRuntimeSnapshot};
+use crate::profiles_ui::ProfilesUiState;
 use crate::theme::{Palette, ThemeMode};
 use crate::tray::TrayController;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveView {
+    HealthCheck,
+    Profiles,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterMode {
@@ -52,10 +60,12 @@ pub(crate) enum WorkerMsg {
         elevation_prompt: Option<PendingElevation>,
         updated_scan: Option<ScanSummary>,
     },
+    ProfileRuntimeUpdated(Box<ProfileRuntimeSnapshot>),
 }
 
 pub struct PolledApp {
     theme: ThemeMode,
+    active_view: ActiveView,
     summary: Option<ScanSummary>,
     snapshot_path: String,
     filter: FilterMode,
@@ -64,6 +74,9 @@ pub struct PolledApp {
     status_message: Option<String>,
     error_message: Option<String>,
     pending_elevation: Option<PendingElevation>,
+
+    profiles_ui: ProfilesUiState,
+    profile_runtime: ProfileRuntimeHandle,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -82,6 +95,10 @@ impl PolledApp {
             TrayController::init(cc.egui_ctx.clone(), tx.clone(), Arc::clone(&quit_requested));
         spawn_windows_build_watcher(tx.clone(), cc.egui_ctx.clone());
 
+        let profiles_ui = ProfilesUiState::load();
+        let profile_runtime =
+            ProfileRuntimeHandle::start(profiles_ui.store.clone(), tx.clone(), cc.egui_ctx.clone());
+
         let snapshot_path = AppPaths::default_user_dir()
             .baseline_snapshot_path()
             .display()
@@ -89,6 +106,7 @@ impl PolledApp {
 
         let mut app = Self {
             theme,
+            active_view: ActiveView::HealthCheck,
             summary: None,
             snapshot_path,
             filter: FilterMode::All,
@@ -97,6 +115,8 @@ impl PolledApp {
             status_message: None,
             error_message: None,
             pending_elevation: None,
+            profiles_ui,
+            profile_runtime,
             tx,
             rx,
             quit_requested,
@@ -459,6 +479,9 @@ impl PolledApp {
                         self.pending_elevation = elevation_prompt;
                     }
                 }
+                WorkerMsg::ProfileRuntimeUpdated(snap) => {
+                    self.profiles_ui.runtime_snapshot = Some(*snap);
+                }
             }
         }
     }
@@ -544,11 +567,25 @@ impl eframe::App for PolledApp {
                                 }
                             }
                         });
-                        ui.label(
-                            RichText::new("Input Settings Health Check")
-                                .size(12.0)
-                                .color(p.text_muted),
-                        );
+                        ui.horizontal(|ui| {
+                            let hc_btn = if self.active_view == ActiveView::HealthCheck {
+                                primary_button("Health Check", p)
+                            } else {
+                                secondary_button("Health Check", p)
+                            };
+                            if ui.add(hc_btn).clicked() {
+                                self.active_view = ActiveView::HealthCheck;
+                            }
+
+                            let prof_btn = if self.active_view == ActiveView::Profiles {
+                                primary_button("Profiles", p)
+                            } else {
+                                secondary_button("Profiles", p)
+                            };
+                            if ui.add(prof_btn).clicked() {
+                                self.active_view = ActiveView::Profiles;
+                            }
+                        });
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -556,32 +593,34 @@ impl eframe::App for PolledApp {
                             toggle_theme = true;
                         }
 
-                        let undo_count = undoable_set.len();
-                        if ui
-                            .add_enabled(
-                                !self.busy && undo_count > 0,
-                                secondary_button(&format!("Undo All ({undo_count})"), p),
-                            )
-                            .clicked()
-                        {
-                            trigger_undo_all = true;
-                        }
+                        if self.active_view == ActiveView::HealthCheck {
+                            let undo_count = undoable_set.len();
+                            if ui
+                                .add_enabled(
+                                    !self.busy && undo_count > 0,
+                                    secondary_button(&format!("Undo All ({undo_count})"), p),
+                                )
+                                .clicked()
+                            {
+                                trigger_undo_all = true;
+                            }
 
-                        if ui
-                            .add_enabled(
-                                !self.busy && fixable_safe > 0,
-                                primary_button(&format!("Fix Safe Issues ({fixable_safe})"), p),
-                            )
-                            .clicked()
-                        {
-                            trigger_fix_all_safe = true;
-                        }
+                            if ui
+                                .add_enabled(
+                                    !self.busy && fixable_safe > 0,
+                                    primary_button(&format!("Fix Safe Issues ({fixable_safe})"), p),
+                                )
+                                .clicked()
+                            {
+                                trigger_fix_all_safe = true;
+                            }
 
-                        if ui
-                            .add_enabled(!self.busy, secondary_button("Rescan", p))
-                            .clicked()
-                        {
-                            trigger_rescan = true;
+                            if ui
+                                .add_enabled(!self.busy, secondary_button("Rescan", p))
+                                .clicked()
+                            {
+                                trigger_rescan = true;
+                            }
                         }
                     });
                 });
@@ -621,6 +660,12 @@ impl eframe::App for PolledApp {
                     .inner_margin(Margin::symmetric(18, 14)),
             )
             .show(ctx, |ui| {
+                if self.active_view == ActiveView::Profiles {
+                    self.profiles_ui
+                        .render(ctx, ui, p, mode, &self.profile_runtime);
+                    return;
+                }
+
                 // Regression alert banner
                 if let Some(summary) = &self.summary {
                     if !summary.regressions.is_empty() {
