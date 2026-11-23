@@ -737,7 +737,7 @@ impl eframe::App for PolledApp {
                     .inner_margin(Margin::symmetric(18, 14)),
             )
             .show(ctx, |ui| {
-                let content_w = ui.available_width().max(320.0);
+                let content_w = (ctx.screen_rect().width() - 36.0).max(320.0);
                 ui.set_max_width(content_w);
 
                 if self.active_view == ActiveView::Profiles {
@@ -749,7 +749,7 @@ impl eframe::App for PolledApp {
                 // Regression alert banner
                 if let Some(summary) = &self.summary {
                     if !summary.regressions.is_empty() {
-                        banner_frame(ui, p, Some(p.warn), mode, |ui| {
+                        banner_frame(ui, p, content_w, Some(p.warn), mode, |ui| {
                             let heading = if summary.windows_build_changed {
                                 "Windows Update changed your input settings:"
                             } else {
@@ -783,7 +783,7 @@ impl eframe::App for PolledApp {
                 // Transient status / error banners (neutral B&W for status, BAD red for errors)
                 if let Some(msg) = self.status_message.clone() {
                     let mut dismiss = false;
-                    banner_frame(ui, p, None, mode, |ui| {
+                    banner_frame(ui, p, content_w, None, mode, |ui| {
                         ui.horizontal(|ui| {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -812,7 +812,7 @@ impl eframe::App for PolledApp {
 
                 if let Some(err) = self.error_message.clone() {
                     let mut dismiss = false;
-                    banner_frame(ui, p, Some(p.bad), mode, |ui| {
+                    banner_frame(ui, p, content_w, Some(p.bad), mode, |ui| {
                         ui.horizontal(|ui| {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -839,42 +839,44 @@ impl eframe::App for PolledApp {
                     ui.add_space(8.0);
                 }
 
-                // Filter tabs + severity summary counters
+                // Filter tabs + severity summary counters (reflows cleanly on narrow windows)
                 let total_count = self.summary.as_ref().map_or(0, |s| s.checks.len());
                 let issues_count = warn_count + bad_count;
                 let undo_count = undoable_set.len();
 
-                ui.horizontal(|ui| {
-                    filter_tab(
-                        ui,
-                        p,
-                        &mut self.filter,
-                        FilterMode::All,
-                        &format!("All ({total_count})"),
-                    );
-                    filter_tab(
-                        ui,
-                        p,
-                        &mut self.filter,
-                        FilterMode::Issues,
-                        &format!("Issues ({issues_count})"),
-                    );
-                    filter_tab(
-                        ui,
-                        p,
-                        &mut self.filter,
-                        FilterMode::ReportOnly,
-                        "Report Only",
-                    );
-                    filter_tab(
-                        ui,
-                        p,
-                        &mut self.filter,
-                        FilterMode::Undoable,
-                        &format!("Undoable ({undo_count})"),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if content_w < 680.0 {
+                    ui.horizontal_wrapped(|ui| {
+                        filter_tab(
+                            ui,
+                            p,
+                            &mut self.filter,
+                            FilterMode::All,
+                            &format!("All ({total_count})"),
+                        );
+                        filter_tab(
+                            ui,
+                            p,
+                            &mut self.filter,
+                            FilterMode::Issues,
+                            &format!("Issues ({issues_count})"),
+                        );
+                        filter_tab(
+                            ui,
+                            p,
+                            &mut self.filter,
+                            FilterMode::ReportOnly,
+                            "Report Only",
+                        );
+                        filter_tab(
+                            ui,
+                            p,
+                            &mut self.filter,
+                            FilterMode::Undoable,
+                            &format!("Undoable ({undo_count})"),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
                         if self.busy {
                             ui.spinner();
                             ui.label(
@@ -883,14 +885,7 @@ impl eframe::App for PolledApp {
                                     .color(p.text_muted),
                             );
                         } else {
-                            pill(ui, &format!("{bad_count} Bad"), p.surface, p.bad, p.border);
-                            pill(
-                                ui,
-                                &format!("{warn_count} Warn"),
-                                p.surface,
-                                p.warn,
-                                p.border,
-                            );
+                            pill(ui, &format!("{ok_count} OK"), p.surface, p.ok, p.border);
                             pill(
                                 ui,
                                 &format!("{info_count} Info"),
@@ -898,13 +893,80 @@ impl eframe::App for PolledApp {
                                 p.info,
                                 p.border,
                             );
-                            pill(ui, &format!("{ok_count} OK"), p.surface, p.ok, p.border);
+                            pill(
+                                ui,
+                                &format!("{warn_count} Warn"),
+                                p.surface,
+                                p.warn,
+                                p.border,
+                            );
+                            pill(ui, &format!("{bad_count} Bad"), p.surface, p.bad, p.border);
                         }
                     });
-                });
+                } else {
+                    ui.horizontal(|ui| {
+                        filter_tab(
+                            ui,
+                            p,
+                            &mut self.filter,
+                            FilterMode::All,
+                            &format!("All ({total_count})"),
+                        );
+                        filter_tab(
+                            ui,
+                            p,
+                            &mut self.filter,
+                            FilterMode::Issues,
+                            &format!("Issues ({issues_count})"),
+                        );
+                        filter_tab(
+                            ui,
+                            p,
+                            &mut self.filter,
+                            FilterMode::ReportOnly,
+                            "Report Only",
+                        );
+                        filter_tab(
+                            ui,
+                            p,
+                            &mut self.filter,
+                            FilterMode::Undoable,
+                            &format!("Undoable ({undo_count})"),
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.busy {
+                                ui.spinner();
+                                ui.label(
+                                    RichText::new(&self.busy_label)
+                                        .size(12.0)
+                                        .color(p.text_muted),
+                                );
+                            } else {
+                                pill(ui, &format!("{bad_count} Bad"), p.surface, p.bad, p.border);
+                                pill(
+                                    ui,
+                                    &format!("{warn_count} Warn"),
+                                    p.surface,
+                                    p.warn,
+                                    p.border,
+                                );
+                                pill(
+                                    ui,
+                                    &format!("{info_count} Info"),
+                                    p.surface,
+                                    p.info,
+                                    p.border,
+                                );
+                                pill(ui, &format!("{ok_count} OK"), p.surface, p.ok, p.border);
+                            }
+                        });
+                    });
+                }
 
                 ui.add_space(10.0);
 
+                let card_w = (content_w - 14.0).max(240.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -952,6 +1014,7 @@ impl eframe::App for PolledApp {
                                 ui,
                                 p,
                                 mode,
+                                card_w,
                                 check,
                                 is_undoable,
                                 self.busy,
@@ -1145,6 +1208,7 @@ fn render_check_card(
     ui: &mut egui::Ui,
     p: Palette,
     mode: ThemeMode,
+    outer_w: f32,
     check: &CheckReport,
     is_undoable: bool,
     busy: bool,
@@ -1157,7 +1221,7 @@ fn render_check_card(
         && (check.severity >= Severity::Warn
             || (check.id == "power_plan" && check.severity == Severity::Info));
 
-    let inner_w = (ui.available_width() - 26.0).max(160.0);
+    let inner_w = (outer_w - 26.0).max(160.0);
     let frame = egui::Frame::NONE
         .fill(p.surface)
         .stroke(Stroke::new(1.0_f32, p.border))
@@ -1165,25 +1229,10 @@ fn render_check_card(
         .inner_margin(Margin::same(13));
 
     let resp = frame.show(ui, |ui| {
-        ui.set_width(inner_w);
+        ui.set_min_width(inner_w);
         ui.set_max_width(inner_w);
 
         ui.horizontal(|ui| {
-            pill(
-                ui,
-                &check.severity.as_str().to_uppercase(),
-                sev_bg,
-                sev_fg,
-                p.border,
-            );
-            ui.label(RichText::new(&check.name).size(14.5).strong().color(p.text));
-            ui.label(
-                RichText::new(&check.id)
-                    .size(11.5)
-                    .monospace()
-                    .color(p.text_muted),
-            );
-
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if show_fix {
                     let label = if check.requires_elevation {
@@ -1213,21 +1262,65 @@ fn render_check_card(
                 if !check.can_fix {
                     pill(ui, "Report only", p.surface_alt, p.text_muted, p.border);
                 }
+
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    pill(
+                        ui,
+                        &check.severity.as_str().to_uppercase(),
+                        sev_bg,
+                        sev_fg,
+                        p.border,
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&check.name).size(14.5).strong().color(p.text),
+                        )
+                        .truncate(),
+                    );
+                    if inner_w >= 640.0 {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&check.id)
+                                    .size(11.5)
+                                    .monospace()
+                                    .color(p.text_muted),
+                            )
+                            .truncate(),
+                        );
+                    }
+                });
             });
         });
 
         ui.add_space(8.0);
 
-        ui.columns(2, |cols| {
-            value_box(&mut cols[0], p, "CURRENT", &check.current_value, p.text);
+        if inner_w < 540.0 {
+            value_box(ui, p, inner_w, "CURRENT", &check.current_value, p.text);
+            ui.add_space(6.0);
             value_box(
-                &mut cols[1],
+                ui,
                 p,
+                inner_w,
                 "RECOMMENDED",
                 &check.recommended_value,
                 p.text_muted,
             );
-        });
+        } else {
+            let col_gap = 8.0;
+            let col_w = ((inner_w - col_gap) * 0.5).max(120.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = col_gap;
+                value_box(ui, p, col_w, "CURRENT", &check.current_value, p.text);
+                value_box(
+                    ui,
+                    p,
+                    col_w,
+                    "RECOMMENDED",
+                    &check.recommended_value,
+                    p.text_muted,
+                );
+            });
+        }
 
         ui.add_space(7.0);
         ui.add(
@@ -1257,15 +1350,22 @@ fn secondary_button(label: &str, p: Palette) -> egui::Button<'_> {
         .corner_radius(CornerRadius::same(6))
 }
 
-fn value_box(ui: &mut egui::Ui, p: Palette, label: &str, value: &str, text_color: Color32) {
-    let inner_w = (ui.available_width() - 20.0).max(100.0);
+fn value_box(
+    ui: &mut egui::Ui,
+    p: Palette,
+    outer_w: f32,
+    label: &str,
+    value: &str,
+    text_color: Color32,
+) {
+    let inner_w = (outer_w - 20.0).max(100.0);
     egui::Frame::NONE
         .fill(p.surface_alt)
         .stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 7))
         .show(ui, |ui| {
-            ui.set_width(inner_w);
+            ui.set_min_width(inner_w);
             ui.set_max_width(inner_w);
             ui.label(RichText::new(label).size(10.0).strong().color(p.text_muted));
             ui.add(egui::Label::new(RichText::new(value).size(12.5).color(text_color)).wrap());
@@ -1275,6 +1375,7 @@ fn value_box(ui: &mut egui::Ui, p: Palette, label: &str, value: &str, text_color
 fn banner_frame(
     ui: &mut egui::Ui,
     p: Palette,
+    outer_w: f32,
     semantic_accent: Option<Color32>,
     mode: ThemeMode,
     add_contents: impl FnOnce(&mut egui::Ui),
@@ -1292,14 +1393,14 @@ fn banner_frame(
         }
         None => (p.surface, p.border),
     };
-    let inner_w = (ui.available_width() - 24.0).max(120.0);
+    let inner_w = (outer_w - 24.0).max(120.0);
     egui::Frame::NONE
         .fill(fill)
         .stroke(Stroke::new(1.0_f32, border))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(12, 9))
         .show(ui, |ui| {
-            ui.set_width(inner_w);
+            ui.set_min_width(inner_w);
             ui.set_max_width(inner_w);
             add_contents(ui);
         });
@@ -1335,13 +1436,25 @@ fn filter_tab(
     }
 }
 
+/// Pre-measured pill badge so `ui.horizontal_wrapped` wraps pills cleanly on resize.
 fn pill(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32, border: Color32) {
-    egui::Frame::NONE
-        .fill(bg)
-        .stroke(Stroke::new(1.0_f32, border))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.0).strong().color(fg));
-        });
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_string(), egui::FontId::proportional(11.0), fg);
+    let pad_x = 8.0;
+    let pad_y = 3.0;
+    let desired = Vec2::new(galley.size().x + pad_x * 2.0, galley.size().y + pad_y * 2.0);
+    let (rect, _resp) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        painter.rect(
+            rect,
+            CornerRadius::same(10),
+            bg,
+            Stroke::new(1.0_f32, border),
+            egui::StrokeKind::Inside,
+        );
+        let pos = egui::pos2(rect.left() + pad_x, rect.center().y - galley.size().y * 0.5);
+        painter.galley(pos, galley, fg);
+    }
 }

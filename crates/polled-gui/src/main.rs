@@ -31,7 +31,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Polled")
             .with_inner_size([1040.0, 740.0])
-            .with_min_inner_size([800.0, 600.0])
+            .with_min_inner_size([680.0, 540.0])
             .with_visible(!start_minimized)
             .with_icon(icon::window_icon()),
         ..Default::default()
