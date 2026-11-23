@@ -9,12 +9,16 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 use polled_core::win::WindowsEnv;
-use polled_core::{AppPaths, CheckReport, HealthEngine, PolledError, ScanSummary, Severity};
+use polled_core::{
+    is_autostart_enabled, set_autostart_enabled, AppPaths, AppSettings, CheckReport, HealthEngine,
+    PolledError, ScanSummary, Severity, ThemePreference,
+};
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
 use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
-use crate::profile_runtime::{ProfileRuntimeHandle, ProfileRuntimeSnapshot};
+use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::profiles_ui::ProfilesUiState;
+use crate::single_instance::SingleInstanceGuard;
 use crate::theme::{Palette, ThemeMode};
 use crate::tray::TrayController;
 
@@ -50,6 +54,7 @@ pub(crate) struct PendingElevation {
 /// Messages sent from background worker/tray threads back to the `egui` UI thread.
 pub(crate) enum WorkerMsg {
     TrayScanRequested,
+    TrayToggleAutoSwitch,
     ScanFinished {
         result: Result<ScanSummary, String>,
         notify_regressions: bool,
@@ -64,6 +69,8 @@ pub(crate) enum WorkerMsg {
 }
 
 pub struct PolledApp {
+    settings: AppSettings,
+    autostart_enabled: bool,
     theme: ThemeMode,
     active_view: ActiveView,
     summary: Option<ScanSummary>,
@@ -81,30 +88,43 @@ pub struct PolledApp {
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
     quit_requested: Arc<AtomicBool>,
-    _tray: TrayController,
+    _instance_guard: SingleInstanceGuard,
+    tray: TrayController,
 }
 
 impl PolledApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let theme = ThemeMode::Dark;
+    pub fn new(cc: &eframe::CreationContext<'_>, mut instance_guard: SingleInstanceGuard) -> Self {
+        let paths = AppPaths::default_user_dir();
+        let settings = AppSettings::load_or_default(&paths.settings_path());
+        let theme = ThemeMode::from(settings.theme);
         theme.apply_to(&cc.egui_ctx);
+
+        let autostart_enabled = is_autostart_enabled(&WindowsEnv).unwrap_or(false);
 
         let (tx, rx) = mpsc::channel();
         let quit_requested = Arc::new(AtomicBool::new(false));
-        let tray =
-            TrayController::init(cc.egui_ctx.clone(), tx.clone(), Arc::clone(&quit_requested));
+        instance_guard.start_show_listener(cc.egui_ctx.clone(), Arc::clone(&quit_requested));
+        let tray = TrayController::init(
+            cc.egui_ctx.clone(),
+            tx.clone(),
+            Arc::clone(&quit_requested),
+            settings.auto_switch_on_startup,
+        );
         spawn_windows_build_watcher(tx.clone(), cc.egui_ctx.clone());
 
         let profiles_ui = ProfilesUiState::load();
-        let profile_runtime =
-            ProfileRuntimeHandle::start(profiles_ui.store.clone(), tx.clone(), cc.egui_ctx.clone());
+        let profile_runtime = ProfileRuntimeHandle::start(
+            profiles_ui.store.clone(),
+            settings.auto_switch_on_startup,
+            tx.clone(),
+            cc.egui_ctx.clone(),
+        );
 
-        let snapshot_path = AppPaths::default_user_dir()
-            .baseline_snapshot_path()
-            .display()
-            .to_string();
+        let snapshot_path = paths.baseline_snapshot_path().display().to_string();
 
         let mut app = Self {
+            settings,
+            autostart_enabled,
             theme,
             active_view: ActiveView::HealthCheck,
             summary: None,
@@ -120,7 +140,8 @@ impl PolledApp {
             tx,
             rx,
             quit_requested,
-            _tray: tray,
+            _instance_guard: instance_guard,
+            tray,
         };
 
         app.start_scan(&cc.egui_ctx, true);
@@ -446,6 +467,15 @@ impl PolledApp {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 WorkerMsg::TrayScanRequested => self.start_scan(ctx, true),
+                WorkerMsg::TrayToggleAutoSwitch => {
+                    let next = !self.settings.auto_switch_on_startup;
+                    self.settings.auto_switch_on_startup = next;
+                    let _ = self
+                        .settings
+                        .save_atomic(&AppPaths::default_user_dir().settings_path());
+                    self.profile_runtime
+                        .send(ProfileRuntimeCmd::SetAutoSwitch(next));
+                }
                 WorkerMsg::ScanFinished {
                     result,
                     notify_regressions,
@@ -480,6 +510,14 @@ impl PolledApp {
                     }
                 }
                 WorkerMsg::ProfileRuntimeUpdated(snap) => {
+                    self.tray
+                        .update_status(snap.auto_switch_enabled, &snap.active_profile_name);
+                    if self.settings.auto_switch_on_startup != snap.auto_switch_enabled {
+                        self.settings.auto_switch_on_startup = snap.auto_switch_enabled;
+                        let _ = self
+                            .settings
+                            .save_atomic(&AppPaths::default_user_dir().settings_path());
+                    }
                     self.profiles_ui.runtime_snapshot = Some(*snap);
                 }
             }
@@ -528,6 +566,7 @@ impl eframe::App for PolledApp {
             .unwrap_or_default();
 
         let mut toggle_theme = false;
+        let mut toggle_autostart = false;
         let mut trigger_rescan = false;
         let mut trigger_fix_all_safe = false;
         let mut trigger_undo_all = false;
@@ -591,6 +630,21 @@ impl eframe::App for PolledApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(secondary_button(self.theme.label(), p)).clicked() {
                             toggle_theme = true;
+                        }
+
+                        let startup_btn = if self.autostart_enabled {
+                            primary_button("Startup: ON", p)
+                        } else {
+                            secondary_button("Startup: OFF", p)
+                        };
+                        if ui
+                            .add(startup_btn)
+                            .on_hover_text(
+                                "Start Polled minimized to the system tray on Windows sign-in (HKCU Run, no admin required)",
+                            )
+                            .clicked()
+                        {
+                            toggle_autostart = true;
                         }
 
                         if self.active_view == ActiveView::HealthCheck {
@@ -928,6 +982,43 @@ impl eframe::App for PolledApp {
         if toggle_theme {
             self.theme = self.theme.toggle();
             self.theme.apply_to(ctx);
+            self.settings.theme = ThemePreference::from(self.theme);
+            let _ = self
+                .settings
+                .save_atomic(&AppPaths::default_user_dir().settings_path());
+        }
+
+        if toggle_autostart {
+            let target = !self.autostart_enabled;
+            let result = std::env::current_exe()
+                .map_err(|e| format!("Could not resolve current executable path: {e}"))
+                .and_then(|exe| {
+                    set_autostart_enabled(&WindowsEnv, target, &exe).map_err(|e| e.to_string())
+                });
+            match result {
+                Ok(()) => {
+                    self.autostart_enabled = target;
+                    let msg = if target {
+                        "Enabled Start with Windows (launches minimized to tray via HKCU\\...\\Run)."
+                            .to_string()
+                    } else {
+                        "Disabled Start with Windows (removed HKCU\\...\\Run entry).".to_string()
+                    };
+                    if self.active_view == ActiveView::Profiles {
+                        self.profiles_ui.notice = Some((Severity::Ok, msg));
+                    } else {
+                        self.status_message = Some(msg);
+                        self.error_message = None;
+                    }
+                }
+                Err(err) => {
+                    if self.active_view == ActiveView::Profiles {
+                        self.profiles_ui.notice = Some((Severity::Bad, err));
+                    } else {
+                        self.error_message = Some(err);
+                    }
+                }
+            }
         }
 
         if cancel_elevation {

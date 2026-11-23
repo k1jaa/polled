@@ -2,8 +2,8 @@
 
 Open-source, lightweight pure-Rust Windows 10/11 utility for competitive mouse input hygiene and per-game peripheral profiles.
 
-- **Small & fast:** 100% pure Rust (`eframe`/`egui` + `hidapi` + `windows-rs`) — no WebView2, no Electron, no Node.js runtime, monochrome Dark/Light UI, system tray support.
-- **No account, no telemetry, no cloud:** Fully local. Data lives in `%LOCALAPPDATA%\Polled\`.
+- **Small & fast:** 100% pure Rust (`eframe`/`egui` + `hidapi` + `windows-rs`) — no WebView2, no Electron, no Node.js runtime, monochrome Dark/Light UI, single-instance system tray app with optional minimized Windows startup (`HKCU\...\Run`, no admin needed).
+- **No account, no telemetry, no cloud:** Fully local. Data lives in `%LOCALAPPDATA%\Polled\` (`baseline_snapshot.json`, `state.json`, `profiles.json`, `settings.json`).
 - **Safe & reversible by design:** Before applying any Windows fix, Polled atomically saves original values to `baseline_snapshot.json` (first-write-wins). One click or `polled --undo-all` restores everything. Nothing touches device firmware.
 - **No persistent admin rights:** Runs non-elevated. Only requests UAC elevation for the specific fix that needs HKLM/power-policy access, explaining why first.
 - **Anti-cheat friendly:** No DLL injection, no hooks into game processes, no reading game memory. Per-game detection uses an out-of-context `SetWinEventHook` (`EVENT_SYSTEM_FOREGROUND`) + `PROCESS_QUERY_LIMITED_INFORMATION`. Works alongside Vanguard, FACEIT, EAC, and BattlEye.

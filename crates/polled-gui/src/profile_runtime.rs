@@ -79,6 +79,7 @@ pub struct ProfileRuntimeHandle {
 impl ProfileRuntimeHandle {
     pub fn start(
         initial_store: ProfileStore,
+        initial_auto_switch: bool,
         ui_tx: Sender<WorkerMsg>,
         ctx: egui::Context,
     ) -> Self {
@@ -87,7 +88,7 @@ impl ProfileRuntimeHandle {
         std::thread::Builder::new()
             .name("polled-profile-runtime".to_string())
             .spawn(move || {
-                run_runtime_loop(initial_store, cmd_rx, ui_tx, ctx);
+                run_runtime_loop(initial_store, initial_auto_switch, cmd_rx, ui_tx, ctx);
             })
             .expect("failed to spawn profile runtime thread");
 
@@ -449,6 +450,7 @@ impl RuntimeState {
 
 fn run_runtime_loop(
     initial_store: ProfileStore,
+    initial_auto_switch: bool,
     cmd_rx: Receiver<ProfileRuntimeCmd>,
     ui_tx: Sender<WorkerMsg>,
     ctx: egui::Context,
@@ -463,7 +465,7 @@ fn run_runtime_loop(
 
     let mut state = RuntimeState {
         store: initial_store,
-        auto_switch_enabled: false,
+        auto_switch_enabled: initial_auto_switch,
         selection: BackendSelection::AutoConnected,
         detected_hardware_info: Vec::new(),
         controllers: Vec::new(),
@@ -480,6 +482,9 @@ fn run_runtime_loop(
     };
 
     state.rebuild_controllers(BackendSelection::AutoConnected, "startup auto-detect");
+    if initial_auto_switch {
+        state.start_watcher();
+    }
     state.emit(&ui_tx, &ctx);
 
     loop {

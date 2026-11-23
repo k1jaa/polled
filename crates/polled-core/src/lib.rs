@@ -8,6 +8,7 @@ pub mod error;
 pub mod hid;
 pub mod paths;
 pub mod profiles;
+pub mod settings;
 pub mod win;
 
 pub use checks::{
@@ -25,4 +26,8 @@ pub use paths::AppPaths;
 pub use profiles::{
     export_profile_json, import_profile_json, match_profile, normalize_exe_name, FocusDebouncer,
     FocusEvent, ForegroundWatcher, GameProfile, ProfileCardExport, ProfileStore,
+};
+pub use settings::{
+    format_autostart_command, is_autostart_enabled, set_autostart_enabled, AppSettings,
+    ThemePreference,
 };

@@ -6,12 +6,30 @@
 //! Only the four semantic status colors (`OK`, `INFO`, `WARN`, `BAD`) carry chroma.
 
 use eframe::egui::{self, Color32};
-use polled_core::Severity;
+use polled_core::{Severity, ThemePreference};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeMode {
     Dark,
     Light,
+}
+
+impl From<ThemePreference> for ThemeMode {
+    fn from(pref: ThemePreference) -> Self {
+        match pref {
+            ThemePreference::Dark => ThemeMode::Dark,
+            ThemePreference::Light => ThemeMode::Light,
+        }
+    }
+}
+
+impl From<ThemeMode> for ThemePreference {
+    fn from(mode: ThemeMode) -> Self {
+        match mode {
+            ThemeMode::Dark => ThemePreference::Dark,
+            ThemeMode::Light => ThemePreference::Light,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

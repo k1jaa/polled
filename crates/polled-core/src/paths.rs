@@ -55,6 +55,11 @@ impl AppPaths {
     pub fn profiles_path(&self) -> PathBuf {
         self.root.join("profiles.json")
     }
+
+    /// Stores GUI preferences (theme, startup auto-switch state).
+    pub fn settings_path(&self) -> PathBuf {
+        self.root.join("settings.json")
+    }
 }
 
 #[cfg(test)]
@@ -74,5 +79,6 @@ mod tests {
         );
         assert_eq!(paths.state_path(), dir.path().join("state.json"));
         assert_eq!(paths.profiles_path(), dir.path().join("profiles.json"));
+        assert_eq!(paths.settings_path(), dir.path().join("settings.json"));
     }
 }
