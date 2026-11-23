@@ -172,13 +172,18 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
             for dev in &report.devices {
                 let product = dev.product.as_deref().unwrap_or("(unnamed)");
                 let mfg = dev.manufacturer.as_deref().unwrap_or("(unknown vendor)");
+                let reports_str = dev
+                    .reports
+                    .as_ref()
+                    .map(|r| r.compact_label())
+                    .unwrap_or_else(|| "reports:unopened".to_string());
                 println!(
-                    "{}  if={:<2}  usage_page=0x{:04x} usage=0x{:04x}  [{}]  {} — {}",
+                    "{}  if={:<2}  usage_page=0x{:04x} usage=0x{:04x}  {}  {} — {}",
                     dev.vid_pid,
                     dev.interface_number,
                     dev.usage_page,
                     dev.usage,
-                    dev.usage_page_label,
+                    reports_str,
                     mfg,
                     product
                 );

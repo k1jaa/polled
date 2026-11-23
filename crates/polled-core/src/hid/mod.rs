@@ -4,4 +4,6 @@
 
 pub mod dump;
 
-pub use dump::{dump_hid_devices, HidDeviceDump, HidDumpReport};
+pub use dump::{
+    dump_hid_devices, parse_hid_report_descriptor, HidDeviceDump, HidDumpReport, HidReportSummary,
+};

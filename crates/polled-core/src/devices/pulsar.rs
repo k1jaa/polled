@@ -31,6 +31,7 @@ use crate::devices::{
     SupportTier, WriteMode,
 };
 use crate::error::{PolledError, Result};
+use crate::hid::parse_hid_report_descriptor;
 
 // --- USB & HID Transport Constants (MIT: packerlschupfer/pulsar-mouse-linux) ---
 pub const PULSAR_VID: u16 = 0x3710;
@@ -477,8 +478,9 @@ impl DeviceDriver for PulsarX2CrazyLightDriver {
                 _ => continue,
             };
 
-            // On Windows, Interface 1 is split by Top-Level Collection: pick the vendor-defined
-            // collection (`usage_page >= 0xFF00`) so we don't open the mouse/consumer input path.
+            // On Windows, Interface 1 is split into multiple vendor Top-Level Collections
+            // (e.g. 0xff02..0xff06). Inspect the collection's HID Report Descriptor and select
+            // ONLY the collection that actually declares Output Report ID 0x08 (17 bytes).
             if dev.interface_number() != CONFIG_INTERFACE_NUM || dev.usage_page() < 0xFF00 {
                 continue;
             }
@@ -486,6 +488,19 @@ impl DeviceDriver for PulsarX2CrazyLightDriver {
             let Ok(hid) = dev.open_device(api) else {
                 continue;
             };
+
+            let mut desc_buf = [0u8; 4096];
+            let has_config_report = hid
+                .get_report_descriptor(&mut desc_buf)
+                .ok()
+                .map(|len| parse_hid_report_descriptor(&desc_buf[..len]))
+                .is_some_and(|summary| {
+                    summary.output_reports.contains_key(&REPORT_ID)
+                        && summary.input_reports.contains_key(&REPORT_ID)
+                });
+            if !has_config_report {
+                continue;
+            }
 
             let vid_pid = format!("{:04x}:{:04x}", dev.vendor_id(), dev.product_id());
             let mut candidate = PulsarX2CrazyLightDevice {
@@ -498,12 +513,19 @@ impl DeviceDriver for PulsarX2CrazyLightDriver {
                 },
             };
 
-            // For the shared 3710:5406 CrazyLight dongle, verify identity when the mouse is awake
-            // so we don't misidentify a different model (e.g. X3 LHD = (0x57, 0x68)) as X2 CL.
+            // On the shared 3710:5406 dongle, query (cid, mid) via CMD_HANDSHAKE (0x01).
+            // Known X2 CrazyLight = (0x57, 0x03); reject explicitly known non-X2 models like
+            // X3 LHD CrazyLight Medium = (0x57, 0x68), and label any other X2 variant clearly
+            // with its (cid, mid) so hardware verification can confirm it.
             if connection == ConnectionKind::WirelessDongle {
                 if let Ok((cid, mid)) = candidate.query_model_ids() {
-                    if (cid, mid) != (X2_CRAZYLIGHT_CID, X2_CRAZYLIGHT_MID) {
+                    if (cid, mid) == (0x57, 0x68) {
                         continue;
+                    }
+                    if (cid, mid) != (X2_CRAZYLIGHT_CID, X2_CRAZYLIGHT_MID) {
+                        candidate.model_name = format!(
+                            "Pulsar CrazyLight Wireless (cid=0x{cid:02x}, mid=0x{mid:02x})"
+                        );
                     }
                 }
             }
