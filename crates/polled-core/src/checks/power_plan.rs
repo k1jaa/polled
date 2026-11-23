@@ -87,7 +87,7 @@ impl HealthCheck for PowerPlanCheck {
                 format!("{} ({})", active.name, active.guid),
                 "High Performance (or Balanced on modern CPUs)".to_string(),
                 "Active power plan avoids aggressive power throttling.".to_string(),
-                false,
+                true,
             )
         } else if has_high_perf {
             (
