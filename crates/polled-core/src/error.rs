@@ -40,6 +40,28 @@ pub enum PolledError {
     #[error("Invalid power scheme GUID: '{0}'")]
     InvalidGuid(String),
 
+    #[error("HID / device error ({device}): {message}")]
+    Device { device: String, message: String },
+
+    #[error("Unsupported setting for {device}: {detail}")]
+    UnsupportedSetting { device: String, detail: String },
+
+    #[error(
+        "Flash-wear protection blocked write to {device}: wait {wait_secs}s before next onboard flash write"
+    )]
+    FlashRateLimited { device: String, wait_secs: u64 },
+
+    #[error("Read-back verification failed on {device} (expected {expected}, got {actual}); rollback {rollback_status}")]
+    VerificationFailed {
+        device: String,
+        expected: String,
+        actual: String,
+        rollback_status: String,
+    },
+
+    #[error("Invalid profile data: {0}")]
+    InvalidProfile(String),
+
     #[error("Unsupported platform: Polled requires Windows 10 or Windows 11")]
     UnsupportedPlatform,
 }
