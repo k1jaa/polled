@@ -11,7 +11,7 @@
 mod platform {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use std::sync::Arc;
 
     use eframe::egui;
@@ -107,7 +107,12 @@ mod platform {
 
         /// Moves the show-event handle into a lightweight background thread that brings the
         /// window to the foreground whenever a second instance signals it.
-        pub fn start_show_listener(&mut self, ctx: egui::Context, quit_requested: Arc<AtomicBool>) {
+        pub fn start_show_listener(
+            &mut self,
+            main_hwnd: Arc<AtomicIsize>,
+            ctx: egui::Context,
+            quit_requested: Arc<AtomicBool>,
+        ) {
             let Some(event) = self.show_event.take() else {
                 return;
             };
@@ -121,7 +126,7 @@ mod platform {
                         // SAFETY: `event.0` is an owned valid event handle alive for the entire loop.
                         let wait = unsafe { WaitForSingleObject(event.0, 250) };
                         if wait == WAIT_OBJECT_0 {
-                            crate::tray::show_and_focus(&ctx);
+                            crate::tray::show_and_focus(&main_hwnd, &ctx);
                         }
                     }
                     drop(event);
@@ -151,6 +156,7 @@ impl SingleInstanceGuard {
 
     pub fn start_show_listener(
         &mut self,
+        _main_hwnd: std::sync::Arc<std::sync::atomic::AtomicIsize>,
         _ctx: eframe::egui::Context,
         _quit_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
@@ -16,11 +16,11 @@ use polled_core::{
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
 use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
-use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
+use crate::profile_runtime::{ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::profiles_ui::ProfilesUiState;
 use crate::single_instance::SingleInstanceGuard;
 use crate::theme::{Palette, ThemeMode};
-use crate::tray::TrayController;
+use crate::tray::{find_own_main_hwnd, TrayController};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveView {
@@ -53,8 +53,7 @@ pub(crate) struct PendingElevation {
 
 /// Messages sent from background worker/tray threads back to the `egui` UI thread.
 pub(crate) enum WorkerMsg {
-    TrayScanRequested,
-    TrayToggleAutoSwitch,
+    TraySyncAutoSwitch(bool),
     ScanFinished {
         result: Result<ScanSummary, String>,
         notify_regressions: bool,
@@ -87,6 +86,8 @@ pub struct PolledApp {
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
+    main_hwnd: Arc<AtomicIsize>,
+    auto_switch_state: Arc<AtomicBool>,
     quit_requested: Arc<AtomicBool>,
     _instance_guard: SingleInstanceGuard,
     tray: TrayController,
@@ -102,15 +103,9 @@ impl PolledApp {
         let autostart_enabled = is_autostart_enabled(&WindowsEnv).unwrap_or(false);
 
         let (tx, rx) = mpsc::channel();
+        let main_hwnd = Arc::new(AtomicIsize::new(find_own_main_hwnd()));
+        let auto_switch_state = Arc::new(AtomicBool::new(settings.auto_switch_on_startup));
         let quit_requested = Arc::new(AtomicBool::new(false));
-        instance_guard.start_show_listener(cc.egui_ctx.clone(), Arc::clone(&quit_requested));
-        let tray = TrayController::init(
-            cc.egui_ctx.clone(),
-            tx.clone(),
-            Arc::clone(&quit_requested),
-            settings.auto_switch_on_startup,
-        );
-        spawn_windows_build_watcher(tx.clone(), cc.egui_ctx.clone());
 
         let profiles_ui = ProfilesUiState::load();
         let profile_runtime = ProfileRuntimeHandle::start(
@@ -119,6 +114,21 @@ impl PolledApp {
             tx.clone(),
             cc.egui_ctx.clone(),
         );
+
+        instance_guard.start_show_listener(
+            Arc::clone(&main_hwnd),
+            cc.egui_ctx.clone(),
+            Arc::clone(&quit_requested),
+        );
+        let tray = TrayController::init(
+            cc.egui_ctx.clone(),
+            tx.clone(),
+            profile_runtime.command_sender(),
+            Arc::clone(&main_hwnd),
+            Arc::clone(&auto_switch_state),
+            Arc::clone(&quit_requested),
+        );
+        spawn_windows_build_watcher(tx.clone(), cc.egui_ctx.clone());
 
         let snapshot_path = paths.baseline_snapshot_path().display().to_string();
 
@@ -139,6 +149,8 @@ impl PolledApp {
             profile_runtime,
             tx,
             rx,
+            main_hwnd,
+            auto_switch_state,
             quit_requested,
             _instance_guard: instance_guard,
             tray,
@@ -464,17 +476,11 @@ impl PolledApp {
     }
 
     fn drain_worker_messages(&mut self, ctx: &egui::Context) {
+        let _ = ctx;
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                WorkerMsg::TrayScanRequested => self.start_scan(ctx, true),
-                WorkerMsg::TrayToggleAutoSwitch => {
-                    let next = !self.settings.auto_switch_on_startup;
-                    self.settings.auto_switch_on_startup = next;
-                    let _ = self
-                        .settings
-                        .save_atomic(&AppPaths::default_user_dir().settings_path());
-                    self.profile_runtime
-                        .send(ProfileRuntimeCmd::SetAutoSwitch(next));
+                WorkerMsg::TraySyncAutoSwitch(enabled) => {
+                    self.settings.auto_switch_on_startup = enabled;
                 }
                 WorkerMsg::ScanFinished {
                     result,
@@ -510,6 +516,8 @@ impl PolledApp {
                     }
                 }
                 WorkerMsg::ProfileRuntimeUpdated(snap) => {
+                    self.auto_switch_state
+                        .store(snap.auto_switch_enabled, Ordering::SeqCst);
                     self.tray
                         .update_status(snap.auto_switch_enabled, &snap.active_profile_name);
                     if self.settings.auto_switch_on_startup != snap.auto_switch_enabled {
@@ -527,6 +535,13 @@ impl PolledApp {
 
 impl eframe::App for PolledApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.main_hwnd.load(Ordering::Relaxed) == 0 {
+            let found = find_own_main_hwnd();
+            if found != 0 {
+                self.main_hwnd.store(found, Ordering::SeqCst);
+            }
+        }
+
         // Minimize to system tray instead of exiting when clicking the window [X] button.
         if ctx.input(|i| i.viewport().close_requested())
             && !self.quit_requested.load(Ordering::SeqCst)

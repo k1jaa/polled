@@ -98,6 +98,10 @@ impl ProfileRuntimeHandle {
     pub fn send(&self, cmd: ProfileRuntimeCmd) {
         let _ = self.cmd_tx.send(cmd);
     }
+
+    pub fn command_sender(&self) -> Sender<ProfileRuntimeCmd> {
+        self.cmd_tx.clone()
+    }
 }
 
 impl Drop for ProfileRuntimeHandle {
