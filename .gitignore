@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / Tauri frontend
+node_modules/
+apps/polled-desktop/dist/
+apps/polled-desktop/src-tauri/target/
+apps/polled-desktop/src-tauri/gen/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Local test artifacts
+*.log
