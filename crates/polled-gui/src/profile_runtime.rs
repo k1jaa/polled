@@ -15,7 +15,8 @@ use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
     detect_hardware_devices, hid_topology_fingerprint, match_profile, AppPaths, ApplyOutcome,
     DeviceCapabilities, DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent, ForegroundWatcher,
-    GameProfile, MouseDevice, MouseSettings, ProfileStore, SafeDeviceController, Severity,
+    GameProfile, MouseDevice, MouseSettings, PolledError, ProfileStore, SafeDeviceController,
+    Severity,
 };
 
 use crate::app::WorkerMsg;
@@ -123,6 +124,8 @@ struct RuntimeState {
     foreground_exe: Option<String>,
     active_profile_id: String,
     active_profile_name: String,
+    /// Queued `(profile_id, retry_at)` when a focus switch was deferred by flash-wear cooldown.
+    pending_retry: Option<(String, Instant)>,
     log: Vec<ProfileLogEntry>,
 }
 
@@ -336,8 +339,7 @@ impl RuntimeState {
     }
 
     fn apply_profile(&mut self, profile: &GameProfile, reason: &str) {
-        self.active_profile_id = profile.id.clone();
-        self.active_profile_name = profile.name.clone();
+        self.pending_retry = None;
 
         if let Some(speed) = profile.windows_pointer_speed {
             let env = WindowsEnv;
@@ -358,16 +360,21 @@ impl RuntimeState {
         }
 
         let mut logs: Vec<(Severity, String)> = Vec::new();
+        let mut max_rate_limit_wait: Option<u64> = None;
+        let mut any_succeeded = false;
+
         for managed in &mut self.controllers {
             let dev_name = managed.controller.info().name;
             match managed.controller.apply_profile_settings(&profile.mouse) {
                 Ok(ApplyOutcome::SkippedNoSettings) => {
+                    any_succeeded = true;
                     logs.push((
                         Severity::Info,
                         format!("[{dev_name}] '{}': no mouse changes.", profile.name),
                     ));
                 }
                 Ok(ApplyOutcome::SkippedUnchanged { current }) => {
+                    any_succeeded = true;
                     managed.last_settings = Some(current.clone());
                     logs.push((
                         Severity::Ok,
@@ -383,6 +390,7 @@ impl RuntimeState {
                     verified,
                     flash_writes_this_session,
                 }) => {
+                    any_succeeded = true;
                     managed.last_settings = Some(verified.clone());
                     logs.push((
                         Severity::Ok,
@@ -390,6 +398,22 @@ impl RuntimeState {
                             "[{dev_name}] Applied '{}' ({reason}) via {mode:?} & verified: {} (flash writes: {flash_writes_this_session}).",
                             profile.name,
                             verified.summary_string()
+                        ),
+                    ));
+                }
+                Err(PolledError::FlashRateLimited { wait_secs, .. }) => {
+                    max_rate_limit_wait =
+                        Some(max_rate_limit_wait.map_or(wait_secs, |cur| cur.max(wait_secs)));
+                    let suffix = if self.auto_switch_enabled {
+                        format!(" — auto-retry queued in {wait_secs}s.")
+                    } else {
+                        format!(" — wait {wait_secs}s before next write.")
+                    };
+                    logs.push((
+                        Severity::Warn,
+                        format!(
+                            "[{dev_name}] '{}' ({reason}): flash-wear cooldown active{suffix}",
+                            profile.name
                         ),
                     ));
                 }
@@ -403,6 +427,18 @@ impl RuntimeState {
                     ));
                 }
             }
+        }
+
+        if let Some(wait_secs) = max_rate_limit_wait {
+            if self.auto_switch_enabled {
+                self.pending_retry = Some((
+                    profile.id.clone(),
+                    Instant::now() + Duration::from_secs(wait_secs) + Duration::from_millis(250),
+                ));
+            }
+        } else if any_succeeded || self.controllers.is_empty() {
+            self.active_profile_id = profile.id.clone();
+            self.active_profile_name = profile.name.clone();
         }
 
         for (sev, msg) in logs {
@@ -439,6 +475,7 @@ fn run_runtime_loop(
         foreground_exe: None,
         active_profile_id: "desktop".to_string(),
         active_profile_name: desktop_name,
+        pending_retry: None,
         log: Vec::new(),
     };
 
@@ -459,15 +496,54 @@ fn run_runtime_loop(
         }
 
         if state.auto_switch_enabled {
-            if let Some(committed_exe) = state.debouncer.poll_ready(Instant::now()) {
+            let now = Instant::now();
+            if let Some(committed_exe) = state.debouncer.poll_ready(now) {
                 let matched = match_profile(&state.store, committed_exe.as_deref()).cloned();
                 if let Some(profile) = matched {
-                    let reason = committed_exe
-                        .as_deref()
-                        .map(|e| format!("focus: {e}"))
-                        .unwrap_or_else(|| "focus: desktop".to_string());
-                    state.apply_profile(&profile, &reason);
-                    changed = true;
+                    if profile.id == state.active_profile_id {
+                        if state.pending_retry.take().is_some() {
+                            state.push_log(
+                                Severity::Info,
+                                format!(
+                                    "Cancelled queued flash retry — focus returned to '{}'.",
+                                    profile.name
+                                ),
+                            );
+                            changed = true;
+                        }
+                    } else if state
+                        .pending_retry
+                        .as_ref()
+                        .is_some_and(|(queued_id, _)| queued_id == &profile.id)
+                    {
+                        // Already queued for this profile once cooldown clears; avoid duplicate log noise.
+                    } else {
+                        let reason = committed_exe
+                            .as_deref()
+                            .map(|e| format!("focus: {e}"))
+                            .unwrap_or_else(|| "focus: desktop".to_string());
+                        state.apply_profile(&profile, &reason);
+                        changed = true;
+                    }
+                }
+            } else if let Some((retry_profile_id, retry_at)) = state.pending_retry.clone() {
+                if now >= retry_at {
+                    state.pending_retry = None;
+                    let still_matches =
+                        match_profile(&state.store, state.foreground_exe.as_deref())
+                            .is_some_and(|p| p.id == retry_profile_id);
+                    if still_matches {
+                        if let Some(profile) = state
+                            .store
+                            .profiles
+                            .iter()
+                            .find(|p| p.id == retry_profile_id)
+                            .cloned()
+                        {
+                            state.apply_profile(&profile, "cooldown retry");
+                            changed = true;
+                        }
+                    }
                 }
             }
         }
@@ -499,6 +575,7 @@ fn run_runtime_loop(
                     state.start_watcher();
                 } else {
                     state.stop_watcher();
+                    state.pending_retry = None;
                     state.push_log(Severity::Info, "Paused automatic per-game switching.");
                 }
                 state.emit(&ui_tx, &ctx);

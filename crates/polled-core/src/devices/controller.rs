@@ -106,7 +106,9 @@ impl SafeDeviceController {
             if let Some(last) = self.last_flash_write {
                 let elapsed = now.saturating_duration_since(last);
                 if elapsed < self.flash_cooldown {
-                    let wait_secs = (self.flash_cooldown - elapsed).as_secs().max(1);
+                    let remaining = self.flash_cooldown - elapsed;
+                    let wait_secs =
+                        (remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).max(1);
                     return Err(PolledError::FlashRateLimited {
                         device: info.name,
                         wait_secs,

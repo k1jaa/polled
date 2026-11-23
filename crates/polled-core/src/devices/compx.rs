@@ -725,7 +725,16 @@ impl DeviceDriver for CompxProtocolDriver {
             {
                 if let Ok((cid, mid)) = device.query_model_ids() {
                     match resolve_crazylight_model_name(cid, mid, device.spec.wired_1k_cap) {
-                        Some(name) => device.spec.display_name = name,
+                        Some(name) => {
+                            device.spec.display_name = name;
+                            // Confirmed read + write + read-back + live focus auto-switch on real hardware.
+                            if !device.spec.wired_1k_cap
+                                && cid == X2_CRAZYLIGHT_CID
+                                && mid == X2_CRAZYLIGHT_MINI_MID
+                            {
+                                device.spec.support_tier = SupportTier::TestedOnHardware;
+                            }
+                        }
                         None => continue,
                     }
                 }
