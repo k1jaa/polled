@@ -333,7 +333,8 @@ pub fn resolve_variant_spec(
             polling_rates_hz: vec![125, 250, 500, 1000, 2000, 4000],
             lod_options: vec![LiftOffDistance::Mm10, LiftOffDistance::Mm20],
             debounce_max_ms: 15,
-            support_tier: SupportTier::ImplementedFromDocs,
+            // Confirmed detect, read, write, read-back, hot-plug & focus auto-switch on hardware.
+            support_tier: SupportTier::TestedOnHardware,
         }),
         (COMPX_VID, LAMZU_1K_PID | LAMZU_WIRED_PID) => Some(CompxVariantSpec {
             id_slug: format!("lamzu_compx_{pid:04x}"),

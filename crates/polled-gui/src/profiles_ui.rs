@@ -5,10 +5,12 @@
 //! Plain monochrome Black & White UI for Phase 2 Per-Game Peripheral Profiles.
 //! Only the four semantic statuses (`OK`, `INFO`, `WARN`, `BAD`) carry chroma.
 
+use std::collections::BTreeMap;
+
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 use polled_core::{
-    export_profile_json, import_profile_json, AppPaths, GameProfile, LiftOffDistance,
-    MouseSettings, ProfileStore, Severity,
+    export_profile_json, import_profile_json, AppPaths, DeviceCapabilities, GameProfile,
+    LiftOffDistance, MouseSettings, ProfileStore, Severity,
 };
 
 use crate::profile_runtime::{
@@ -33,6 +35,10 @@ pub struct ProfileDraft {
     pub name: String,
     pub is_desktop_default: bool,
     pub executables_csv: String,
+    pub default_mouse: MouseSettings,
+    pub device_overrides: BTreeMap<String, MouseSettings>,
+    /// `None` = editing shared default settings; `Some(device_id)` = editing per-mouse override.
+    pub editing_device_id: Option<String>,
     pub set_dpi: bool,
     pub dpi: u16,
     pub set_polling: bool,
@@ -49,31 +55,108 @@ pub struct ProfileDraft {
 
 impl ProfileDraft {
     pub fn from_profile(p: &GameProfile) -> Self {
-        Self {
+        let mut draft = Self {
             id: p.id.clone(),
             name: p.name.clone(),
             is_desktop_default: p.is_desktop_default,
             executables_csv: p.executables.join(", "),
-            set_dpi: p.mouse.dpi.is_some(),
-            dpi: p.mouse.dpi.unwrap_or(800),
-            set_polling: p.mouse.polling_rate_hz.is_some(),
-            polling_rate_hz: p.mouse.polling_rate_hz.unwrap_or(1000),
-            set_lod: p.mouse.lod.is_some(),
-            lod: p.mouse.lod.unwrap_or(LiftOffDistance::Mm10),
-            set_debounce: p.mouse.debounce_ms.is_some(),
-            debounce_ms: p.mouse.debounce_ms.unwrap_or(4),
+            default_mouse: p.mouse.clone(),
+            device_overrides: p.device_overrides.clone(),
+            editing_device_id: None,
+            set_dpi: false,
+            dpi: 800,
+            set_polling: false,
+            polling_rate_hz: 1000,
+            set_lod: false,
+            lod: LiftOffDistance::Mm10,
+            set_debounce: false,
+            debounce_ms: 4,
             set_win_speed: p.windows_pointer_speed.is_some(),
             win_speed: p.windows_pointer_speed.unwrap_or(10),
             author: p.author.clone().unwrap_or_default(),
             notes: p.notes.clone().unwrap_or_default(),
+        };
+        draft.load_mouse_fields(&p.mouse);
+        draft
+    }
+
+    fn load_mouse_fields(&mut self, m: &MouseSettings) {
+        self.set_dpi = m.dpi.is_some();
+        self.dpi = m.dpi.unwrap_or(800);
+        self.set_polling = m.polling_rate_hz.is_some();
+        self.polling_rate_hz = m.polling_rate_hz.unwrap_or(1000);
+        self.set_lod = m.lod.is_some();
+        self.lod = m.lod.unwrap_or(LiftOffDistance::Mm10);
+        self.set_debounce = m.debounce_ms.is_some();
+        self.debounce_ms = m.debounce_ms.unwrap_or(4);
+    }
+
+    fn current_mouse_fields(&self) -> MouseSettings {
+        MouseSettings {
+            dpi: self.set_dpi.then_some(self.dpi),
+            polling_rate_hz: self.set_polling.then_some(self.polling_rate_hz),
+            lod: self.set_lod.then_some(self.lod),
+            debounce_ms: self.set_debounce.then_some(self.debounce_ms),
+        }
+    }
+
+    fn commit_current_mouse_fields(&mut self) {
+        let current = self.current_mouse_fields();
+        if let Some(dev_id) = &self.editing_device_id {
+            self.device_overrides.insert(dev_id.clone(), current);
+        } else {
+            self.default_mouse = current;
+        }
+    }
+
+    fn switch_editing_target(
+        &mut self,
+        next: Option<String>,
+        target_caps: Option<&DeviceCapabilities>,
+    ) {
+        if self.editing_device_id == next {
+            return;
+        }
+        self.commit_current_mouse_fields();
+        match next {
+            None => {
+                self.editing_device_id = None;
+                let base = self.default_mouse.clone();
+                self.load_mouse_fields(&base);
+            }
+            Some(dev_id) => {
+                let settings = if let Some(existing) = self.device_overrides.get(&dev_id) {
+                    existing.clone()
+                } else {
+                    let seed = match target_caps {
+                        Some(caps) => caps.adapt_settings(&self.default_mouse).0,
+                        None => self.default_mouse.clone(),
+                    };
+                    self.device_overrides.insert(dev_id.clone(), seed.clone());
+                    seed
+                };
+                self.editing_device_id = Some(dev_id);
+                self.load_mouse_fields(&settings);
+            }
+        }
+    }
+
+    fn remove_current_override(&mut self) {
+        if let Some(dev_id) = self.editing_device_id.take() {
+            self.device_overrides.remove(&dev_id);
+            let base = self.default_mouse.clone();
+            self.load_mouse_fields(&base);
         }
     }
 
     pub fn to_profile(&self) -> GameProfile {
-        let executables = if self.is_desktop_default {
+        let mut copy = self.clone();
+        copy.commit_current_mouse_fields();
+
+        let executables = if copy.is_desktop_default {
             Vec::new()
         } else {
-            self.executables_csv
+            copy.executables_csv
                 .split([',', ';', '\n'])
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -82,23 +165,19 @@ impl ProfileDraft {
         };
 
         GameProfile {
-            id: self.id.clone(),
-            name: if self.name.trim().is_empty() {
+            id: copy.id,
+            name: if copy.name.trim().is_empty() {
                 "Untitled Profile".to_string()
             } else {
-                self.name.trim().to_string()
+                copy.name.trim().to_string()
             },
-            is_desktop_default: self.is_desktop_default,
+            is_desktop_default: copy.is_desktop_default,
             executables,
-            mouse: MouseSettings {
-                dpi: self.set_dpi.then_some(self.dpi),
-                polling_rate_hz: self.set_polling.then_some(self.polling_rate_hz),
-                lod: self.set_lod.then_some(self.lod),
-                debounce_ms: self.set_debounce.then_some(self.debounce_ms),
-            },
-            windows_pointer_speed: self.set_win_speed.then_some(self.win_speed.clamp(1, 20)),
-            author: (!self.author.trim().is_empty()).then(|| self.author.trim().to_string()),
-            notes: (!self.notes.trim().is_empty()).then(|| self.notes.trim().to_string()),
+            mouse: copy.default_mouse,
+            device_overrides: copy.device_overrides,
+            windows_pointer_speed: copy.set_win_speed.then_some(copy.win_speed.clamp(1, 20)),
+            author: (!copy.author.trim().is_empty()).then(|| copy.author.trim().to_string()),
+            notes: (!copy.notes.trim().is_empty()).then(|| copy.notes.trim().to_string()),
         }
         .sanitized()
     }
@@ -338,9 +417,10 @@ impl ProfilesUiState {
                                             mouse: MouseSettings {
                                                 dpi: Some(800),
                                                 polling_rate_hz: Some(4000),
-                                                lod: Some(LiftOffDistance::Mm07),
+                                                lod: Some(LiftOffDistance::Mm10),
                                                 debounce_ms: Some(1),
                                             },
+                                            device_overrides: BTreeMap::new(),
                                             windows_pointer_speed: None,
                                             author: None,
                                             notes: None,
@@ -402,12 +482,21 @@ impl ProfilesUiState {
                                                     );
                                                 }
                                             });
-                                            let sub = if prof.is_desktop_default {
+                                            let base_sub = if prof.is_desktop_default {
                                                 "Fallback when no game matches".to_string()
                                             } else if prof.executables.is_empty() {
                                                 "(no executables)".to_string()
                                             } else {
                                                 prof.executables.join(", ")
+                                            };
+                                            let sub = if prof.device_overrides.is_empty() {
+                                                base_sub
+                                            } else {
+                                                let n = prof.device_overrides.len();
+                                                format!(
+                                                    "{base_sub} · {n} mouse override{}",
+                                                    if n == 1 { "" } else { "s" }
+                                                )
                                             };
                                             ui.label(
                                                 RichText::new(sub)
@@ -496,16 +585,34 @@ impl ProfilesUiState {
 
                     ui.add_space(10.0);
 
-                    let caps = snap.as_ref().map(|s| s.primary_caps.clone());
-                    let dpi_min = caps.as_ref().map_or(50, |c| c.dpi_min);
-                    let dpi_max = caps.as_ref().map_or(32000, |c| c.dpi_max);
-                    let dpi_step = caps.as_ref().map_or(10, |c| c.dpi_step);
-                    let rates = caps
+                    let active_target_caps: Option<DeviceCapabilities> =
+                        self.editor.editing_device_id.as_deref().and_then(|dev_id| {
+                            snap.as_ref().and_then(|s| {
+                                s.active_devices
+                                    .iter()
+                                    .find(|d| d.info.id == dev_id)
+                                    .map(|d| d.caps.clone())
+                            })
+                        });
+                    let dpi_min = active_target_caps.as_ref().map_or(10, |c| c.dpi_min);
+                    let dpi_max = active_target_caps.as_ref().map_or(32000, |c| c.dpi_max);
+                    let dpi_step = active_target_caps.as_ref().map_or(10, |c| c.dpi_step);
+                    let rates = active_target_caps
                         .as_ref()
                         .map(|c| c.polling_rates_hz.clone())
                         .unwrap_or_else(|| vec![125, 250, 500, 1000, 2000, 4000, 8000]);
-                    let db_min = caps.as_ref().map_or(0, |c| c.debounce_min_ms);
-                    let db_max = caps.as_ref().map_or(20, |c| c.debounce_max_ms);
+                    let lod_options = active_target_caps
+                        .as_ref()
+                        .map(|c| c.lod_options.clone())
+                        .unwrap_or_else(|| LiftOffDistance::ALL.to_vec());
+                    let db_min = active_target_caps.as_ref().map_or(0, |c| c.debounce_min_ms);
+                    let db_max = active_target_caps
+                        .as_ref()
+                        .map_or(20, |c| c.debounce_max_ms);
+
+                    let mut next_target: Option<(Option<String>, Option<DeviceCapabilities>)> =
+                        None;
+                    let mut remove_override = false;
 
                     egui::Grid::new("profile_editor_grid")
                         .num_columns(2)
@@ -527,6 +634,89 @@ impl ProfilesUiState {
                                 );
                                 ui.end_row();
                             }
+
+                            ui.label(RichText::new("Mouse Target").color(p.text_muted));
+                            ui.horizontal(|ui| {
+                                let target_label = match &self.editor.editing_device_id {
+                                    None => "All Mice (Default)".to_string(),
+                                    Some(dev_id) => {
+                                        let friendly = snap
+                                            .as_ref()
+                                            .and_then(|s| {
+                                                s.active_devices
+                                                    .iter()
+                                                    .find(|d| d.info.id == *dev_id)
+                                                    .map(|d| d.info.name.clone())
+                                            })
+                                            .unwrap_or_else(|| dev_id.clone());
+                                        format!("{friendly} [Override]")
+                                    }
+                                };
+
+                                egui::ComboBox::from_id_salt("mouse_target_combo")
+                                    .selected_text(target_label)
+                                    .width(260.0)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                self.editor.editing_device_id.is_none(),
+                                                "All Mice (Default)",
+                                            )
+                                            .clicked()
+                                        {
+                                            next_target = Some((None, None));
+                                        }
+
+                                        let mut seen_ids = Vec::new();
+                                        if let Some(s) = &snap {
+                                            for dev in &s.active_devices {
+                                                seen_ids.push(dev.info.id.clone());
+                                                let has_ov = self
+                                                    .editor
+                                                    .device_overrides
+                                                    .contains_key(&dev.info.id);
+                                                let label = if has_ov {
+                                                    format!("{} [Override]", dev.info.name)
+                                                } else {
+                                                    format!("{} (+ add override)", dev.info.name)
+                                                };
+                                                let selected =
+                                                    self.editor.editing_device_id.as_deref()
+                                                        == Some(dev.info.id.as_str());
+                                                if ui.selectable_label(selected, label).clicked() {
+                                                    next_target = Some((
+                                                        Some(dev.info.id.clone()),
+                                                        Some(dev.caps.clone()),
+                                                    ));
+                                                }
+                                            }
+                                        }
+
+                                        for dev_id in self.editor.device_overrides.keys() {
+                                            if seen_ids.iter().any(|seen| seen == dev_id) {
+                                                continue;
+                                            }
+                                            let selected = self.editor.editing_device_id.as_deref()
+                                                == Some(dev_id.as_str());
+                                            if ui
+                                                .selectable_label(
+                                                    selected,
+                                                    format!("{dev_id} [Override · offline]"),
+                                                )
+                                                .clicked()
+                                            {
+                                                next_target = Some((Some(dev_id.clone()), None));
+                                            }
+                                        }
+                                    });
+
+                                if self.editor.editing_device_id.is_some()
+                                    && ui.add(secondary_btn("Remove Override", p)).clicked()
+                                {
+                                    remove_override = true;
+                                }
+                            });
+                            ui.end_row();
 
                             ui.checkbox(&mut self.editor.set_dpi, "DPI");
                             ui.add_enabled(
@@ -559,10 +749,10 @@ impl ProfilesUiState {
                                 egui::ComboBox::from_id_salt("lod_combo")
                                     .selected_text(self.editor.lod.label())
                                     .show_ui(ui, |ui| {
-                                        for opt in LiftOffDistance::ALL {
+                                        for opt in &lod_options {
                                             ui.selectable_value(
                                                 &mut self.editor.lod,
-                                                opt,
+                                                *opt,
                                                 opt.label(),
                                             );
                                         }
@@ -596,6 +786,12 @@ impl ProfilesUiState {
                             );
                             ui.end_row();
                         });
+
+                    if remove_override {
+                        self.editor.remove_current_override();
+                    } else if let Some((target_id, caps)) = next_target {
+                        self.editor.switch_editing_target(target_id, caps.as_ref());
+                    }
                 });
             });
         });

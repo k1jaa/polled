@@ -44,6 +44,7 @@ pub fn match_profile<'a>(
 mod tests {
     use super::*;
     use crate::devices::MouseSettings;
+    use std::collections::BTreeMap;
 
     fn sample_store() -> ProfileStore {
         let mut store = ProfileStore::default();
@@ -56,6 +57,7 @@ mod tests {
                 dpi: Some(1600),
                 ..Default::default()
             },
+            device_overrides: BTreeMap::new(),
             windows_pointer_speed: None,
             author: None,
             notes: None,
@@ -69,6 +71,7 @@ mod tests {
                 dpi: Some(800),
                 ..Default::default()
             },
+            device_overrides: BTreeMap::new(),
             windows_pointer_speed: None,
             author: None,
             notes: None,

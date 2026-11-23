@@ -15,8 +15,7 @@ use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
     detect_hardware_devices, hid_topology_fingerprint, match_profile, AppPaths, ApplyOutcome,
     DeviceCapabilities, DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent, ForegroundWatcher,
-    GameProfile, MouseDevice, MouseSettings, PolledError, ProfileStore, SafeDeviceController,
-    Severity,
+    GameProfile, MouseSettings, PolledError, ProfileStore, SafeDeviceController, Severity,
 };
 
 use crate::app::WorkerMsg;
@@ -43,6 +42,7 @@ pub struct ProfileLogEntry {
 #[derive(Debug, Clone)]
 pub struct ConnectedDeviceStatus {
     pub info: DeviceInfo,
+    pub caps: DeviceCapabilities,
     pub settings: Option<MouseSettings>,
 }
 
@@ -52,7 +52,6 @@ pub struct ProfileRuntimeSnapshot {
     pub selection: BackendSelection,
     pub detected_hardware: Vec<DeviceInfo>,
     pub active_devices: Vec<ConnectedDeviceStatus>,
-    pub primary_caps: DeviceCapabilities,
     pub any_flash_only: bool,
     pub flash_warning: Option<String>,
     pub foreground_exe: Option<String>,
@@ -155,15 +154,10 @@ impl RuntimeState {
             .iter()
             .map(|m| ConnectedDeviceStatus {
                 info: m.controller.info(),
+                caps: m.controller.capabilities(),
                 settings: m.last_settings.clone(),
             })
             .collect();
-
-        let primary_caps = self
-            .controllers
-            .first()
-            .map(|m| m.controller.capabilities())
-            .unwrap_or_else(|| DryRunDevice::new_volatile().capabilities());
 
         let any_flash_only = self
             .controllers
@@ -186,7 +180,6 @@ impl RuntimeState {
             selection: self.selection.clone(),
             detected_hardware: self.detected_hardware_info.clone(),
             active_devices,
-            primary_caps,
             any_flash_only,
             flash_warning,
             foreground_exe: self.foreground_exe.clone(),
@@ -369,13 +362,38 @@ impl RuntimeState {
         let mut any_succeeded = false;
 
         for managed in &mut self.controllers {
-            let dev_name = managed.controller.info().name;
-            match managed.controller.apply_profile_settings(&profile.mouse) {
+            let dev_info = managed.controller.info();
+            let dev_name = dev_info.name;
+            let caps = managed.controller.capabilities();
+            let (raw_desired, used_override) = profile.settings_for_device(&dev_info.id);
+            let (effective_desired, adjustments) = caps.adapt_settings(raw_desired);
+            let source_tag = if used_override {
+                " [mouse override]"
+            } else {
+                ""
+            };
+            if !adjustments.is_empty() {
+                logs.push((
+                    Severity::Info,
+                    format!(
+                        "[{dev_name}] Adapted '{}' to device limits: {} (set a per-mouse override to customize).",
+                        profile.name,
+                        adjustments.join(", ")
+                    ),
+                ));
+            }
+            match managed
+                .controller
+                .apply_profile_settings(&effective_desired)
+            {
                 Ok(ApplyOutcome::SkippedNoSettings) => {
                     any_succeeded = true;
                     logs.push((
                         Severity::Info,
-                        format!("[{dev_name}] '{}': no mouse changes.", profile.name),
+                        format!(
+                            "[{dev_name}] '{}'{source_tag}: no mouse changes.",
+                            profile.name
+                        ),
                     ));
                 }
                 Ok(ApplyOutcome::SkippedUnchanged { current }) => {
@@ -384,7 +402,7 @@ impl RuntimeState {
                     logs.push((
                         Severity::Ok,
                         format!(
-                            "[{dev_name}] '{}' ({reason}): already matches ({}) — 0 writes.",
+                            "[{dev_name}] '{}'{source_tag} ({reason}): already matches ({}) — 0 writes.",
                             profile.name,
                             current.summary_string()
                         ),
@@ -400,7 +418,7 @@ impl RuntimeState {
                     logs.push((
                         Severity::Ok,
                         format!(
-                            "[{dev_name}] Applied '{}' ({reason}) via {mode:?} & verified: {} (flash writes: {flash_writes_this_session}).",
+                            "[{dev_name}] Applied '{}'{source_tag} ({reason}) via {mode:?} & verified: {} (flash writes: {flash_writes_this_session}).",
                             profile.name,
                             verified.summary_string()
                         ),

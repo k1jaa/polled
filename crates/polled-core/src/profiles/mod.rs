@@ -6,6 +6,7 @@ pub mod debouncer;
 pub mod matcher;
 pub mod watcher;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -37,6 +38,11 @@ pub struct GameProfile {
     #[serde(default)]
     pub executables: Vec<String>,
     pub mouse: MouseSettings,
+    /// Optional per-mouse overrides keyed by `DeviceInfo.id` (e.g., `lamzu_compx_4k`,
+    /// `pulsar_x2_crazylight_wireless`). When present for a connected mouse, these settings
+    /// are used instead of the shared `mouse` defaults.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub device_overrides: BTreeMap<String, MouseSettings>,
     /// Optional Windows pointer speed override (`1..=20`, where `10` = 6/11 1.0x).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub windows_pointer_speed: Option<u32>,
@@ -59,9 +65,20 @@ impl GameProfile {
                 lod: Some(LiftOffDistance::Mm10),
                 debounce_ms: Some(4),
             },
+            device_overrides: BTreeMap::new(),
             windows_pointer_speed: Some(10),
             author: None,
             notes: Some("Fallback profile used whenever no game profile matches.".to_string()),
+        }
+    }
+
+    /// Resolves the mouse settings to apply for a specific `device_id`, returning
+    /// `(settings, used_device_override)`.
+    pub fn settings_for_device(&self, device_id: &str) -> (&MouseSettings, bool) {
+        if let Some(overridden) = self.device_overrides.get(device_id) {
+            (overridden, true)
+        } else {
+            (&self.mouse, false)
         }
     }
 
@@ -77,6 +94,18 @@ impl GameProfile {
                     None
                 } else {
                     Some(norm)
+                }
+            })
+            .collect();
+        self.device_overrides = self
+            .device_overrides
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let key = k.trim().to_string();
+                if key.is_empty() {
+                    None
+                } else {
+                    Some((key, v))
                 }
             })
             .collect();
@@ -205,6 +234,15 @@ mod tests {
                 lod: Some(LiftOffDistance::Mm07),
                 debounce_ms: Some(1),
             },
+            device_overrides: BTreeMap::from([(
+                "lamzu_compx_4k".to_string(),
+                MouseSettings {
+                    dpi: Some(800),
+                    polling_rate_hz: Some(4000),
+                    lod: Some(LiftOffDistance::Mm10),
+                    debounce_ms: Some(2),
+                },
+            )]),
             windows_pointer_speed: Some(10),
             author: Some("k1jaa".to_string()),
             notes: Some("Tournament config".to_string()),
@@ -214,6 +252,14 @@ mod tests {
         let loaded = ProfileStore::load_or_default(&path).unwrap();
         assert_eq!(loaded.profiles.len(), 2);
         assert_eq!(loaded.profiles[1].executables, vec!["cs2.exe"]);
+        let (lamzu, is_override) = loaded.profiles[1].settings_for_device("lamzu_compx_4k");
+        assert!(is_override);
+        assert_eq!(lamzu.lod, Some(LiftOffDistance::Mm10));
+        assert_eq!(lamzu.debounce_ms, Some(2));
+        let (pulsar, is_override_pulsar) =
+            loaded.profiles[1].settings_for_device("pulsar_x2_crazylight_wireless");
+        assert!(!is_override_pulsar);
+        assert_eq!(pulsar.lod, Some(LiftOffDistance::Mm07));
     }
 
     #[test]
@@ -229,6 +275,7 @@ mod tests {
                 lod: Some(LiftOffDistance::Mm07),
                 debounce_ms: Some(0),
             },
+            device_overrides: BTreeMap::new(),
             windows_pointer_speed: None,
             author: Some("k1jaa".to_string()),
             notes: Some("Low LOD + 4K".to_string()),

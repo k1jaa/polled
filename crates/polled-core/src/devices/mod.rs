@@ -71,6 +71,15 @@ impl LiftOffDistance {
         LiftOffDistance::Mm10,
         LiftOffDistance::Mm20,
     ];
+
+    /// Exact lift-off height in tenths of a millimeter (avoids floating-point comparisons).
+    pub fn tenths_mm(self) -> u8 {
+        match self {
+            LiftOffDistance::Mm07 => 7,
+            LiftOffDistance::Mm10 => 10,
+            LiftOffDistance::Mm20 => 20,
+        }
+    }
 }
 
 impl fmt::Display for LiftOffDistance {
@@ -241,6 +250,76 @@ impl DeviceCapabilities {
 
         Ok(())
     }
+
+    /// Adapts `desired` to the nearest settings supported by this mouse so shared profiles still
+    /// switch cleanly across mice with different capabilities (e.g., LOD `0.7 mm` -> `1.0 mm`,
+    /// `8000 Hz` -> `4000 Hz`, or 10-step DPI snapped to 50-step).
+    ///
+    /// Returns `(adapted_settings, human_readable_adjustments)`.
+    pub fn adapt_settings(&self, desired: &MouseSettings) -> (MouseSettings, Vec<String>) {
+        let mut out = desired.clone();
+        let mut notes = Vec::new();
+
+        if let Some(dpi) = desired.dpi {
+            let clamped = dpi.clamp(self.dpi_min, self.dpi_max);
+            let snapped = if self.dpi_step > 1 {
+                let step = u32::from(self.dpi_step);
+                let offset = u32::from(clamped - self.dpi_min);
+                let rounded = ((offset + step / 2) / step) * step;
+                let max_valid = u32::from(self.dpi_min)
+                    + (u32::from(self.dpi_max - self.dpi_min) / step) * step;
+                (u32::from(self.dpi_min) + rounded).min(max_valid) as u16
+            } else {
+                clamped
+            };
+            if snapped != dpi {
+                notes.push(format!("DPI {dpi} -> {snapped}"));
+            }
+            out.dpi = Some(snapped);
+        }
+
+        if let Some(hz) = desired.polling_rate_hz {
+            if !self.polling_rates_hz.contains(&hz) {
+                if let Some(&adapted) = self
+                    .polling_rates_hz
+                    .iter()
+                    .filter(|&&r| r <= hz)
+                    .max()
+                    .or_else(|| self.polling_rates_hz.iter().min())
+                {
+                    notes.push(format!("Polling {hz} Hz -> {adapted} Hz"));
+                    out.polling_rate_hz = Some(adapted);
+                } else {
+                    notes.push(format!("Polling {hz} Hz skipped"));
+                    out.polling_rate_hz = None;
+                }
+            }
+        }
+
+        if let Some(lod) = desired.lod {
+            if !self.lod_options.contains(&lod) {
+                if let Some(&adapted) = self.lod_options.iter().min_by_key(|&&opt| {
+                    (opt.tenths_mm().abs_diff(lod.tenths_mm()), opt.tenths_mm())
+                }) {
+                    notes.push(format!("LOD {lod} -> {adapted}"));
+                    out.lod = Some(adapted);
+                } else {
+                    notes.push(format!("LOD {lod} skipped"));
+                    out.lod = None;
+                }
+            }
+        }
+
+        if let Some(db) = desired.debounce_ms {
+            let clamped = db.clamp(self.debounce_min_ms, self.debounce_max_ms);
+            if clamped != db {
+                notes.push(format!("Debounce {db} ms -> {clamped} ms"));
+            }
+            out.debounce_ms = Some(clamped);
+        }
+
+        (out, notes)
+    }
 }
 
 /// Core hardware abstraction implemented by every mouse backend (and `DryRunDevice`).
@@ -287,4 +366,39 @@ pub fn hid_topology_fingerprint() -> Vec<(u16, u16, u16, u16)> {
     fp.sort_unstable();
     fp.dedup();
     fp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapts_unsupported_pulsar_settings_cleanly_for_lamzu_4k() {
+        let lamzu_caps = DeviceCapabilities {
+            dpi_min: 50,
+            dpi_max: 26000,
+            dpi_step: 50,
+            polling_rates_hz: vec![125, 250, 500, 1000, 2000, 4000],
+            lod_options: vec![LiftOffDistance::Mm10, LiftOffDistance::Mm20],
+            debounce_min_ms: 0,
+            debounce_max_ms: 15,
+            supports_volatile_writes: false,
+            flash_write_warning: None,
+        };
+
+        let pulsar_profile = MouseSettings {
+            dpi: Some(810),
+            polling_rate_hz: Some(8000),
+            lod: Some(LiftOffDistance::Mm07),
+            debounce_ms: Some(20),
+        };
+
+        let (adapted, notes) = lamzu_caps.adapt_settings(&pulsar_profile);
+        assert_eq!(adapted.dpi, Some(800));
+        assert_eq!(adapted.polling_rate_hz, Some(4000));
+        assert_eq!(adapted.lod, Some(LiftOffDistance::Mm10));
+        assert_eq!(adapted.debounce_ms, Some(15));
+        assert_eq!(notes.len(), 4);
+        assert!(lamzu_caps.validate("LAMZU 4K", &adapted).is_ok());
+    }
 }
