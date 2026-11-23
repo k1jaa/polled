@@ -43,9 +43,31 @@ pub const CONFIG_INTERFACE_NUM: i32 = 1;
 pub const REPORT_ID: u8 = 0x08;
 pub const REPORT_LEN: usize = 17;
 
-// Identity pair answered by `CMD_HANDSHAKE (0x01)` for X2 CrazyLight (cid=0x57, mid=0x03).
+// Identity pairs answered by `CMD_HANDSHAKE (0x01)` on the shared CrazyLight dongle (`3710:5406`):
+// - (0x57, 0x01): Pulsar X2 CrazyLight Mini (confirmed via live `polled --detect`)
+// - (0x57, 0x03): Pulsar X2 CrazyLight (documented in packerlschupfer/pulsar-mouse-linux)
+// - (0x57, 0x68): Pulsar X3 LHD CrazyLight Medium (non-X2 model, skipped here)
 pub const X2_CRAZYLIGHT_CID: u8 = 0x57;
+pub const X2_CRAZYLIGHT_MINI_MID: u8 = 0x01;
 pub const X2_CRAZYLIGHT_MID: u8 = 0x03;
+const X3_LHD_CRAZYLIGHT_MID: u8 = 0x68;
+
+fn resolve_crazylight_model_name(cid: u8, mid: u8, connection: ConnectionKind) -> Option<String> {
+    let suffix = match connection {
+        ConnectionKind::WirelessDongle => "Wireless",
+        ConnectionKind::WiredUsb => "Wired",
+    };
+    match (cid, mid) {
+        (X2_CRAZYLIGHT_CID, X2_CRAZYLIGHT_MINI_MID) => {
+            Some(format!("Pulsar X2 CrazyLight Mini {suffix}"))
+        }
+        (X2_CRAZYLIGHT_CID, X2_CRAZYLIGHT_MID) => Some(format!("Pulsar X2 CrazyLight {suffix}")),
+        (X2_CRAZYLIGHT_CID, X3_LHD_CRAZYLIGHT_MID) => None,
+        _ => Some(format!(
+            "Pulsar CrazyLight {suffix} (cid=0x{cid:02x}, mid=0x{mid:02x})"
+        )),
+    }
+}
 
 // --- Command IDs ---
 const CMD_HANDSHAKE: u8 = 0x01;
@@ -513,20 +535,12 @@ impl DeviceDriver for PulsarX2CrazyLightDriver {
                 },
             };
 
-            // On the shared 3710:5406 dongle, query (cid, mid) via CMD_HANDSHAKE (0x01).
-            // Known X2 CrazyLight = (0x57, 0x03); reject explicitly known non-X2 models like
-            // X3 LHD CrazyLight Medium = (0x57, 0x68), and label any other X2 variant clearly
-            // with its (cid, mid) so hardware verification can confirm it.
-            if connection == ConnectionKind::WirelessDongle {
-                if let Ok((cid, mid)) = candidate.query_model_ids() {
-                    if (cid, mid) == (0x57, 0x68) {
-                        continue;
-                    }
-                    if (cid, mid) != (X2_CRAZYLIGHT_CID, X2_CRAZYLIGHT_MID) {
-                        candidate.model_name = format!(
-                            "Pulsar CrazyLight Wireless (cid=0x{cid:02x}, mid=0x{mid:02x})"
-                        );
-                    }
+            // Query (cid, mid) via CMD_HANDSHAKE (0x01) to distinguish X2 CrazyLight Mini (0x57, 0x01)
+            // and X2 CrazyLight (0x57, 0x03) from other CrazyLight models on the shared 3710:5406 dongle.
+            if let Ok((cid, mid)) = candidate.query_model_ids() {
+                match resolve_crazylight_model_name(cid, mid, connection) {
+                    Some(name) => candidate.model_name = name,
+                    None => continue,
                 }
             }
 
@@ -604,5 +618,21 @@ mod tests {
         for lod in LiftOffDistance::ALL {
             assert_eq!(decode_lod(encode_lod(lod)), Some(lod));
         }
+    }
+
+    #[test]
+    fn resolves_crazylight_model_identities() {
+        assert_eq!(
+            resolve_crazylight_model_name(0x57, 0x01, ConnectionKind::WirelessDongle).as_deref(),
+            Some("Pulsar X2 CrazyLight Mini Wireless")
+        );
+        assert_eq!(
+            resolve_crazylight_model_name(0x57, 0x03, ConnectionKind::WiredUsb).as_deref(),
+            Some("Pulsar X2 CrazyLight Wired")
+        );
+        assert_eq!(
+            resolve_crazylight_model_name(0x57, 0x68, ConnectionKind::WirelessDongle),
+            None
+        );
     }
 }
