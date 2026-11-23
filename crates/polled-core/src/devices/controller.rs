@@ -2,6 +2,7 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -9,8 +10,15 @@ use serde::{Deserialize, Serialize};
 use crate::devices::{DeviceCapabilities, DeviceInfo, MouseDevice, MouseSettings, WriteMode};
 use crate::error::{PolledError, Result};
 
-/// Default minimum spacing between onboard flash writes on mice that lack volatile RAM writes.
-pub const DEFAULT_FLASH_COOLDOWN: Duration = Duration::from_secs(15);
+/// Default sliding window for flash-wear protection on mice without volatile RAM writes.
+pub const DEFAULT_FLASH_WINDOW: Duration = Duration::from_secs(60);
+
+/// Default maximum onboard flash writes allowed inside [`DEFAULT_FLASH_WINDOW`].
+///
+/// Allowing a small burst (4 writes / 60 s) lets normal Game <-> Desktop switches apply right
+/// after focus debounce (~1.5 s) with zero artificial wait, while still blocking runaway loops
+/// or rapid alt-tab hammering from wearing out onboard flash.
+pub const DEFAULT_MAX_FLASH_WRITES_PER_WINDOW: usize = 4;
 
 /// Result of attempting to apply a profile's settings through `SafeDeviceController`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,13 +40,14 @@ pub enum ApplyOutcome {
 /// 1. **Validation**: Rejects unsupported DPI/polling/LOD/debounce before touching HID.
 /// 2. **Diff-before-write**: Reads current settings and skips writing if already identical.
 /// 3. **Flash-wear protection**: Uses `VolatileRam` whenever supported; on flash-only hardware,
-///    enforces a cooldown rate-limiter and counts session flash writes.
+///    enforces a sliding-window write budget and counts session flash writes.
 /// 4. **Read-back verification + rollback**: Reads settings back immediately after writing; if
 ///    they do not match the target, automatically rolls back to the pre-write settings and errors.
 pub struct SafeDeviceController {
     device: Box<dyn MouseDevice>,
-    flash_cooldown: Duration,
-    last_flash_write: Option<Instant>,
+    flash_window: Duration,
+    max_flash_writes_per_window: usize,
+    recent_flash_writes: VecDeque<Instant>,
     flash_writes_this_session: u64,
 }
 
@@ -46,15 +55,21 @@ impl SafeDeviceController {
     pub fn new(device: Box<dyn MouseDevice>) -> Self {
         Self {
             device,
-            flash_cooldown: DEFAULT_FLASH_COOLDOWN,
-            last_flash_write: None,
+            flash_window: DEFAULT_FLASH_WINDOW,
+            max_flash_writes_per_window: DEFAULT_MAX_FLASH_WRITES_PER_WINDOW,
+            recent_flash_writes: VecDeque::new(),
             flash_writes_this_session: 0,
         }
     }
 
-    pub fn with_flash_cooldown(mut self, cooldown: Duration) -> Self {
-        self.flash_cooldown = cooldown;
+    pub fn with_flash_window(mut self, window: Duration, max_writes: usize) -> Self {
+        self.flash_window = window;
+        self.max_flash_writes_per_window = max_writes.max(1);
         self
+    }
+
+    pub fn with_flash_cooldown(self, cooldown: Duration) -> Self {
+        self.with_flash_window(cooldown, 1)
     }
 
     pub fn info(&self) -> DeviceInfo {
@@ -99,21 +114,31 @@ impl SafeDeviceController {
             return Ok(ApplyOutcome::SkippedUnchanged { current: before });
         }
 
-        // 3. Pick write mode and enforce flash rate-limiting when volatile writes are unavailable.
+        // 3. Pick write mode and enforce sliding-window flash protection when volatile writes are unavailable.
         let mode = if caps.supports_volatile_writes {
             WriteMode::VolatileRam
         } else {
-            if let Some(last) = self.last_flash_write {
-                let elapsed = now.saturating_duration_since(last);
-                if elapsed < self.flash_cooldown {
-                    let remaining = self.flash_cooldown - elapsed;
-                    let wait_secs =
-                        (remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).max(1);
-                    return Err(PolledError::FlashRateLimited {
-                        device: info.name,
-                        wait_secs,
-                    });
+            while let Some(&oldest) = self.recent_flash_writes.front() {
+                if now.saturating_duration_since(oldest) >= self.flash_window {
+                    self.recent_flash_writes.pop_front();
+                } else {
+                    break;
                 }
+            }
+            if self.recent_flash_writes.len() >= self.max_flash_writes_per_window {
+                let oldest = *self
+                    .recent_flash_writes
+                    .front()
+                    .expect("non-empty flash window");
+                let remaining = self
+                    .flash_window
+                    .saturating_sub(now.saturating_duration_since(oldest));
+                let wait_secs =
+                    (remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).max(1);
+                return Err(PolledError::FlashRateLimited {
+                    device: info.name,
+                    wait_secs,
+                });
             }
             WriteMode::OnboardFlash
         };
@@ -121,7 +146,7 @@ impl SafeDeviceController {
         // 4. Write desired settings.
         self.device.apply_settings(desired, mode)?;
         if mode == WriteMode::OnboardFlash {
-            self.last_flash_write = Some(now);
+            self.recent_flash_writes.push_back(now);
             self.flash_writes_this_session += 1;
         }
 
@@ -230,6 +255,52 @@ mod tests {
             ApplyOutcome::Applied {
                 mode: WriteMode::OnboardFlash,
                 flash_writes_this_session: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn allows_small_flash_burst_then_throttles_until_window_expires() {
+        let dry = DryRunDevice::new_flash_only();
+        let mut ctrl = SafeDeviceController::new(Box::new(dry));
+        let t0 = Instant::now();
+
+        let game = MouseSettings {
+            dpi: Some(400),
+            ..Default::default()
+        };
+        let desktop = MouseSettings {
+            dpi: Some(1600),
+            ..Default::default()
+        };
+
+        // 4 rapid Game <-> Desktop writes within 12s all succeed without artificial delay.
+        for i in 0..DEFAULT_MAX_FLASH_WRITES_PER_WINDOW {
+            let target = if i % 2 == 0 { &game } else { &desktop };
+            let res = ctrl
+                .apply_profile_settings_at(target, t0 + Duration::from_secs((i * 3) as u64))
+                .unwrap();
+            assert!(matches!(res, ApplyOutcome::Applied { .. }));
+        }
+
+        // 5th write inside the 60s window is blocked by flash-wear protection.
+        let err = ctrl
+            .apply_profile_settings_at(&game, t0 + Duration::from_secs(20))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PolledError::FlashRateLimited { wait_secs: 40, .. }
+        ));
+
+        // Once the oldest write ages out past 60s, the next write succeeds.
+        let res = ctrl
+            .apply_profile_settings_at(&game, t0 + Duration::from_secs(61))
+            .unwrap();
+        assert!(matches!(
+            res,
+            ApplyOutcome::Applied {
+                flash_writes_this_session: 5,
                 ..
             }
         ));

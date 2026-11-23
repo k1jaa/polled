@@ -4,8 +4,9 @@
 
 //! Anti-cheat-safe Windows foreground window watcher using `SetWinEventHook`.
 //!
-//! Uses `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS` (no DLL injection, no hooks in
-//! game processes, no memory reads, no admin rights, and zero polling loops).
+//! Uses `WINEVENT_OUTOFCONTEXT` (no DLL injection, no hooks in game processes, no memory
+//! reads, no admin rights, and zero polling loops). Deliberately omits `WINEVENT_SKIPOWNPROCESS`
+//! so clicking back onto Polled's own window properly restores the Desktop profile.
 
 use std::time::Instant;
 
@@ -33,7 +34,7 @@ mod platform {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
         PostThreadMessageW, TranslateMessage, EVENT_SYSTEM_FOREGROUND, MSG, WINEVENT_OUTOFCONTEXT,
-        WINEVENT_SKIPOWNPROCESS, WM_QUIT,
+        WM_QUIT,
     };
 
     use crate::error::{PolledError, Result};
@@ -83,7 +84,7 @@ mod platform {
                             Some(win_event_proc),
                             0,
                             0,
-                            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                            WINEVENT_OUTOFCONTEXT,
                         )
                     };
 
@@ -160,10 +161,16 @@ mod platform {
         _event_thread: u32,
         _event_time: u32,
     ) {
-        if event != EVENT_SYSTEM_FOREGROUND || hwnd.is_invalid() {
+        if event != EVENT_SYSTEM_FOREGROUND {
             return;
         }
-        let exe_name = exe_name_from_hwnd(hwnd);
+        // When the foreground window becomes null (e.g., minimizing everything to an empty
+        // desktop), emit `exe_name: None` so the matcher falls back to the Desktop profile.
+        let exe_name = if hwnd.is_invalid() {
+            None
+        } else {
+            exe_name_from_hwnd(hwnd)
+        };
         HOOK_SENDER.with(|slot| {
             if let Some(tx) = slot.borrow().as_ref() {
                 let _ = tx.send(FocusEvent {

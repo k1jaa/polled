@@ -34,7 +34,7 @@ Open-source, lightweight pure-Rust Windows 10/11 utility for competitive mouse i
 
 ### Phase 2 — Per-Game Peripheral Profiles
 
-- **Event-driven game detection:** Uses `SetWinEventHook` (`EVENT_SYSTEM_FOREGROUND`, `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`) — zero polling loops, zero admin.
+- **Event-driven game detection:** Uses `SetWinEventHook` (`EVENT_SYSTEM_FOREGROUND`, `WINEVENT_OUTOFCONTEXT`) — zero polling loops, zero admin.
 - **Focus debouncing:** Waits for the focused app to stay in the foreground (default `1500 ms`, configurable `500–5000 ms`) before switching, so alt-tab spam triggers zero device writes.
 - **Versioned JSON profiles + export/import:** Stored in `%LOCALAPPDATA%\Polled\profiles.json` (`schema_version: 1`) with single-profile `polled.profile.v1` JSON export/import ready for shareable settings cards, plus a fallback `"Desktop (Default)"` profile.
 - **Mandatory read-back verification + rollback:** After every mouse write, Polled reads settings back from the mouse. If they do not match the target, Polled automatically rolls back to the pre-write values and logs an error.
@@ -49,7 +49,7 @@ Some wireless gaming mice expose volatile RAM-only write commands, while others 
 To protect your mouse's onboard flash from excessive erase/write cycles:
 1. **Register-level diffing:** Polled reads the mouse first and writes **only** registers whose value actually changed (0 writes when settings already match).
 2. **Focus debounce:** Quick alt-tabs cancel pending switches before any HID packet is sent.
-3. **Flash write rate-limiter:** On flash-only devices (`supports_volatile_writes = false`), Polled enforces a cooldown between onboard flash writes (default 15 s) and tracks session flash writes visibly in the UI.
+3. **Sliding-window flash rate-limiter:** On flash-only devices (`supports_volatile_writes = false`), Polled allows normal Game ↔ Desktop bursts (up to 4 onboard flash writes per 60 s) so switching back to Desktop happens right after focus debounce, while throttling runaway loops/spam with automatic cooldown retry and a visible session flash-write counter.
 4. **Recommendation:** Keep your desktop and game profiles sharing the same baseline settings where possible (only varying what you actually change per game) to minimize onboard flash writes.
 
 ---
