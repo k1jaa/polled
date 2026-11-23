@@ -7,7 +7,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use polled_core::win::WindowsEnv;
-use polled_core::{dump_hid_devices, AppPaths, CheckReport, HealthEngine, PolledError, Severity};
+use polled_core::{
+    detect_hardware_devices, dump_hid_devices, AppPaths, CheckReport, HealthEngine, PolledError,
+    Severity,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -23,6 +26,10 @@ struct Cli {
     /// List connected HID devices, interfaces, and usage pages (for device support reports)
     #[arg(long)]
     dump: bool,
+
+    /// Detect supported mice and read their current settings (read-only, zero writes)
+    #[arg(long)]
+    detect: bool,
 
     /// Optional hex Vendor ID filter for --dump (e.g. 3710 or 0x3710 for Pulsar)
     #[arg(long, value_name = "HEX_VID")]
@@ -86,6 +93,62 @@ fn parse_hex_vid(input: &str) -> polled_core::Result<u16> {
 }
 
 fn run(cli: Cli) -> polled_core::Result<ExitCode> {
+    if cli.detect {
+        let mut devices = detect_hardware_devices()?;
+        if devices.is_empty() {
+            if cli.json {
+                println!("[]");
+            } else {
+                println!("No supported hardware mice detected.");
+                println!("Run `polled --dump` to inspect all connected HID interfaces.");
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        if cli.json {
+            let entries: Vec<_> = devices
+                .iter_mut()
+                .map(|d| {
+                    let info = d.info();
+                    let caps = d.capabilities();
+                    let settings = d.read_settings().ok();
+                    serde_json::json!({
+                        "info": info,
+                        "capabilities": caps,
+                        "current_settings": settings,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+        } else {
+            for d in &mut devices {
+                let info = d.info();
+                let caps = d.capabilities();
+                println!(
+                    "{} ({}) [{}]",
+                    info.name,
+                    info.vid_pid.as_deref().unwrap_or("n/a"),
+                    info.support_tier.label()
+                );
+                println!("  Connection: {}", info.connection);
+                println!(
+                    "  Writes:     {}",
+                    if caps.supports_volatile_writes {
+                        "Volatile RAM (no flash wear)"
+                    } else {
+                        "Onboard flash (diffed & rate-limited)"
+                    }
+                );
+                match d.read_settings() {
+                    Ok(s) => println!("  Current:    {}", s.summary_string()),
+                    Err(e) => println!("  Current:    Unavailable ({e})"),
+                }
+                println!();
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     if cli.dump {
         let filter_vid = match &cli.vid {
             Some(v) => Some(parse_hex_vid(v)?),
