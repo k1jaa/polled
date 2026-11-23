@@ -604,33 +604,66 @@ impl ProfilesUiState {
 
         // --- LIVE ACTIVITY LOG (verifications, diff skips, flash guards, rollbacks) ---
         card_frame(ui, p, |ui| {
-            ui.label(RichText::new("Activity Log").strong().color(p.text));
+            let log_entries = snap.as_ref().map(|s| s.log.as_slice()).unwrap_or(&[]);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Activity Log").strong().color(p.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!log_entries.is_empty(), secondary_btn("Copy Log", p))
+                        .clicked()
+                    {
+                        let text = log_entries
+                            .iter()
+                            .map(|entry| {
+                                format!(
+                                    "{} [{}] {}",
+                                    entry.timestamp,
+                                    entry.severity.as_str().to_uppercase(),
+                                    entry.message
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ctx.copy_text(text);
+                        self.notice = Some((
+                            Severity::Ok,
+                            format!(
+                                "Copied {} activity log {} to clipboard.",
+                                log_entries.len(),
+                                if log_entries.len() == 1 {
+                                    "line"
+                                } else {
+                                    "lines"
+                                }
+                            ),
+                        ));
+                    }
+                });
+            });
             ui.add_space(4.0);
             egui::ScrollArea::vertical()
                 .id_salt("profile_activity_log")
                 .max_height(105.0)
                 .show(ui, |ui| {
-                    if let Some(s) = &snap {
-                        for entry in &s.log {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    RichText::new(&entry.timestamp)
-                                        .size(11.0)
-                                        .monospace()
-                                        .color(p.text_muted),
-                                );
-                                ui.label(
-                                    RichText::new(format!(
-                                        "[{}]",
-                                        entry.severity.as_str().to_uppercase()
-                                    ))
+                    for entry in log_entries {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(&entry.timestamp)
                                     .size(11.0)
-                                    .strong()
-                                    .color(p.severity_fg(entry.severity)),
-                                );
-                                ui.label(RichText::new(&entry.message).size(11.5).color(p.text));
-                            });
-                        }
+                                    .monospace()
+                                    .color(p.text_muted),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "[{}]",
+                                    entry.severity.as_str().to_uppercase()
+                                ))
+                                .size(11.0)
+                                .strong()
+                                .color(p.severity_fg(entry.severity)),
+                            );
+                            ui.label(RichText::new(&entry.message).size(11.5).color(p.text));
+                        });
                     }
                 });
         });
