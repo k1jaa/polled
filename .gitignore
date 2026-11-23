@@ -9,5 +9,6 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local test artifacts
+# Local test & release artifacts
 *.log
+/release-stage/

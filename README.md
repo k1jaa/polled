@@ -140,7 +140,8 @@ Release binaries are written to `target/release/polled.exe` and `target/release/
 crates/
   polled-core/         Pure Rust core (Windows API traits, 11 checks, snapshots,
                        HID --dump, MouseDevice trait, SafeDeviceController,
-                       Pulsar X2 CrazyLight backend, profiles, debouncer, watcher)
+                       Compx/Nordic & Logitech HID++ 2.0 backends, settings,
+                       profiles, debouncer, watcher)
   polled-cli/          Standalone console binary (polled.exe) & on-demand UAC helper
   polled-gui/          Pure-Rust monochrome Dark/Light GUI & tray app (eframe/egui)
 ```
