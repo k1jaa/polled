@@ -9,6 +9,7 @@ mod app;
 mod elevation;
 mod icon;
 mod notifications;
+mod theme;
 mod tray;
 
 use eframe::egui;
@@ -17,8 +18,8 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_title("Polled — Input Health Check")
-            .with_inner_size([940.0, 700.0])
+            .with_title("Polled")
+            .with_inner_size([960.0, 700.0])
             .with_min_inner_size([720.0, 500.0])
             .with_icon(icon::window_icon()),
         ..Default::default()

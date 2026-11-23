@@ -13,22 +13,8 @@ use polled_core::{AppPaths, CheckReport, HealthEngine, PolledError, ScanSummary,
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
 use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
+use crate::theme::{Palette, ThemeMode};
 use crate::tray::TrayController;
-
-// Theme palette matching Polled's dark utility aesthetic.
-const BG_DARK: Color32 = Color32::from_rgb(13, 16, 21);
-const SURFACE: Color32 = Color32::from_rgb(21, 26, 34);
-const SURFACE_ALT: Color32 = Color32::from_rgb(27, 34, 45);
-const BORDER: Color32 = Color32::from_rgb(38, 48, 64);
-const TEXT_PRIMARY: Color32 = Color32::from_rgb(230, 237, 245);
-const TEXT_MUTED: Color32 = Color32::from_rgb(148, 163, 184);
-
-const COLOR_OK: Color32 = Color32::from_rgb(34, 197, 94);
-const COLOR_INFO: Color32 = Color32::from_rgb(56, 189, 248);
-const COLOR_WARN: Color32 = Color32::from_rgb(245, 158, 11);
-const COLOR_BAD: Color32 = Color32::from_rgb(239, 68, 68);
-const COLOR_ACCENT: Color32 = Color32::from_rgb(16, 185, 129);
-const COLOR_ADMIN: Color32 = Color32::from_rgb(217, 119, 6);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterMode {
@@ -69,6 +55,7 @@ pub(crate) enum WorkerMsg {
 }
 
 pub struct PolledApp {
+    theme: ThemeMode,
     summary: Option<ScanSummary>,
     snapshot_path: String,
     filter: FilterMode,
@@ -86,7 +73,8 @@ pub struct PolledApp {
 
 impl PolledApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        apply_dark_theme(&cc.egui_ctx);
+        let theme = ThemeMode::Dark;
+        theme.apply_to(&cc.egui_ctx);
 
         let (tx, rx) = mpsc::channel();
         let quit_requested = Arc::new(AtomicBool::new(false));
@@ -100,6 +88,7 @@ impl PolledApp {
             .to_string();
 
         let mut app = Self {
+            theme,
             summary: None,
             snapshot_path,
             filter: FilterMode::All,
@@ -114,7 +103,6 @@ impl PolledApp {
             _tray: tray,
         };
 
-        // Run initial health check on startup (notifies only if something regressed).
         app.start_scan(&cc.egui_ctx, true);
         app
     }
@@ -488,7 +476,9 @@ impl eframe::App for PolledApp {
 
         self.drain_worker_messages(ctx);
 
-        // Compute counts & undoable set from latest scan.
+        let p = self.theme.palette();
+        let mode = self.theme;
+
         let (ok_count, info_count, warn_count, bad_count, fixable_safe) = match &self.summary {
             Some(s) => {
                 let mut counts = (0usize, 0usize, 0usize, 0usize, 0usize);
@@ -514,7 +504,7 @@ impl eframe::App for PolledApp {
             .map(|s| s.undoable_check_ids.iter().cloned().collect())
             .unwrap_or_default();
 
-        // Deferred UI actions (collected while rendering, executed right after).
+        let mut toggle_theme = false;
         let mut trigger_rescan = false;
         let mut trigger_fix_all_safe = false;
         let mut trigger_undo_all = false;
@@ -525,40 +515,31 @@ impl eframe::App for PolledApp {
         egui::TopBottomPanel::top("topbar")
             .frame(
                 egui::Frame::NONE
-                    .fill(SURFACE)
+                    .fill(p.surface)
                     .inner_margin(Margin::symmetric(18, 14))
-                    .stroke(Stroke::new(1.0_f32, BORDER)),
+                    .stroke(Stroke::new(1.0_f32, p.border)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // Brand + Windows build badge
-                    let (dot_rect, _) =
-                        ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(dot_rect.center(), 5.5, COLOR_ACCENT);
-
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("Polled")
-                                    .size(18.0)
-                                    .strong()
-                                    .color(TEXT_PRIMARY),
-                            );
+                            ui.label(RichText::new("Polled").size(18.0).strong().color(p.text));
                             if let Some(s) = &self.summary {
                                 pill(
                                     ui,
                                     &format!("Win {}", s.windows_version),
-                                    SURFACE_ALT,
-                                    TEXT_MUTED,
+                                    p.surface_alt,
+                                    p.text_muted,
+                                    p.border,
                                 );
                                 if s.windows_build_changed {
                                     pill(
                                         ui,
                                         "Windows Updated",
-                                        Color32::from_rgba_unmultiplied(245, 158, 11, 35),
-                                        COLOR_WARN,
+                                        p.severity_bg(Severity::Warn, mode),
+                                        p.warn,
+                                        p.border,
                                     );
                                 }
                             }
@@ -566,62 +547,40 @@ impl eframe::App for PolledApp {
                         ui.label(
                             RichText::new("Input Settings Health Check")
                                 .size(12.0)
-                                .color(TEXT_MUTED),
+                                .color(p.text_muted),
                         );
                     });
 
-                    // Action buttons on right
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let undo_count = undoable_set.len();
-                        let undo_btn = egui::Button::new(
-                            RichText::new(format!("Undo All ({undo_count})"))
-                                .color(if undo_count > 0 {
-                                    Color32::from_rgb(252, 165, 165)
-                                } else {
-                                    TEXT_MUTED
-                                })
-                                .strong(),
-                        )
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(Stroke::new(
-                            1.0_f32,
-                            if undo_count > 0 {
-                                Color32::from_rgba_unmultiplied(239, 68, 68, 130)
-                            } else {
-                                BORDER
-                            },
-                        ))
-                        .corner_radius(CornerRadius::same(6));
+                        if ui.add(secondary_button(self.theme.label(), p)).clicked() {
+                            toggle_theme = true;
+                        }
 
+                        let undo_count = undoable_set.len();
                         if ui
-                            .add_enabled(!self.busy && undo_count > 0, undo_btn)
+                            .add_enabled(
+                                !self.busy && undo_count > 0,
+                                secondary_button(&format!("Undo All ({undo_count})"), p),
+                            )
                             .clicked()
                         {
                             trigger_undo_all = true;
                         }
 
-                        let fix_safe_btn = egui::Button::new(
-                            RichText::new(format!("Fix Safe Issues ({fixable_safe})"))
-                                .color(Color32::from_rgb(4, 19, 12))
-                                .strong(),
-                        )
-                        .fill(COLOR_ACCENT)
-                        .corner_radius(CornerRadius::same(6));
-
                         if ui
-                            .add_enabled(!self.busy && fixable_safe > 0, fix_safe_btn)
+                            .add_enabled(
+                                !self.busy && fixable_safe > 0,
+                                primary_button(&format!("Fix Safe Issues ({fixable_safe})"), p),
+                            )
                             .clicked()
                         {
                             trigger_fix_all_safe = true;
                         }
 
-                        let rescan_btn =
-                            egui::Button::new(RichText::new("Rescan").color(TEXT_PRIMARY).strong())
-                                .fill(SURFACE_ALT)
-                                .stroke(Stroke::new(1.0_f32, BORDER))
-                                .corner_radius(CornerRadius::same(6));
-
-                        if ui.add_enabled(!self.busy, rescan_btn).clicked() {
+                        if ui
+                            .add_enabled(!self.busy, secondary_button("Rescan", p))
+                            .clicked()
+                        {
                             trigger_rescan = true;
                         }
                     });
@@ -632,9 +591,9 @@ impl eframe::App for PolledApp {
         egui::TopBottomPanel::bottom("footer")
             .frame(
                 egui::Frame::NONE
-                    .fill(SURFACE)
+                    .fill(p.surface)
                     .inner_margin(Margin::symmetric(18, 8))
-                    .stroke(Stroke::new(1.0_f32, BORDER)),
+                    .stroke(Stroke::new(1.0_f32, p.border)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -642,13 +601,13 @@ impl eframe::App for PolledApp {
                         RichText::new(format!("Snapshot: {}", self.snapshot_path))
                             .size(11.0)
                             .monospace()
-                            .color(TEXT_MUTED),
+                            .color(p.text_muted),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new("Close [X] minimizes to tray • No telemetry • GPL-3.0")
                                 .size(11.0)
-                                .color(TEXT_MUTED),
+                                .color(p.text_muted),
                         );
                     });
                 });
@@ -658,20 +617,20 @@ impl eframe::App for PolledApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
-                    .fill(BG_DARK)
+                    .fill(p.bg)
                     .inner_margin(Margin::symmetric(18, 14)),
             )
             .show(ctx, |ui| {
                 // Regression alert banner
                 if let Some(summary) = &self.summary {
                     if !summary.regressions.is_empty() {
-                        banner_frame(ui, COLOR_WARN, |ui| {
+                        banner_frame(ui, p, Some(p.warn), mode, |ui| {
                             let heading = if summary.windows_build_changed {
                                 "Windows Update changed your input settings:"
                             } else {
                                 "Regressions detected since your previous scan:"
                             };
-                            ui.label(RichText::new(heading).strong().color(COLOR_WARN));
+                            ui.label(RichText::new(heading).strong().color(p.warn));
                             for reg in &summary.regressions {
                                 ui.label(
                                     RichText::new(format!(
@@ -682,7 +641,7 @@ impl eframe::App for PolledApp {
                                         reg.current_value
                                     ))
                                     .size(12.5)
-                                    .color(TEXT_PRIMARY),
+                                    .color(p.text),
                                 );
                             }
                         });
@@ -690,16 +649,16 @@ impl eframe::App for PolledApp {
                     }
                 }
 
-                // Transient status / error banners
+                // Transient status / error banners (neutral B&W for status, BAD red for errors)
                 if let Some(msg) = self.status_message.clone() {
                     let mut dismiss = false;
-                    banner_frame(ui, COLOR_OK, |ui| {
+                    banner_frame(ui, p, None, mode, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&msg).color(Color32::from_rgb(134, 239, 172)));
+                            ui.label(RichText::new(&msg).color(p.text));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.small_button("Dismiss").clicked() {
+                                    if ui.add(secondary_button("Dismiss", p)).clicked() {
                                         dismiss = true;
                                     }
                                 },
@@ -714,13 +673,13 @@ impl eframe::App for PolledApp {
 
                 if let Some(err) = self.error_message.clone() {
                     let mut dismiss = false;
-                    banner_frame(ui, COLOR_BAD, |ui| {
+                    banner_frame(ui, p, Some(p.bad), mode, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&err).color(Color32::from_rgb(254, 202, 202)));
+                            ui.label(RichText::new(&err).color(p.bad));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.small_button("Dismiss").clicked() {
+                                    if ui.add(secondary_button("Dismiss", p)).clicked() {
                                         dismiss = true;
                                     }
                                 },
@@ -733,7 +692,7 @@ impl eframe::App for PolledApp {
                     ui.add_space(8.0);
                 }
 
-                // Filter tabs + summary counters
+                // Filter tabs + severity summary counters
                 let total_count = self.summary.as_ref().map_or(0, |s| s.checks.len());
                 let issues_count = warn_count + bad_count;
                 let undo_count = undoable_set.len();
@@ -741,19 +700,28 @@ impl eframe::App for PolledApp {
                 ui.horizontal(|ui| {
                     filter_tab(
                         ui,
+                        p,
                         &mut self.filter,
                         FilterMode::All,
                         &format!("All ({total_count})"),
                     );
                     filter_tab(
                         ui,
+                        p,
                         &mut self.filter,
                         FilterMode::Issues,
                         &format!("Issues ({issues_count})"),
                     );
-                    filter_tab(ui, &mut self.filter, FilterMode::ReportOnly, "Report Only");
                     filter_tab(
                         ui,
+                        p,
+                        &mut self.filter,
+                        FilterMode::ReportOnly,
+                        "Report Only",
+                    );
+                    filter_tab(
+                        ui,
+                        p,
                         &mut self.filter,
                         FilterMode::Undoable,
                         &format!("Undoable ({undo_count})"),
@@ -762,19 +730,34 @@ impl eframe::App for PolledApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.busy {
                             ui.spinner();
-                            ui.label(RichText::new(&self.busy_label).size(12.0).color(TEXT_MUTED));
+                            ui.label(
+                                RichText::new(&self.busy_label)
+                                    .size(12.0)
+                                    .color(p.text_muted),
+                            );
                         } else {
-                            pill(ui, &format!("{bad_count} Bad"), SURFACE, COLOR_BAD);
-                            pill(ui, &format!("{warn_count} Warn"), SURFACE, COLOR_WARN);
-                            pill(ui, &format!("{info_count} Info"), SURFACE, COLOR_INFO);
-                            pill(ui, &format!("{ok_count} OK"), SURFACE, COLOR_OK);
+                            pill(ui, &format!("{bad_count} Bad"), p.surface, p.bad, p.border);
+                            pill(
+                                ui,
+                                &format!("{warn_count} Warn"),
+                                p.surface,
+                                p.warn,
+                                p.border,
+                            );
+                            pill(
+                                ui,
+                                &format!("{info_count} Info"),
+                                p.surface,
+                                p.info,
+                                p.border,
+                            );
+                            pill(ui, &format!("{ok_count} OK"), p.surface, p.ok, p.border);
                         }
                     });
                 });
 
                 ui.add_space(10.0);
 
-                // Scrollable check list
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -782,7 +765,7 @@ impl eframe::App for PolledApp {
                             ui.centered_and_justified(|ui| {
                                 ui.label(
                                     RichText::new("Scanning Windows input settings...")
-                                        .color(TEXT_MUTED),
+                                        .color(p.text_muted),
                                 );
                             });
                             return;
@@ -801,15 +784,15 @@ impl eframe::App for PolledApp {
 
                         if visible.is_empty() {
                             egui::Frame::NONE
-                                .fill(SURFACE)
-                                .stroke(Stroke::new(1.0_f32, BORDER))
+                                .fill(p.surface)
+                                .stroke(Stroke::new(1.0_f32, p.border))
                                 .corner_radius(CornerRadius::same(8))
                                 .inner_margin(Margin::same(28))
                                 .show(ui, |ui| {
                                     ui.centered_and_justified(|ui| {
                                         ui.label(
                                             RichText::new("No checks match the selected filter.")
-                                                .color(TEXT_MUTED),
+                                                .color(p.text_muted),
                                         );
                                     });
                                 });
@@ -820,6 +803,8 @@ impl eframe::App for PolledApp {
                             let is_undoable = undoable_set.contains(&check.id);
                             render_check_card(
                                 ui,
+                                p,
+                                mode,
                                 check,
                                 is_undoable,
                                 self.busy,
@@ -831,7 +816,7 @@ impl eframe::App for PolledApp {
                     });
             });
 
-        // --- UAC CONFIRMATION MODAL ---
+        // --- UAC CONFIRMATION MODAL (plain monochrome) ---
         let mut confirm_elevation = false;
         let mut cancel_elevation = false;
         if let Some(pending) = &self.pending_elevation {
@@ -843,37 +828,28 @@ impl eframe::App for PolledApp {
                 .max_width(440.0)
                 .frame(
                     egui::Frame::NONE
-                        .fill(SURFACE)
-                        .stroke(Stroke::new(1.5_f32, COLOR_ADMIN))
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.5_f32, p.text))
                         .corner_radius(CornerRadius::same(10))
                         .inner_margin(Margin::same(18)),
                 )
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        pill(
-                            ui,
-                            "UAC",
-                            Color32::from_rgba_unmultiplied(245, 158, 11, 35),
-                            COLOR_WARN,
-                        );
+                        pill(ui, "UAC", p.surface_alt, p.text, p.border);
                         ui.label(
                             RichText::new(&pending.title)
                                 .size(15.0)
                                 .strong()
-                                .color(TEXT_PRIMARY),
+                                .color(p.text),
                         );
                     });
                     ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(&pending.reason)
-                            .size(13.0)
-                            .color(TEXT_MUTED),
-                    );
+                    ui.label(RichText::new(&pending.reason).size(13.0).color(p.text_muted));
                     ui.add_space(10.0);
 
                     egui::Frame::NONE
-                        .fill(SURFACE_ALT)
-                        .stroke(Stroke::new(1.0_f32, BORDER))
+                        .fill(p.surface_alt)
+                        .stroke(Stroke::new(1.0_f32, p.border))
                         .corner_radius(CornerRadius::same(6))
                         .inner_margin(Margin::same(10))
                         .show(ui, |ui| {
@@ -882,37 +858,33 @@ impl eframe::App for PolledApp {
                                     "Polled stays non-elevated and launches polled.exe only for this single action. Your original setting is saved to baseline_snapshot.json before any change.",
                                 )
                                 .size(12.0)
-                                .color(TEXT_MUTED),
+                                .color(p.text_muted),
                             );
                         });
 
                     ui.add_space(14.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let confirm_btn = egui::Button::new(
-                            RichText::new(&pending.action_label)
-                                .color(Color32::WHITE)
-                                .strong(),
-                        )
-                        .fill(COLOR_ADMIN)
-                        .corner_radius(CornerRadius::same(6));
-
-                        if ui.add_enabled(!self.busy, confirm_btn).clicked() {
+                        if ui
+                            .add_enabled(!self.busy, primary_button(&pending.action_label, p))
+                            .clicked()
+                        {
                             confirm_elevation = true;
                         }
-
-                        let cancel_btn =
-                            egui::Button::new(RichText::new("Cancel").color(TEXT_PRIMARY))
-                                .fill(SURFACE_ALT)
-                                .stroke(Stroke::new(1.0_f32, BORDER))
-                                .corner_radius(CornerRadius::same(6));
-                        if ui.add_enabled(!self.busy, cancel_btn).clicked() {
+                        if ui
+                            .add_enabled(!self.busy, secondary_button("Cancel", p))
+                            .clicked()
+                        {
                             cancel_elevation = true;
                         }
                     });
                 });
         }
 
-        // Execute any deferred user actions cleanly.
+        if toggle_theme {
+            self.theme = self.theme.toggle();
+            self.theme.apply_to(ctx);
+        }
+
         if cancel_elevation {
             self.pending_elevation = None;
         } else if confirm_elevation {
@@ -978,133 +950,152 @@ impl eframe::App for PolledApp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_check_card(
     ui: &mut egui::Ui,
+    p: Palette,
+    mode: ThemeMode,
     check: &CheckReport,
     is_undoable: bool,
     busy: bool,
     clicked_fix: &mut Option<CheckReport>,
     clicked_undo: &mut Option<CheckReport>,
 ) {
-    let sev_color = severity_color(check.severity);
-    let sev_bg = severity_bg(check.severity);
+    let sev_fg = p.severity_fg(check.severity);
+    let sev_bg = p.severity_bg(check.severity, mode);
     let show_fix = check.can_fix
         && (check.severity >= Severity::Warn
             || (check.id == "power_plan" && check.severity == Severity::Info));
 
     let frame = egui::Frame::NONE
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(13));
 
     let resp = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
 
-        // Header row
         ui.horizontal(|ui| {
             pill(
                 ui,
                 &check.severity.as_str().to_uppercase(),
                 sev_bg,
-                sev_color,
+                sev_fg,
+                p.border,
             );
-            ui.label(
-                RichText::new(&check.name)
-                    .size(14.5)
-                    .strong()
-                    .color(TEXT_PRIMARY),
-            );
+            ui.label(RichText::new(&check.name).size(14.5).strong().color(p.text));
             ui.label(
                 RichText::new(&check.id)
                     .size(11.5)
                     .monospace()
-                    .color(TEXT_MUTED),
+                    .color(p.text_muted),
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if show_fix {
-                    let (label, bg, fg) = if check.requires_elevation {
-                        ("Fix (Admin)", COLOR_ADMIN, Color32::WHITE)
+                    let label = if check.requires_elevation {
+                        "Fix [Admin]"
                     } else {
-                        ("Fix", COLOR_ACCENT, Color32::from_rgb(4, 19, 12))
+                        "Fix"
                     };
-                    let btn = egui::Button::new(RichText::new(label).color(fg).strong())
-                        .fill(bg)
-                        .corner_radius(CornerRadius::same(6));
-                    if ui.add_enabled(!busy, btn).clicked() {
+                    if ui.add_enabled(!busy, primary_button(label, p)).clicked() {
                         *clicked_fix = Some(check.clone());
                     }
                 }
 
-                if is_undoable {
-                    let undo_btn = egui::Button::new(RichText::new("Undo").color(TEXT_PRIMARY))
-                        .fill(SURFACE_ALT)
-                        .stroke(Stroke::new(1.0_f32, BORDER))
-                        .corner_radius(CornerRadius::same(6));
-                    if ui.add_enabled(!busy, undo_btn).clicked() {
-                        *clicked_undo = Some(check.clone());
-                    }
+                if is_undoable && ui.add_enabled(!busy, secondary_button("Undo", p)).clicked() {
+                    *clicked_undo = Some(check.clone());
                 }
 
                 if check.requires_relogin && check.severity >= Severity::Warn {
                     pill(
                         ui,
                         "Sign-out required",
-                        Color32::from_rgba_unmultiplied(245, 158, 11, 28),
-                        COLOR_WARN,
+                        p.surface_alt,
+                        p.text_muted,
+                        p.border,
                     );
                 }
 
                 if !check.can_fix {
-                    pill(ui, "Report only", SURFACE_ALT, TEXT_MUTED);
+                    pill(ui, "Report only", p.surface_alt, p.text_muted, p.border);
                 }
             });
         });
 
         ui.add_space(8.0);
 
-        // Current vs Recommended comparison boxes
         ui.columns(2, |cols| {
-            value_box(&mut cols[0], "CURRENT", &check.current_value, TEXT_PRIMARY);
+            value_box(&mut cols[0], p, "CURRENT", &check.current_value, p.text);
             value_box(
                 &mut cols[1],
+                p,
                 "RECOMMENDED",
                 &check.recommended_value,
-                Color32::from_rgb(203, 213, 225),
+                p.text_muted,
             );
         });
 
         ui.add_space(7.0);
-        ui.label(RichText::new(&check.reason).size(12.2).color(TEXT_MUTED));
+        ui.label(RichText::new(&check.reason).size(12.2).color(p.text_muted));
     });
 
-    // Crisp left severity stripe inside the card edge
     let rect = resp.response.rect;
     let stripe = egui::Rect::from_min_max(
         rect.left_top() + egui::vec2(1.0, 2.0),
         egui::pos2(rect.left() + 4.5, rect.bottom() - 2.0),
     );
     ui.painter()
-        .rect_filled(stripe, CornerRadius::same(2), sev_color);
+        .rect_filled(stripe, CornerRadius::same(2), sev_fg);
 }
 
-fn value_box(ui: &mut egui::Ui, label: &str, value: &str, text_color: Color32) {
+fn primary_button(label: &str, p: Palette) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(label).color(p.btn_primary_fg).strong())
+        .fill(p.btn_primary_bg)
+        .corner_radius(CornerRadius::same(6))
+}
+
+fn secondary_button(label: &str, p: Palette) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(label).color(p.text))
+        .fill(p.surface_alt)
+        .stroke(Stroke::new(1.0_f32, p.border))
+        .corner_radius(CornerRadius::same(6))
+}
+
+fn value_box(ui: &mut egui::Ui, p: Palette, label: &str, value: &str, text_color: Color32) {
     egui::Frame::NONE
-        .fill(SURFACE_ALT)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(p.surface_alt)
+        .stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 7))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(label).size(10.0).strong().color(TEXT_MUTED));
+            ui.label(RichText::new(label).size(10.0).strong().color(p.text_muted));
             ui.label(RichText::new(value).size(12.5).color(text_color));
         });
 }
 
-fn banner_frame(ui: &mut egui::Ui, accent: Color32, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 28);
-    let border = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 110);
+fn banner_frame(
+    ui: &mut egui::Ui,
+    p: Palette,
+    semantic_accent: Option<Color32>,
+    mode: ThemeMode,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let (fill, border) = match semantic_accent {
+        Some(c) => {
+            let alpha = match mode {
+                ThemeMode::Dark => 28,
+                ThemeMode::Light => 20,
+            };
+            (
+                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha),
+                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 120),
+            )
+        }
+        None => (p.surface, p.border),
+    };
     egui::Frame::NONE
         .fill(fill)
         .stroke(Stroke::new(1.0_f32, border))
@@ -1116,19 +1107,25 @@ fn banner_frame(ui: &mut egui::Ui, accent: Color32, add_contents: impl FnOnce(&m
         });
 }
 
-fn filter_tab(ui: &mut egui::Ui, current: &mut FilterMode, target: FilterMode, label: &str) {
+fn filter_tab(
+    ui: &mut egui::Ui,
+    p: Palette,
+    current: &mut FilterMode,
+    target: FilterMode,
+    label: &str,
+) {
     let selected = *current == target;
     let btn = egui::Button::new(
         RichText::new(label)
             .size(12.5)
-            .color(if selected { TEXT_PRIMARY } else { TEXT_MUTED })
+            .color(if selected { p.text } else { p.text_muted })
             .strong(),
     )
-    .fill(if selected { SURFACE_ALT } else { SURFACE })
+    .fill(if selected { p.surface_alt } else { p.surface })
     .stroke(Stroke::new(
         1.0_f32,
         if selected {
-            BORDER
+            p.border
         } else {
             Color32::TRANSPARENT
         },
@@ -1140,39 +1137,13 @@ fn filter_tab(ui: &mut egui::Ui, current: &mut FilterMode, target: FilterMode, l
     }
 }
 
-fn pill(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32) {
+fn pill(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32, border: Color32) {
     egui::Frame::NONE
         .fill(bg)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .stroke(Stroke::new(1.0_f32, border))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(8, 2))
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(11.0).strong().color(fg));
         });
-}
-
-fn severity_color(severity: Severity) -> Color32 {
-    match severity {
-        Severity::Ok => COLOR_OK,
-        Severity::Info => COLOR_INFO,
-        Severity::Warn => COLOR_WARN,
-        Severity::Bad => COLOR_BAD,
-    }
-}
-
-fn severity_bg(severity: Severity) -> Color32 {
-    let c = severity_color(severity);
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 36)
-}
-
-fn apply_dark_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = BG_DARK;
-    visuals.window_fill = SURFACE;
-    visuals.override_text_color = Some(TEXT_PRIMARY);
-    visuals.widgets.noninteractive.bg_fill = SURFACE;
-    visuals.widgets.inactive.bg_fill = SURFACE_ALT;
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(36, 46, 61);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(44, 56, 74);
-    ctx.set_visuals(visuals);
 }

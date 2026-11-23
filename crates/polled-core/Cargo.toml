@@ -10,6 +10,7 @@ description = "Core input health check, snapshot/undo, and peripheral profile en
 [dependencies]
 base64.workspace = true
 chrono.workspace = true
+hidapi.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true

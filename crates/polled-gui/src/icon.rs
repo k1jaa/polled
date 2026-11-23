@@ -2,7 +2,7 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Procedurally renders Polled's crisp dark-slate & emerald crosshair icon as RGBA bytes
+//! Procedurally renders Polled's crisp monochrome black-and-white crosshair icon as RGBA bytes
 //! (zero external image-decoding dependencies).
 
 use eframe::egui::IconData;
@@ -27,9 +27,9 @@ pub fn render_rgba(size: u32) -> Vec<u8> {
             let idx = ((y * size + x) * 4) as usize;
 
             let (r, g, b, a) = if d <= r_outer {
-                let mut color = (15u8, 23u8, 42u8, 255u8); // dark slate badge
+                let mut color = (10u8, 10u8, 12u8, 255u8); // near-black badge
                 if d >= r_outer - (s * 0.045).max(1.2) {
-                    color = (38, 48, 64, 255); // subtle rim
+                    color = (72, 72, 78, 255); // neutral rim
                 }
                 let on_ring = d <= r_ring_outer && d >= r_ring_inner;
                 let on_crosshair = (dx.abs() <= tick_half
@@ -38,11 +38,8 @@ pub fn render_rgba(size: u32) -> Vec<u8> {
                     || (dy.abs() <= tick_half
                         && dx.abs() >= r_dot * 1.45
                         && dx.abs() <= r_ring_outer * 1.15);
-                if on_ring || on_crosshair {
-                    color = (16, 185, 129, 255); // emerald
-                }
-                if d <= r_dot {
-                    color = (52, 211, 153, 255); // bright center dot
+                if on_ring || on_crosshair || d <= r_dot {
+                    color = (248, 248, 250, 255); // crisp white crosshair
                 }
                 color
             } else {

@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use polled_core::win::WindowsEnv;
-use polled_core::{AppPaths, CheckReport, HealthEngine, PolledError, Severity};
+use polled_core::{dump_hid_devices, AppPaths, CheckReport, HealthEngine, PolledError, Severity};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,7 +20,19 @@ struct Cli {
     #[arg(long)]
     scan: bool,
 
-    /// Output results as machine-readable JSON (use with --scan, --fix, or --undo-all)
+    /// List connected HID devices, interfaces, and usage pages (for device support reports)
+    #[arg(long)]
+    dump: bool,
+
+    /// Optional hex Vendor ID filter for --dump (e.g. 3710 or 0x3710 for Pulsar)
+    #[arg(long, value_name = "HEX_VID")]
+    vid: Option<String>,
+
+    /// Include raw hardware serial numbers in --dump output (redacted by default)
+    #[arg(long)]
+    include_serials: bool,
+
+    /// Output results as machine-readable JSON (use with --scan, --dump, --fix, or --undo-all)
     #[arg(long)]
     json: bool,
 
@@ -52,7 +64,7 @@ fn main() -> ExitCode {
         Err(err) => {
             if let PolledError::ElevationRequired { operation, reason } = &err {
                 eprintln!("Elevation required ({operation}): {reason}");
-                eprintln!("Re-run this specific fix from an elevated prompt or click 'Fix (Admin)' in Polled.");
+                eprintln!("Re-run this specific fix from an elevated prompt or click 'Fix [Admin]' in Polled.");
                 return ExitCode::from(5);
             }
             eprintln!("Error: {err}");
@@ -61,7 +73,57 @@ fn main() -> ExitCode {
     }
 }
 
+fn parse_hex_vid(input: &str) -> polled_core::Result<u16> {
+    let trimmed = input
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| input.trim().strip_prefix("0X"))
+        .unwrap_or(input.trim());
+    u16::from_str_radix(trimmed, 16).map_err(|_| PolledError::Win32 {
+        context: "--vid".to_string(),
+        message: format!("Invalid hex Vendor ID '{input}' (expected e.g. 3710 or 0x3710)"),
+    })
+}
+
 fn run(cli: Cli) -> polled_core::Result<ExitCode> {
+    if cli.dump {
+        let filter_vid = match &cli.vid {
+            Some(v) => Some(parse_hex_vid(v)?),
+            None => None,
+        };
+        let report = dump_hid_devices(cli.include_serials, filter_vid)?;
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!(
+                "Polled HID Interface Dump ({} interface{}, serials {})",
+                report.device_count,
+                if report.device_count == 1 { "" } else { "s" },
+                if report.serials_redacted {
+                    "redacted"
+                } else {
+                    "included"
+                }
+            );
+            println!();
+            for dev in &report.devices {
+                let product = dev.product.as_deref().unwrap_or("(unnamed)");
+                let mfg = dev.manufacturer.as_deref().unwrap_or("(unknown vendor)");
+                println!(
+                    "{}  if={:<2}  usage_page=0x{:04x} usage=0x{:04x}  [{}]  {} — {}",
+                    dev.vid_pid,
+                    dev.interface_number,
+                    dev.usage_page,
+                    dev.usage,
+                    dev.usage_page_label,
+                    mfg,
+                    product
+                );
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let paths = match &cli.data_dir {
         Some(dir) => AppPaths::from_root(dir),
         None => AppPaths::default_user_dir(),
@@ -160,7 +222,7 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    eprintln!("No action specified. Run `polled --help` for usage (e.g. `polled --scan`).");
+    eprintln!("No action specified. Run `polled --help` for usage (e.g. `polled --scan` or `polled --dump`).");
     Ok(ExitCode::from(2))
 }
 

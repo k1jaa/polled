@@ -4,6 +4,7 @@
 
 pub mod checks;
 pub mod error;
+pub mod hid;
 pub mod paths;
 pub mod win;
 
@@ -12,4 +13,5 @@ pub use checks::{
     UndoSummary,
 };
 pub use error::{PolledError, Result};
+pub use hid::{dump_hid_devices, HidDeviceDump, HidDumpReport};
 pub use paths::AppPaths;
