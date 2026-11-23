@@ -17,8 +17,9 @@ pub use checks::{
 };
 pub use devices::{
     detect_hardware_devices, hid_topology_fingerprint, ApplyOutcome, CompxDevice,
-    CompxProtocolDriver, DeviceCapabilities, DeviceDriver, DeviceInfo, DryRunDevice,
-    LiftOffDistance, MouseDevice, MouseSettings, SafeDeviceController, SupportTier, WriteMode,
+    CompxProtocolDriver, DeviceCapabilities, DeviceDriver, DeviceInfo, DryRunDevice, Hidpp20Device,
+    Hidpp20ProtocolDriver, LiftOffDistance, MouseDevice, MouseSettings, SafeDeviceController,
+    SupportTier, WriteMode,
 };
 pub use error::{PolledError, Result};
 pub use hid::{dump_hid_devices, HidDeviceDump, HidDumpReport};

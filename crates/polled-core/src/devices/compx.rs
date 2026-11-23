@@ -569,6 +569,7 @@ impl MouseDevice for CompxDevice {
             dpi_step: self.spec.dpi_step,
             polling_rates_hz: self.spec.polling_rates_hz.clone(),
             lod_options: self.spec.lod_options.clone(),
+            supports_debounce: true,
             debounce_min_ms: 0,
             debounce_max_ms: self.spec.debounce_max_ms,
             supports_volatile_writes: false,

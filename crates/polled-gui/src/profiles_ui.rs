@@ -605,6 +605,9 @@ impl ProfilesUiState {
                         .as_ref()
                         .map(|c| c.lod_options.clone())
                         .unwrap_or_else(|| LiftOffDistance::ALL.to_vec());
+                    let supports_debounce = active_target_caps
+                        .as_ref()
+                        .is_none_or(|c| c.supports_debounce);
                     let db_min = active_target_caps.as_ref().map_or(0, |c| c.debounce_min_ms);
                     let db_max = active_target_caps
                         .as_ref()
@@ -744,29 +747,47 @@ impl ProfilesUiState {
                             });
                             ui.end_row();
 
-                            ui.checkbox(&mut self.editor.set_lod, "Lift-Off Distance");
-                            ui.add_enabled_ui(self.editor.set_lod, |ui| {
-                                egui::ComboBox::from_id_salt("lod_combo")
-                                    .selected_text(self.editor.lod.label())
-                                    .show_ui(ui, |ui| {
-                                        for opt in &lod_options {
-                                            ui.selectable_value(
-                                                &mut self.editor.lod,
-                                                *opt,
-                                                opt.label(),
-                                            );
-                                        }
-                                    });
-                            });
+                            if lod_options.is_empty() {
+                                ui.label(RichText::new("Lift-Off Distance").color(p.text_muted));
+                                ui.label(
+                                    RichText::new("Not configurable on this mouse")
+                                        .size(12.0)
+                                        .color(p.text_muted),
+                                );
+                            } else {
+                                ui.checkbox(&mut self.editor.set_lod, "Lift-Off Distance");
+                                ui.add_enabled_ui(self.editor.set_lod, |ui| {
+                                    egui::ComboBox::from_id_salt("lod_combo")
+                                        .selected_text(self.editor.lod.label())
+                                        .show_ui(ui, |ui| {
+                                            for opt in &lod_options {
+                                                ui.selectable_value(
+                                                    &mut self.editor.lod,
+                                                    *opt,
+                                                    opt.label(),
+                                                );
+                                            }
+                                        });
+                                });
+                            }
                             ui.end_row();
 
-                            ui.checkbox(&mut self.editor.set_debounce, "Debounce");
-                            ui.add_enabled(
-                                self.editor.set_debounce,
-                                egui::DragValue::new(&mut self.editor.debounce_ms)
-                                    .range(db_min..=db_max)
-                                    .suffix(" ms"),
-                            );
+                            if !supports_debounce {
+                                ui.label(RichText::new("Debounce").color(p.text_muted));
+                                ui.label(
+                                    RichText::new("Not configurable on this mouse")
+                                        .size(12.0)
+                                        .color(p.text_muted),
+                                );
+                            } else {
+                                ui.checkbox(&mut self.editor.set_debounce, "Debounce");
+                                ui.add_enabled(
+                                    self.editor.set_debounce,
+                                    egui::DragValue::new(&mut self.editor.debounce_ms)
+                                        .range(db_min..=db_max)
+                                        .suffix(" ms"),
+                                );
+                            }
                             ui.end_row();
 
                             ui.checkbox(&mut self.editor.set_win_speed, "Windows Speed");

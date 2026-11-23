@@ -92,6 +92,7 @@ impl MouseDevice for DryRunDevice {
             dpi_step: 50,
             polling_rates_hz: vec![125, 250, 500, 1000, 2000, 4000, 8000],
             lod_options: LiftOffDistance::ALL.to_vec(),
+            supports_debounce: true,
             debounce_min_ms: 0,
             debounce_max_ms: 20,
             supports_volatile_writes: self.supports_volatile_writes,

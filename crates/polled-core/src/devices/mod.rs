@@ -5,6 +5,7 @@
 pub mod compx;
 pub mod controller;
 pub mod dry_run;
+pub mod hidpp20;
 
 use std::fmt;
 
@@ -16,6 +17,7 @@ use crate::error::{PolledError, Result};
 pub use compx::{CompxDevice, CompxProtocolDriver};
 pub use controller::{ApplyOutcome, SafeDeviceController};
 pub use dry_run::DryRunDevice;
+pub use hidpp20::{Hidpp20Device, Hidpp20ProtocolDriver};
 
 /// Explicitly communicates how a device backend was verified (surfaced in UI and README).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +187,7 @@ pub struct DeviceCapabilities {
     pub dpi_step: u16,
     pub polling_rates_hz: Vec<u16>,
     pub lod_options: Vec<LiftOffDistance>,
+    pub supports_debounce: bool,
     pub debounce_min_ms: u8,
     pub debounce_max_ms: u8,
     /// If `false`, writes touch onboard flash and MUST be diffed and rate-limited.
@@ -237,6 +240,12 @@ impl DeviceCapabilities {
         }
 
         if let Some(db) = settings.debounce_ms {
+            if !self.supports_debounce {
+                return Err(PolledError::UnsupportedSetting {
+                    device: device_name.to_string(),
+                    detail: format!("Debounce is not configurable on {device_name}"),
+                });
+            }
             if db < self.debounce_min_ms || db > self.debounce_max_ms {
                 return Err(PolledError::UnsupportedSetting {
                     device: device_name.to_string(),
@@ -311,11 +320,16 @@ impl DeviceCapabilities {
         }
 
         if let Some(db) = desired.debounce_ms {
-            let clamped = db.clamp(self.debounce_min_ms, self.debounce_max_ms);
-            if clamped != db {
-                notes.push(format!("Debounce {db} ms -> {clamped} ms"));
+            if !self.supports_debounce {
+                notes.push(format!("Debounce {db} ms skipped"));
+                out.debounce_ms = None;
+            } else {
+                let clamped = db.clamp(self.debounce_min_ms, self.debounce_max_ms);
+                if clamped != db {
+                    notes.push(format!("Debounce {db} ms -> {clamped} ms"));
+                }
+                out.debounce_ms = Some(clamped);
             }
-            out.debounce_ms = Some(clamped);
         }
 
         (out, notes)
@@ -342,7 +356,10 @@ pub fn detect_hardware_devices() -> Result<Vec<Box<dyn MouseDevice>>> {
         context: "HidApi::new".to_string(),
         message: e.to_string(),
     })?;
-    let drivers: Vec<Box<dyn DeviceDriver>> = vec![Box::new(CompxProtocolDriver)];
+    let drivers: Vec<Box<dyn DeviceDriver>> = vec![
+        Box::new(CompxProtocolDriver),
+        Box::new(Hidpp20ProtocolDriver),
+    ];
     let mut devices = Vec::new();
     for driver in &drivers {
         if let Ok(found) = driver.detect(&api) {
@@ -380,6 +397,7 @@ mod tests {
             dpi_step: 50,
             polling_rates_hz: vec![125, 250, 500, 1000, 2000, 4000],
             lod_options: vec![LiftOffDistance::Mm10, LiftOffDistance::Mm20],
+            supports_debounce: true,
             debounce_min_ms: 0,
             debounce_max_ms: 15,
             supports_volatile_writes: false,
@@ -400,5 +418,36 @@ mod tests {
         assert_eq!(adapted.debounce_ms, Some(15));
         assert_eq!(notes.len(), 4);
         assert!(lamzu_caps.validate("LAMZU 4K", &adapted).is_ok());
+    }
+
+    #[test]
+    fn skips_unsupported_lod_and_debounce_for_logitech_hidpp20() {
+        let logi_caps = DeviceCapabilities {
+            dpi_min: 100,
+            dpi_max: 25600,
+            dpi_step: 50,
+            polling_rates_hz: vec![125, 250, 500, 1000],
+            lod_options: Vec::new(),
+            supports_debounce: false,
+            debounce_min_ms: 0,
+            debounce_max_ms: 0,
+            supports_volatile_writes: true,
+            flash_write_warning: None,
+        };
+
+        let desired = MouseSettings {
+            dpi: Some(1600),
+            polling_rate_hz: Some(4000),
+            lod: Some(LiftOffDistance::Mm07),
+            debounce_ms: Some(4),
+        };
+
+        let (adapted, notes) = logi_caps.adapt_settings(&desired);
+        assert_eq!(adapted.dpi, Some(1600));
+        assert_eq!(adapted.polling_rate_hz, Some(1000));
+        assert_eq!(adapted.lod, None);
+        assert_eq!(adapted.debounce_ms, None);
+        assert_eq!(notes.len(), 3);
+        assert!(logi_caps.validate("PRO X SUPERLIGHT", &adapted).is_ok());
     }
 }
