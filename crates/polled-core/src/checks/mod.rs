@@ -2,6 +2,12 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod accel_curves;
+pub mod accessibility_shortcuts;
+pub mod enhance_pointer_precision;
+pub mod game_mode;
+pub mod hags;
+pub mod pointer_speed;
 pub mod runner;
 pub mod snapshot;
 pub mod state;
@@ -99,6 +105,14 @@ pub trait HealthCheck: Send + Sync {
 
 /// Returns all registered Phase 1 health checks in display order.
 pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
-    // Individual checks are added in Steps 3 & 4.
-    Vec::new()
+    vec![
+        Box::new(enhance_pointer_precision::EnhancePointerPrecisionCheck),
+        Box::new(pointer_speed::PointerSpeedCheck),
+        Box::new(accel_curves::AccelCurvesCheck),
+        Box::new(game_mode::GameModeCheck),
+        Box::new(hags::HagsCheck),
+        Box::new(accessibility_shortcuts::StickyKeysShortcutCheck),
+        Box::new(accessibility_shortcuts::FilterKeysShortcutCheck),
+        Box::new(accessibility_shortcuts::MouseKeysShortcutCheck),
+    ]
 }
