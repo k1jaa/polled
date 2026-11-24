@@ -27,10 +27,11 @@ fn main() -> eframe::Result<()> {
         InstanceLock::AlreadyRunning => return Ok(()),
     };
 
+    let window_title = format!("Polled v{} (Experimental)", env!("CARGO_PKG_VERSION"));
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_title("Polled")
+            .with_title(window_title)
             .with_inner_size([1040.0, 740.0])
             .with_min_inner_size([680.0, 540.0])
             .with_visible(!start_minimized)

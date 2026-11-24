@@ -45,7 +45,7 @@ pub(crate) fn find_own_main_hwnd() -> isize {
         let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
         if len > 0 {
             let title = String::from_utf16_lossy(&buf[..len as usize]);
-            if title == "Polled" {
+            if title == "Polled" || title.starts_with("Polled ") {
                 search.exact_title = hwnd.0 as isize;
                 return BOOL(0);
             }

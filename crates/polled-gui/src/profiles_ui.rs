@@ -5,7 +5,7 @@
 //! Plain monochrome Black & White UI for Phase 2 Per-Game Peripheral Profiles.
 //! Only the four semantic statuses (`OK`, `INFO`, `WARN`, `BAD`) carry chroma.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{
@@ -13,13 +13,25 @@ use eframe::egui::{
 };
 use polled_core::{
     export_profile_json, import_profile_json, AppPaths, DeviceCapabilities, GameProfile,
-    LiftOffDistance, MouseSettings, ProfileStore, Severity,
+    LiftOffDistance, MouseSettings, ProfileStore, Severity, SupportTier,
 };
 
 use crate::profile_runtime::{
     BackendSelection, ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot,
 };
 use crate::theme::{Palette, ThemeMode};
+
+#[derive(Debug, Clone)]
+enum PendingUnverifiedWrite {
+    EnableAutoSwitch {
+        /// `(device_id, display_name, is_flash_only)`
+        devices: Vec<(String, String, bool)>,
+    },
+    ApplyProfileNow {
+        profile_id: String,
+        devices: Vec<(String, String, bool)>,
+    },
+}
 
 pub struct ProfilesUiState {
     pub store: ProfileStore,
@@ -30,6 +42,8 @@ pub struct ProfilesUiState {
     pub import_modal_open: bool,
     pub import_text: String,
     pub notice: Option<(Severity, String)>,
+    acknowledged_unverified_devices: HashSet<String>,
+    pending_unverified_action: Option<PendingUnverifiedWrite>,
 }
 
 #[derive(Debug, Clone)]
@@ -204,7 +218,32 @@ impl ProfilesUiState {
             import_modal_open: false,
             import_text: String::new(),
             notice: None,
+            acknowledged_unverified_devices: HashSet::new(),
+            pending_unverified_action: None,
         }
+    }
+
+    fn unacknowledged_unverified_devices(
+        &self,
+        snap: Option<&ProfileRuntimeSnapshot>,
+    ) -> Vec<(String, String, bool)> {
+        let Some(s) = snap else {
+            return Vec::new();
+        };
+        s.active_devices
+            .iter()
+            .filter(|d| {
+                d.info.support_tier == SupportTier::ImplementedFromDocs
+                    && !self.acknowledged_unverified_devices.contains(&d.info.id)
+            })
+            .map(|d| {
+                let label = match &d.info.vid_pid {
+                    Some(vp) => format!("{} ({vp})", d.info.name),
+                    None => d.info.name.clone(),
+                };
+                (d.info.id.clone(), label, !d.caps.supports_volatile_writes)
+            })
+            .collect()
     }
 
     fn select_profile(&mut self, id: &str) {
@@ -425,6 +464,111 @@ impl ProfilesUiState {
                 self.import_modal_open = false;
             }
         }
+
+        // --- UNVERIFIED HARDWARE FIRST-WRITE WARNING MODAL ---
+        let mut confirm_unverified = false;
+        let mut cancel_unverified = false;
+        if let Some(pending) = &self.pending_unverified_action {
+            let devices = match pending {
+                PendingUnverifiedWrite::EnableAutoSwitch { devices }
+                | PendingUnverifiedWrite::ApplyProfileNow { devices, .. } => devices,
+            };
+            let warn_w = (ctx.screen_rect().width() - 48.0).clamp(340.0, 490.0);
+            egui::Window::new("Unverified Hardware Warning")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .default_width(warn_w)
+                .max_width(warn_w)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.5_f32, p.text))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(16)),
+                )
+                .show(ctx, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "The following connected mouse uses an open-source protocol specification ('Implemented from docs') that has not yet been tested on this exact physical hardware:",
+                            )
+                            .size(12.5)
+                            .color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(8.0);
+
+                    egui::Frame::NONE
+                        .fill(p.surface_alt)
+                        .stroke(Stroke::new(1.0_f32, p.border))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::same(10))
+                        .show(ui, |ui| {
+                            for (_, label, is_flash) in devices {
+                                let mem_note = if *is_flash {
+                                    "Onboard flash (diffed & rate-limited)"
+                                } else {
+                                    "Volatile RAM (zero flash wear)"
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("• {label} — {mem_note}"))
+                                            .size(12.0)
+                                            .monospace()
+                                            .color(p.text),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Polled validates bounds, skips unchanged registers, never flashes firmware, and automatically rolls back if read-back verification fails. However, unexpected firmware quirks are still possible. Close vendor software (G HUB / Pulsar / LAMZU) before testing.",
+                            )
+                            .size(12.0)
+                            .color(p.warn),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(primary_btn("I Understand — Proceed", p)).clicked() {
+                            confirm_unverified = true;
+                        }
+                        if ui.add(secondary_btn("Cancel", p)).clicked() {
+                            cancel_unverified = true;
+                        }
+                    });
+                });
+        }
+        if cancel_unverified {
+            self.pending_unverified_action = None;
+        } else if confirm_unverified {
+            if let Some(pending) = self.pending_unverified_action.take() {
+                match pending {
+                    PendingUnverifiedWrite::EnableAutoSwitch { devices } => {
+                        for (id, _, _) in devices {
+                            self.acknowledged_unverified_devices.insert(id);
+                        }
+                        runtime.send(ProfileRuntimeCmd::SetAutoSwitch(true));
+                    }
+                    PendingUnverifiedWrite::ApplyProfileNow {
+                        profile_id,
+                        devices,
+                    } => {
+                        for (id, _, _) in devices {
+                            self.acknowledged_unverified_devices.insert(id);
+                        }
+                        runtime.send(ProfileRuntimeCmd::ApplyProfileNow(profile_id));
+                    }
+                }
+            }
+        }
     }
 
     fn render_device_card(
@@ -604,7 +748,19 @@ impl ProfilesUiState {
             }
 
             if toggle_auto_clicked {
-                runtime.send(ProfileRuntimeCmd::SetAutoSwitch(!auto_on));
+                if !auto_on {
+                    let unverified = self.unacknowledged_unverified_devices(snap);
+                    if !unverified.is_empty() {
+                        self.pending_unverified_action =
+                            Some(PendingUnverifiedWrite::EnableAutoSwitch {
+                                devices: unverified,
+                            });
+                    } else {
+                        runtime.send(ProfileRuntimeCmd::SetAutoSwitch(true));
+                    }
+                } else {
+                    runtime.send(ProfileRuntimeCmd::SetAutoSwitch(false));
+                }
             }
             if debounce_ms != self.store.debounce_ms {
                 self.store.debounce_ms = debounce_ms;
@@ -639,6 +795,27 @@ impl ProfilesUiState {
                     ));
                 }
                 render_status_pill_rows(ui, p, inner_w, &pills);
+
+                let unverified_names: Vec<&str> = s
+                    .active_devices
+                    .iter()
+                    .filter(|d| d.info.support_tier == SupportTier::ImplementedFromDocs)
+                    .map(|d| d.info.name.as_str())
+                    .collect();
+                if !unverified_names.is_empty() {
+                    ui.add_space(6.0);
+                    semantic_banner(
+                        ui,
+                        p,
+                        mode,
+                        inner_w,
+                        Severity::Warn,
+                        &format!(
+                            "Unverified hardware ({}): implemented from open-source docs and not yet verified on physical hardware. Close vendor suites and review docs/COMPATIBILITY.md before writing.",
+                            unverified_names.join(", ")
+                        ),
+                    );
+                }
 
                 if let Some(warn) = &s.flash_warning {
                     ui.add_space(6.0);
@@ -825,7 +1002,16 @@ impl ProfilesUiState {
                         let id = profile.id.clone();
                         self.store.upsert_profile(profile);
                         runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
-                        runtime.send(ProfileRuntimeCmd::ApplyProfileNow(id));
+                        let unverified = self.unacknowledged_unverified_devices(snap);
+                        if !unverified.is_empty() {
+                            self.pending_unverified_action =
+                                Some(PendingUnverifiedWrite::ApplyProfileNow {
+                                    profile_id: id,
+                                    devices: unverified,
+                                });
+                        } else {
+                            runtime.send(ProfileRuntimeCmd::ApplyProfileNow(id));
+                        }
                     }
                     if ui.add(primary_btn("Save", p)).clicked() {
                         let profile = self.editor.to_profile();

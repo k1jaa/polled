@@ -152,6 +152,67 @@ pub(crate) struct PendingElevation {
     title: String,
     reason: String,
     action_label: String,
+    change_summary: Option<String>,
+    impact_tags: Vec<String>,
+    restore_point_hint: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingConfirm {
+    check: CheckReport,
+    warning: String,
+}
+
+fn build_fix_impact_tags(check: &CheckReport) -> Vec<String> {
+    let mut tags = Vec::new();
+    if check.id.starts_with("custom_") {
+        tags.push("Custom tweak".to_string());
+    } else if check.is_optional_tweak {
+        tags.push("Optional tweak".to_string());
+    }
+    if check.requires_elevation {
+        tags.push("System-wide (HKLM)".to_string());
+    }
+    if check.requires_reboot {
+        tags.push("Reboot required".to_string());
+    }
+    if check.requires_relogin {
+        tags.push("Sign-out required".to_string());
+    }
+    tags
+}
+
+fn build_elevation_prompt_for_fix(check: &CheckReport, reason: String) -> PendingElevation {
+    let verb = if check.is_optional_tweak {
+        "Apply"
+    } else {
+        "Fix"
+    };
+    PendingElevation {
+        target: ElevationTarget::Fix(check.id.clone()),
+        title: format!("{verb} \"{}\"", check.name),
+        reason,
+        action_label: "Continue with UAC".to_string(),
+        change_summary: Some(format!(
+            "{}  ->  {}",
+            check.current_value, check.recommended_value
+        )),
+        impact_tags: build_fix_impact_tags(check),
+        restore_point_hint: true,
+    }
+}
+
+fn build_non_elevated_confirm_warning(check: &CheckReport) -> String {
+    if check.id.starts_with("custom_") {
+        "This user-defined custom tweak writes directly to the Windows registry. Verify the target path and value before applying.".to_string()
+    } else if check.requires_reboot {
+        "This change modifies a Windows setting that requires a reboot to take effect.".to_string()
+    } else if check.requires_relogin {
+        "This change resets Windows registry values and requires signing out and back in to take full effect.".to_string()
+    } else {
+        "This is an optional tweak and is never applied automatically by Fix Safe Issues."
+            .to_string()
+    }
 }
 
 /// Messages sent from background worker/tray threads back to the `egui` UI thread.
@@ -164,7 +225,7 @@ pub(crate) enum WorkerMsg {
     ActionFinished {
         status: Option<String>,
         error: Option<String>,
-        elevation_prompt: Option<PendingElevation>,
+        elevation_prompt: Option<Box<PendingElevation>>,
         updated_scan: Option<ScanSummary>,
     },
     ProfileRuntimeUpdated(Box<ProfileRuntimeSnapshot>),
@@ -183,6 +244,7 @@ pub struct PolledApp {
     status_message: Option<String>,
     error_message: Option<String>,
     pending_elevation: Option<PendingElevation>,
+    pending_confirm: Option<PendingConfirm>,
     show_latency_tips: bool,
     custom_tweak_draft: CustomTweakDraft,
 
@@ -251,6 +313,7 @@ impl PolledApp {
             status_message: None,
             error_message: None,
             pending_elevation: None,
+            pending_confirm: None,
             show_latency_tips: false,
             custom_tweak_draft: CustomTweakDraft::default(),
             profiles_ui,
@@ -351,12 +414,9 @@ impl PolledApp {
                         WorkerMsg::ActionFinished {
                             status: None,
                             error: None,
-                            elevation_prompt: Some(PendingElevation {
-                                target: ElevationTarget::Fix(check.id.clone()),
-                                title: format!("Fix \"{}\"", check.name),
-                                reason,
-                                action_label: "Continue with UAC".to_string(),
-                            }),
+                            elevation_prompt: Some(Box::new(build_elevation_prompt_for_fix(
+                                &check, reason,
+                            ))),
                             updated_scan: None,
                         }
                     }
@@ -467,12 +527,15 @@ impl PolledApp {
                         WorkerMsg::ActionFinished {
                             status: None,
                             error: None,
-                            elevation_prompt: Some(PendingElevation {
+                            elevation_prompt: Some(Box::new(PendingElevation {
                                 target: ElevationTarget::Undo(check.id.clone()),
                                 title: format!("Undo \"{}\"", check.name),
                                 reason,
                                 action_label: "Restore with UAC".to_string(),
-                            }),
+                                change_summary: None,
+                                impact_tags: Vec::new(),
+                                restore_point_hint: false,
+                            })),
                             updated_scan: None,
                         }
                     }
@@ -539,13 +602,16 @@ impl PolledApp {
                             WorkerMsg::ActionFinished {
                                 status: None,
                                 error: None,
-                                elevation_prompt: Some(PendingElevation {
+                                elevation_prompt: Some(Box::new(PendingElevation {
                                     target: ElevationTarget::UndoAll,
                                     title: "Restore remaining system-level settings".to_string(),
                                     reason: "One or more settings in your snapshot require administrator permissions to restore."
                                         .to_string(),
                                     action_label: "Restore remaining with UAC".to_string(),
-                                }),
+                                    change_summary: None,
+                                    impact_tags: Vec::new(),
+                                    restore_point_hint: false,
+                                })),
                                 updated_scan: scan,
                             }
                         } else if !undo.failed.is_empty() {
@@ -621,8 +687,8 @@ impl PolledApp {
                     }
                     self.status_message = status;
                     self.error_message = error;
-                    if elevation_prompt.is_some() {
-                        self.pending_elevation = elevation_prompt;
+                    if let Some(prompt) = elevation_prompt {
+                        self.pending_elevation = Some(*prompt);
                     }
                 }
                 WorkerMsg::ProfileRuntimeUpdated(snap) => {
@@ -718,6 +784,16 @@ impl eframe::App for PolledApp {
                 // Row 1: App title & Windows build (left) | Startup & Theme (right)
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Polled").size(18.0).strong().color(p.text));
+                    pill(
+                        ui,
+                        &format!("v{} · Experimental", env!("CARGO_PKG_VERSION")),
+                        p.surface_alt,
+                        p.text_muted,
+                        p.border,
+                    )
+                    .on_hover_text(
+                        "Early-development (0.x) experimental software. Original Windows values are snapshotted before changes; provided AS-IS under GPL-3.0.",
+                    );
                     if let Some(s) = &self.summary {
                         pill(
                             ui,
@@ -1214,6 +1290,17 @@ impl eframe::App for PolledApp {
                         )
                         .wrap(),
                     );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Caution: Incorrect registry edits can affect Windows stability. Verify the hive, subkey, type, and value (and create a Windows System Restore Point before editing HKLM).",
+                            )
+                            .size(11.5)
+                            .color(p.warn),
+                        )
+                        .wrap(),
+                    );
                     ui.add_space(8.0);
 
                     ui.label(
@@ -1393,16 +1480,18 @@ impl eframe::App for PolledApp {
             }
         }
 
-        // --- UAC CONFIRMATION MODAL (plain monochrome) ---
-        let mut confirm_elevation = false;
-        let mut cancel_elevation = false;
-        if let Some(pending) = &self.pending_elevation {
-            egui::Window::new("Administrator permission needed")
+        // --- CONFIRM RISKY / OPTIONAL / CUSTOM NON-ELEVATED CHANGE MODAL ---
+        let mut confirm_risky = false;
+        let mut cancel_risky = false;
+        if let Some(pending) = &self.pending_confirm {
+            let modal_w = (ctx.screen_rect().width() - 48.0).clamp(340.0, 470.0);
+            let tags = build_fix_impact_tags(&pending.check);
+            egui::Window::new("Confirm System Change")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .default_width(440.0)
-                .max_width(440.0)
+                .default_width(modal_w)
+                .max_width(modal_w)
                 .frame(
                     egui::Frame::NONE
                         .fill(p.surface)
@@ -1411,19 +1500,136 @@ impl eframe::App for PolledApp {
                         .inner_margin(Margin::same(18)),
                 )
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        pill(ui, "UAC", p.surface_alt, p.text, p.border);
-                        ui.label(
-                            RichText::new(&pending.title)
-                                .size(15.0)
-                                .strong()
-                                .color(p.text),
+                    ui.horizontal_wrapped(|ui| {
+                        pill(
+                            ui,
+                            "WARNING",
+                            p.severity_bg(Severity::Warn, mode),
+                            p.warn,
+                            p.border,
                         );
+                        for tag in &tags {
+                            pill(ui, tag, p.surface_alt, p.text_muted, p.border);
+                        }
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(&pending.check.name)
+                            .size(15.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.add_space(6.0);
                     ui.add(
-                        egui::Label::new(RichText::new(&pending.reason).size(13.0).color(p.text_muted))
-                            .wrap(),
+                        egui::Label::new(
+                            RichText::new(&pending.warning)
+                                .size(12.5)
+                                .color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(8.0);
+
+                    egui::Frame::NONE
+                        .fill(p.surface_alt)
+                        .stroke(Stroke::new(1.0_f32, p.border))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("PLANNED CHANGE")
+                                    .size(10.0)
+                                    .strong()
+                                    .color(p.text_muted),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "{}  ->  {}",
+                                        pending.check.current_value,
+                                        pending.check.recommended_value
+                                    ))
+                                    .size(12.0)
+                                    .monospace()
+                                    .color(p.text),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        "Your exact original value is saved to baseline_snapshot.json before any change so you can click Undo anytime.",
+                                    )
+                                    .size(11.5)
+                                    .color(p.text_muted),
+                                )
+                                .wrap(),
+                            );
+                        });
+
+                    ui.add_space(14.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!self.busy, primary_button("Apply Change", p))
+                            .clicked()
+                        {
+                            confirm_risky = true;
+                        }
+                        if ui
+                            .add_enabled(!self.busy, secondary_button("Cancel", p))
+                            .clicked()
+                        {
+                            cancel_risky = true;
+                        }
+                    });
+                });
+        }
+
+        // --- UAC CONFIRMATION MODAL (plain monochrome) ---
+        let mut confirm_elevation = false;
+        let mut cancel_elevation = false;
+        if let Some(pending) = &self.pending_elevation {
+            let modal_w = (ctx.screen_rect().width() - 48.0).clamp(340.0, 480.0);
+            egui::Window::new("Administrator permission needed")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .default_width(modal_w)
+                .max_width(modal_w)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.5_f32, p.text))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(18)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        pill(
+                            ui,
+                            "UAC",
+                            p.severity_bg(Severity::Warn, mode),
+                            p.warn,
+                            p.border,
+                        );
+                        for tag in &pending.impact_tags {
+                            pill(ui, tag, p.surface_alt, p.text_muted, p.border);
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(&pending.title)
+                            .size(15.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&pending.reason).size(12.5).color(p.text_muted),
+                        )
+                        .wrap(),
                     );
                     ui.add_space(10.0);
 
@@ -1433,6 +1639,24 @@ impl eframe::App for PolledApp {
                         .corner_radius(CornerRadius::same(6))
                         .inner_margin(Margin::same(10))
                         .show(ui, |ui| {
+                            if let Some(summary) = &pending.change_summary {
+                                ui.label(
+                                    RichText::new("PLANNED CHANGE")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(p.text_muted),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(summary)
+                                            .size(12.0)
+                                            .monospace()
+                                            .color(p.text),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.add_space(6.0);
+                            }
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(
@@ -1443,6 +1667,19 @@ impl eframe::App for PolledApp {
                                 )
                                 .wrap(),
                             );
+                            if pending.restore_point_hint {
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(
+                                            "Tip: Consider creating a Windows System Restore Point before making system-wide (HKLM) changes.",
+                                        )
+                                        .size(11.5)
+                                        .color(p.warn),
+                                    )
+                                    .wrap(),
+                                );
+                            }
                         });
 
                     ui.add_space(14.0);
@@ -1515,7 +1752,13 @@ impl eframe::App for PolledApp {
             }
         }
 
-        if cancel_elevation {
+        if cancel_risky {
+            self.pending_confirm = None;
+        } else if confirm_risky {
+            if let Some(pending) = self.pending_confirm.take() {
+                self.start_fix_check(ctx, pending.check, false);
+            }
+        } else if cancel_elevation {
             self.pending_elevation = None;
         } else if confirm_elevation {
             if let Some(pending) = self.pending_elevation.take() {
@@ -1551,14 +1794,17 @@ impl eframe::App for PolledApp {
             self.start_undo_all(ctx, false);
         } else if let Some(check) = clicked_fix {
             if check.requires_elevation {
-                self.pending_elevation = Some(PendingElevation {
-                    target: ElevationTarget::Fix(check.id.clone()),
-                    title: format!("Fix \"{}\"", check.name),
-                    reason: check.elevation_reason.clone().unwrap_or_else(|| {
-                        "Windows requires administrator permissions for this setting.".to_string()
-                    }),
-                    action_label: "Continue with UAC".to_string(),
+                let reason = check.elevation_reason.clone().unwrap_or_else(|| {
+                    "Windows requires administrator permissions for this setting.".to_string()
                 });
+                self.pending_elevation = Some(build_elevation_prompt_for_fix(&check, reason));
+            } else if check.id.starts_with("custom_")
+                || check.is_optional_tweak
+                || check.requires_reboot
+                || check.requires_relogin
+            {
+                let warning = build_non_elevated_confirm_warning(&check);
+                self.pending_confirm = Some(PendingConfirm { check, warning });
             } else {
                 self.start_fix_check(ctx, check, false);
             }
@@ -1572,6 +1818,9 @@ impl eframe::App for PolledApp {
                             .to_string()
                     }),
                     action_label: "Restore with UAC".to_string(),
+                    change_summary: None,
+                    impact_tags: Vec::new(),
+                    restore_point_hint: false,
                 });
             } else {
                 self.start_undo_check(ctx, check, false);
@@ -1910,14 +2159,20 @@ fn filter_tab(
 }
 
 /// Pre-measured pill badge so `ui.horizontal_wrapped` wraps pills cleanly on resize.
-fn pill(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32, border: Color32) {
+fn pill(
+    ui: &mut egui::Ui,
+    text: &str,
+    bg: Color32,
+    fg: Color32,
+    border: Color32,
+) -> egui::Response {
     let galley =
         ui.painter()
             .layout_no_wrap(text.to_string(), egui::FontId::proportional(11.0), fg);
     let pad_x = 8.0;
     let pad_y = 3.0;
     let desired = Vec2::new(galley.size().x + pad_x * 2.0, galley.size().y + pad_y * 2.0);
-    let (rect, _resp) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::hover());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter_at(rect);
         painter.rect(
@@ -1930,4 +2185,5 @@ fn pill(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32, border: Color32
         let pos = egui::pos2(rect.left() + pad_x, rect.center().y - galley.size().y * 0.5);
         painter.galley(pos, galley, fg);
     }
+    resp
 }
