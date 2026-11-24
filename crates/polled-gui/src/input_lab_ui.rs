@@ -15,14 +15,24 @@ use eframe::egui::{
 use polled_core::{
     format_diagnostic_report, run_timer_jitter_benchmark, DiagnosticsSnapshot, PollingStats,
     PollingTarget, RawInputCaptureSession, Severity, TimerJitterBenchmark, BOUNCE_THRESHOLD_MS,
-    STANDARD_RATES_HZ,
+    HISTOGRAM_BASE_BINS, STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ChartViewMode {
+    #[default]
+    Split,
+    Intervals,
+    Histogram,
+}
+
 pub struct InputLabUiState {
     session: Option<RawInputCaptureSession>,
     target: PollingTarget,
+    chart_mode: ChartViewMode,
+    saturated_only: bool,
     last_snapshot: DiagnosticsSnapshot,
     timer_benchmark: Option<TimerJitterBenchmark>,
     timer_running: bool,
@@ -41,6 +51,8 @@ impl InputLabUiState {
         Self {
             session: None,
             target: PollingTarget::Auto,
+            chart_mode: ChartViewMode::Split,
+            saturated_only: false,
             last_snapshot: DiagnosticsSnapshot::default(),
             timer_benchmark: None,
             timer_running: false,
@@ -163,7 +175,7 @@ impl InputLabUiState {
 
                 ui.add_space(10.0);
 
-                // --- 2. POLLING INTERVAL CONSISTENCY & WIRELESS HEALTH CHART ---
+                // --- 2. POLLING INTERVAL CONSISTENCY & HISTOGRAM CARD ---
                 self.render_polling_chart_card(ui, p, mode, scroll_w);
 
                 ui.add_space(10.0);
@@ -307,7 +319,14 @@ impl InputLabUiState {
             } else {
                 self.target.label()
             };
-            let consistency_str = if ps.active_intervals > 0 {
+            let sat_str = if ps.active_intervals > 0 {
+                format!("{:.0}%", ps.saturated_pct)
+            } else {
+                "—".to_string()
+            };
+            let consistency_str = if ps.saturated_intervals > 0 {
+                format!("{:.1}%", ps.saturated_within_15_pct)
+            } else if ps.active_intervals > 0 {
                 format!("{:.1}%", ps.within_15_pct)
             } else {
                 "—".to_string()
@@ -317,8 +336,10 @@ impl InputLabUiState {
                 ("EFFECTIVE".to_string(), eff_str),
                 ("PEAK".to_string(), peak_str),
                 ("TARGET".to_string(), target_str),
-                ("WITHIN ±15%".to_string(), consistency_str),
-                ("GAPS".to_string(), ps.gap_count.to_string()),
+                ("SATURATED".to_string(), sat_str),
+                ("SAT ±15%".to_string(), consistency_str),
+                ("DROPOUTS".to_string(), ps.true_dropout_count.to_string()),
+                ("SLOW SLOTS".to_string(), ps.slow_slot_count.to_string()),
                 ("BUNCHED".to_string(), ps.bunch_count.to_string()),
                 ("PACKETS".to_string(), ps.total_motion_packets.to_string()),
             ];
@@ -350,7 +371,7 @@ impl InputLabUiState {
     }
 
     fn render_polling_chart_card(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         p: Palette,
         mode: ThemeMode,
@@ -360,35 +381,116 @@ impl InputLabUiState {
         let ps = &self.last_snapshot.polling;
 
         card_frame(ui, p, card_w, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Polling Interval Consistency & Wireless Health")
-                        .size(14.0)
-                        .strong()
-                        .color(p.text),
-                );
-                if let Some(sev) = ps.health_severity {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = match sev {
-                            Severity::Ok => "CLEAN",
-                            Severity::Info => "COLLECTING",
-                            Severity::Warn => "JITTER",
-                            Severity::Bad => "UNSTABLE",
+            let narrow_hdr = inner_w < 740.0;
+            let draw_controls =
+                |ui: &mut egui::Ui, chart_mode: &mut ChartViewMode, saturated_only: &mut bool| {
+                    for (m, lbl) in [
+                        (ChartViewMode::Split, "Split"),
+                        (ChartViewMode::Intervals, "Intervals"),
+                        (ChartViewMode::Histogram, "Histogram"),
+                    ] {
+                        let btn = if *chart_mode == m {
+                            primary_btn(lbl, p)
+                        } else {
+                            secondary_btn(lbl, p)
                         };
-                        ui.label(
-                            RichText::new(label)
-                                .size(11.0)
-                                .strong()
-                                .color(p.severity_fg(sev)),
-                        );
+                        if ui.add(btn).clicked() {
+                            *chart_mode = m;
+                        }
+                    }
+                    let sat_btn = if *saturated_only {
+                        primary_btn("Saturated only", p)
+                    } else {
+                        secondary_btn("Saturated only", p)
+                    };
+                    if ui
+                        .add(sat_btn)
+                        .on_hover_text(
+                            "Hide slow-hand empty slots and show only motion-saturated intervals",
+                        )
+                        .clicked()
+                    {
+                        *saturated_only = !*saturated_only;
+                    }
+                };
+
+            if narrow_hdr {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Polling Consistency & Wireless Health")
+                            .size(14.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    if let Some(sev) = ps.health_severity {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(health_badge_label(sev))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(p.severity_fg(sev)),
+                            );
+                        });
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    draw_controls(ui, &mut self.chart_mode, &mut self.saturated_only);
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Polling Consistency & Wireless Health")
+                            .size(14.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(sev) = ps.health_severity {
+                            ui.label(
+                                RichText::new(health_badge_label(sev))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(p.severity_fg(sev)),
+                            );
+                            ui.add_space(4.0);
+                        }
+                        let sat_btn = if self.saturated_only {
+                            primary_btn("Saturated only", p)
+                        } else {
+                            secondary_btn("Saturated only", p)
+                        };
+                        if ui
+                            .add(sat_btn)
+                            .on_hover_text(
+                                "Hide slow-hand empty slots and show only motion-saturated intervals",
+                            )
+                            .clicked()
+                        {
+                            self.saturated_only = !self.saturated_only;
+                        }
+                        for (m, lbl) in [
+                            (ChartViewMode::Histogram, "Histogram"),
+                            (ChartViewMode::Intervals, "Intervals"),
+                            (ChartViewMode::Split, "Split"),
+                        ] {
+                            let btn = if self.chart_mode == m {
+                                primary_btn(lbl, p)
+                            } else {
+                                secondary_btn(lbl, p)
+                            };
+                            if ui.add(btn).clicked() {
+                                self.chart_mode = m;
+                            }
+                        }
                     });
-                }
-            });
+                });
+            }
 
             if ps.active_intervals > 0 {
                 ui.add_space(4.0);
                 let stats_text = format!(
-                    "Min {:.3} ms  ·  Median {:.3} ms  ·  p95 {:.3} ms  ·  p99 {:.3} ms  ·  Max {:.3} ms  ·  σ {:.3} ms",
+                    "Min {:.3} ms · Median {:.3} ms · p95 {:.3} ms · p99 {:.3} ms · Max {:.3} ms · σ {:.3} ms",
                     ps.min_us / 1000.0,
                     ps.median_us / 1000.0,
                     ps.p95_us / 1000.0,
@@ -408,12 +510,36 @@ impl InputLabUiState {
             }
 
             ui.add_space(6.0);
-            paint_interval_chart(ui, p, inner_w, 175.0, ps);
+
+            match self.chart_mode {
+                ChartViewMode::Intervals => {
+                    paint_interval_chart(ui, p, inner_w, 185.0, ps, self.saturated_only);
+                }
+                ChartViewMode::Histogram => {
+                    paint_histogram_chart(ui, p, inner_w, 185.0, ps, self.saturated_only);
+                }
+                ChartViewMode::Split => {
+                    if inner_w >= 760.0 {
+                        let gap = 10.0;
+                        let left_w = ((inner_w - gap) * 0.59).max(300.0);
+                        let right_w = (inner_w - gap - left_w).max(220.0);
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            paint_interval_chart(ui, p, left_w, 185.0, ps, self.saturated_only);
+                            paint_histogram_chart(ui, p, right_w, 185.0, ps, self.saturated_only);
+                        });
+                    } else {
+                        paint_interval_chart(ui, p, inner_w, 165.0, ps, self.saturated_only);
+                        ui.add_space(8.0);
+                        paint_histogram_chart(ui, p, inner_w, 155.0, ps, self.saturated_only);
+                    }
+                }
+            }
 
             ui.add_space(8.0);
             let sev = ps.health_severity.unwrap_or(Severity::Info);
             let msg = if ps.health_summary.is_empty() {
-                "Click Start Capture and move your mouse in steady circles anywhere on screen to test 1K–8K polling consistency and wireless dropouts."
+                "Click Start Capture and move your mouse in brisk, steady circles anywhere on screen to test 1K–8K polling consistency and wireless dropouts."
             } else {
                 &ps.health_summary
             };
@@ -715,8 +841,25 @@ impl InputLabUiState {
     }
 }
 
-/// Custom monochrome interval scatter + stem chart (0 dependencies, strict B&W + semantic spike markers).
-fn paint_interval_chart(ui: &mut egui::Ui, p: Palette, width: f32, height: f32, ps: &PollingStats) {
+fn health_badge_label(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Ok => "CLEAN",
+        Severity::Info => "COLLECTING",
+        Severity::Warn => "JITTER",
+        Severity::Bad => "UNSTABLE",
+    }
+}
+
+/// Custom monochrome interval scatter + stem chart distinguishing true saturated dropouts
+/// (red) from harmless slow-hand empty slots (muted gray).
+fn paint_interval_chart(
+    ui: &mut egui::Ui,
+    p: Palette,
+    width: f32,
+    height: f32,
+    ps: &PollingStats,
+    saturated_only: bool,
+) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
@@ -731,18 +874,37 @@ fn paint_interval_chart(ui: &mut egui::Ui, p: Palette, width: f32, height: f32, 
         egui::StrokeKind::Inside,
     );
 
-    if ps.recent_intervals_us.is_empty() {
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "Click Start Capture and move your mouse in steady circles to graph interval timing",
-            FontId::proportional(12.0),
+    let visible: Vec<_> = ps
+        .recent_samples
+        .iter()
+        .copied()
+        .filter(|s| !saturated_only || s.saturated)
+        .collect();
+
+    if visible.is_empty() {
+        let msg = if ps.recent_samples.is_empty() {
+            "Click Start Capture and move in brisk circles to graph interval timing"
+        } else {
+            "No saturated intervals yet — swipe slightly faster to saturate this polling rate"
+        };
+        let galley = painter.layout(
+            msg.to_string(),
+            FontId::proportional(11.5),
+            p.text_muted,
+            (width - 28.0).max(80.0),
+        );
+        painter.galley(
+            Pos2::new(
+                rect.center().x - galley.size().x * 0.5,
+                rect.center().y - galley.size().y * 0.5,
+            ),
+            galley,
             p.text_muted,
         );
         return;
     }
 
-    let pad_left = 52.0;
+    let pad_left = 50.0;
     let pad_right = 10.0;
     let pad_top = 12.0;
     let pad_bottom = 18.0;
@@ -777,7 +939,7 @@ fn paint_interval_chart(ui: &mut egui::Ui, p: Palette, width: f32, height: f32, 
         p.surface_alt,
     );
 
-    // Horizontal reference lines (1x nominal, 2x nominal, top ceiling).
+    // Horizontal reference lines (1x nominal, 2x nominal).
     for (mult, label_col) in [(1.0, p.text_muted), (2.0, p.border)] {
         let val = nominal * mult;
         if val <= y_max {
@@ -810,8 +972,7 @@ fn paint_interval_chart(ui: &mut egui::Ui, p: Palette, width: f32, height: f32, 
         p.text_muted,
     );
 
-    // Plot each active interval sample.
-    let n = ps.recent_intervals_us.len();
+    let n = visible.len();
     let step_x = if n > 1 {
         plot.width() / ((n - 1) as f32)
     } else {
@@ -819,39 +980,274 @@ fn paint_interval_chart(ui: &mut egui::Ui, p: Palette, width: f32, height: f32, 
     };
     let nominal_y = y_to_px(nominal);
 
-    for (i, &us) in ps.recent_intervals_us.iter().enumerate() {
+    for (i, sample) in visible.iter().enumerate() {
         let x = plot.left() + (i as f32) * step_x;
-        let y = y_to_px(us);
-        let is_bad = us > nominal * 1.85 || us < nominal * 0.35;
-        let is_warn = !is_bad && (us > nominal * 1.15 || us < nominal * 0.85);
-        let col = if is_bad {
+        let y = y_to_px(sample.dt_us);
+        let is_bunched = sample.dt_us < nominal * 0.35;
+        let is_gap = sample.dt_us > nominal * 1.85;
+        let is_true_fault = is_bunched || (is_gap && sample.saturated);
+        let is_warn = !is_true_fault
+            && sample.saturated
+            && (sample.dt_us > nominal * 1.15 || sample.dt_us < nominal * 0.85);
+
+        let col = if is_true_fault {
             p.bad
         } else if is_warn {
             p.warn
-        } else {
+        } else if sample.saturated {
             p.text
+        } else {
+            // Unsaturated slow-hand slots stay muted gray so they never look like red radio faults.
+            p.text_muted
         };
 
-        if is_bad || is_warn {
+        if is_true_fault || is_warn {
             painter.line_segment(
                 [Pos2::new(x, nominal_y), Pos2::new(x, y)],
                 Stroke::new(1.0_f32, col),
             );
         }
-        painter.circle_filled(Pos2::new(x, y), if is_bad { 2.4 } else { 1.6 }, col);
+        painter.circle_filled(
+            Pos2::new(x, y),
+            if is_true_fault {
+                2.4
+            } else if sample.saturated {
+                1.6
+            } else {
+                1.2
+            },
+            col,
+        );
     }
 
+    let filter_tag = if saturated_only {
+        "saturated only"
+    } else {
+        "gray = slow hand"
+    };
     painter.text(
         Pos2::new(plot.right(), rect.bottom() - 3.0),
         Align2::RIGHT_BOTTOM,
-        format!(
-            "Last {n} active reports · band = ±15% of {:.2} ms ({} Hz)",
-            nominal / 1000.0,
-            ps.nominal_hz
-        ),
+        format!("Intervals ({n} pts · {filter_tag})"),
         FontId::monospace(9.5),
         p.text_muted,
     );
+}
+
+/// Custom monochrome binned interval distribution histogram exposing 1x nominal peak vs.
+/// 2x dropped-frame harmonics and USB bottlenecks.
+fn paint_histogram_chart(
+    ui: &mut egui::Ui,
+    p: Palette,
+    width: f32,
+    height: f32,
+    ps: &PollingStats,
+    saturated_only: bool,
+) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect(
+        rect,
+        CornerRadius::same(6),
+        p.bg,
+        Stroke::new(1.0_f32, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    if ps.histogram_bins.is_empty() {
+        let galley = painter.layout(
+            "Interval histogram (1x peak vs. 2x dropped-frame harmonic)".to_string(),
+            FontId::proportional(11.0),
+            p.text_muted,
+            (width - 24.0).max(80.0),
+        );
+        painter.galley(
+            Pos2::new(
+                rect.center().x - galley.size().x * 0.5,
+                rect.center().y - galley.size().y * 0.5,
+            ),
+            galley,
+            p.text_muted,
+        );
+        return;
+    }
+
+    let pad_left = 10.0;
+    let pad_right = 10.0;
+    let pad_top = 18.0;
+    let pad_bottom = 26.0;
+    let plot = Rect::from_min_max(
+        Pos2::new(rect.left() + pad_left, rect.top() + pad_top),
+        Pos2::new(rect.right() - pad_right, rect.bottom() - pad_bottom),
+    );
+    if plot.width() <= 20.0 || plot.height() <= 16.0 {
+        return;
+    }
+
+    let max_count = ps
+        .histogram_bins
+        .iter()
+        .map(|b| {
+            if saturated_only {
+                b.saturated_count
+            } else {
+                b.total_count()
+            }
+        })
+        .max()
+        .unwrap_or(0);
+
+    if max_count == 0 {
+        let galley = painter.layout(
+            "Swipe faster to populate saturated histogram bins".to_string(),
+            FontId::proportional(11.0),
+            p.text_muted,
+            (width - 24.0).max(80.0),
+        );
+        painter.galley(
+            Pos2::new(
+                rect.center().x - galley.size().x * 0.5,
+                rect.center().y - galley.size().y * 0.5,
+            ),
+            galley,
+            p.text_muted,
+        );
+        return;
+    }
+
+    let nominal = ps.nominal_interval_us.max(125.0);
+    let bin_count = ps.histogram_bins.len();
+    let slot_w = plot.width() / (bin_count as f32);
+    let bar_w = (slot_w - 1.5).max(2.0);
+
+    // Subtle header inside histogram box.
+    painter.text(
+        Pos2::new(plot.left(), rect.top() + 4.0),
+        Align2::LEFT_TOP,
+        "Distribution",
+        FontId::monospace(9.5),
+        p.text_muted,
+    );
+    painter.text(
+        Pos2::new(plot.right(), rect.top() + 4.0),
+        Align2::RIGHT_TOP,
+        format!("peak {max_count}"),
+        FontId::monospace(9.5),
+        p.text_muted,
+    );
+
+    // Baseline axis
+    painter.line_segment(
+        [
+            Pos2::new(plot.left(), plot.bottom()),
+            Pos2::new(plot.right(), plot.bottom()),
+        ],
+        Stroke::new(1.0_f32, p.border),
+    );
+
+    let hover_pos = resp.hover_pos();
+    let mut hovered_tip: Option<String> = None;
+
+    for (i, bin) in ps.histogram_bins.iter().enumerate() {
+        let x0 = plot.left() + (i as f32) * slot_w + (slot_w - bar_w) * 0.5;
+        let x1 = x0 + bar_w;
+
+        let total_c = if saturated_only {
+            bin.saturated_count
+        } else {
+            bin.total_count()
+        };
+        let sat_c = bin.saturated_count;
+
+        let mid_mult = if bin.is_overflow {
+            3.0
+        } else {
+            ((bin.start_us + bin.end_us) * 0.5) / nominal
+        };
+
+        let sat_col = if mid_mult < 0.35 || mid_mult > 1.85 {
+            p.bad
+        } else if !(0.85..=1.15).contains(&mid_mult) {
+            p.warn
+        } else {
+            p.text
+        };
+
+        if total_c > 0 {
+            let total_h = ((total_c as f32) / (max_count as f32) * plot.height()).max(2.0);
+            if !saturated_only && bin.unsaturated_count > 0 {
+                // Draw unsaturated slow-hand backdrop in muted border/gray tone.
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(x0, plot.bottom() - total_h),
+                        Pos2::new(x1, plot.bottom()),
+                    ),
+                    CornerRadius::same(1),
+                    p.border,
+                );
+            }
+            if sat_c > 0 {
+                let sat_h = ((sat_c as f32) / (max_count as f32) * plot.height()).max(2.0);
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(x0, plot.bottom() - sat_h),
+                        Pos2::new(x1, plot.bottom()),
+                    ),
+                    CornerRadius::same(1),
+                    sat_col,
+                );
+            }
+        }
+
+        if let Some(hp) = hover_pos {
+            if hp.x >= x0 - 1.0 && hp.x <= x1 + 1.0 && hp.y >= plot.top() && hp.y <= plot.bottom() {
+                let range_str = if bin.is_overflow {
+                    format!(">= {:.2} ms (>2.8x)", bin.start_us / 1000.0)
+                } else {
+                    format!("{:.2}–{:.2} ms", bin.start_us / 1000.0, bin.end_us / 1000.0)
+                };
+                hovered_tip = Some(format!(
+                    "{range_str}\nSaturated: {} · Slow hand: {}",
+                    bin.saturated_count, bin.unsaturated_count
+                ));
+            }
+        }
+    }
+
+    // Key harmonic X-axis markers: 0, 1x nominal, 2x missed-frame harmonic, 2.8x+
+    let tick_y = plot.bottom() + 4.0;
+    let draw_tick = |bin_pos: f32, label: &str, align: Align2, col: Color32| {
+        let x = plot.left() + bin_pos * slot_w;
+        painter.text(
+            Pos2::new(x, tick_y),
+            align,
+            label,
+            FontId::monospace(9.5),
+            col,
+        );
+    };
+    draw_tick(0.0, "0", Align2::LEFT_TOP, p.text_muted);
+    draw_tick(
+        10.0,
+        &format!("1x ({:.2}ms)", nominal / 1000.0),
+        Align2::CENTER_TOP,
+        p.text,
+    );
+    draw_tick(20.0, "2x", Align2::CENTER_TOP, p.warn);
+    draw_tick(
+        (HISTOGRAM_BASE_BINS as f32) + 0.5,
+        "2.8x+",
+        Align2::RIGHT_TOP,
+        p.text_muted,
+    );
+
+    if let Some(tip) = hovered_tip {
+        resp.on_hover_text(tip);
+    }
 }
 
 fn paint_timer_sparkline(
