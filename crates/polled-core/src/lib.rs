@@ -24,9 +24,10 @@ pub use devices::{
 };
 pub use diagnostics::{
     format_diagnostic_report, run_timer_jitter_benchmark, ButtonBounceStats, ClickBounceAnalyzer,
-    ClickBounceSnapshot, ClickEventRecord, DiagnosticsSnapshot, HistogramBin, IntervalSample,
-    MouseButtonKind, PollingAnalyzer, PollingStats, PollingTarget, RawInputCaptureSession,
-    TimerJitterBenchmark, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, STANDARD_RATES_HZ,
+    ClickBounceSnapshot, ClickEventRecord, DiagnosticsSnapshot, DpiCalibrationResult,
+    DpiCalibrator, DpiMeasurementSnapshot, HistogramBin, IntervalSample, MouseButtonKind,
+    PollingAnalyzer, PollingStats, PollingTarget, RawInputCaptureSession, TimerJitterBenchmark,
+    TrackingStats, XyTracePoint, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, STANDARD_RATES_HZ,
 };
 pub use error::{PolledError, Result};
 pub use hid::{dump_hid_devices, HidDeviceDump, HidDumpReport};

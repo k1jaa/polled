@@ -14,8 +14,8 @@ use eframe::egui::{
 };
 use polled_core::{
     format_diagnostic_report, run_timer_jitter_benchmark, DiagnosticsSnapshot, PollingStats,
-    PollingTarget, RawInputCaptureSession, Severity, TimerJitterBenchmark, BOUNCE_THRESHOLD_MS,
-    HISTOGRAM_BASE_BINS, STANDARD_RATES_HZ,
+    PollingTarget, RawInputCaptureSession, Severity, TimerJitterBenchmark, TrackingStats,
+    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
@@ -26,6 +26,31 @@ enum ChartViewMode {
     Split,
     Intervals,
     Histogram,
+    Velocity,
+    XyTrace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RulerUnit {
+    #[default]
+    Cm,
+    Inches,
+}
+
+impl RulerUnit {
+    fn label(self) -> &'static str {
+        match self {
+            RulerUnit::Cm => "cm",
+            RulerUnit::Inches => "in",
+        }
+    }
+
+    fn to_inches(self, value: f64) -> f64 {
+        match self {
+            RulerUnit::Cm => value / 2.54,
+            RulerUnit::Inches => value,
+        }
+    }
 }
 
 pub struct InputLabUiState {
@@ -33,6 +58,11 @@ pub struct InputLabUiState {
     target: PollingTarget,
     chart_mode: ChartViewMode,
     saturated_only: bool,
+    configured_dpi: u32,
+    dpi_manually_edited: bool,
+    ruler_distance: f64,
+    ruler_unit: RulerUnit,
+    dpi_measuring: bool,
     last_snapshot: DiagnosticsSnapshot,
     timer_benchmark: Option<TimerJitterBenchmark>,
     timer_running: bool,
@@ -53,6 +83,11 @@ impl InputLabUiState {
             target: PollingTarget::Auto,
             chart_mode: ChartViewMode::Split,
             saturated_only: false,
+            configured_dpi: 1600,
+            dpi_manually_edited: false,
+            ruler_distance: 10.0,
+            ruler_unit: RulerUnit::Cm,
+            dpi_measuring: false,
             last_snapshot: DiagnosticsSnapshot::default(),
             timer_benchmark: None,
             timer_running: false,
@@ -73,21 +108,29 @@ impl InputLabUiState {
         let session = RawInputCaptureSession::start(self.target, move || {
             ctx_bg.request_repaint();
         });
+        if self.dpi_measuring {
+            session.set_dpi_measuring(true);
+        }
         self.last_snapshot = session.snapshot();
         self.session = Some(session);
         self.notice = None;
     }
 
     pub fn stop_capture(&mut self) {
+        self.dpi_measuring = false;
         if let Some(mut session) = self.session.take() {
+            session.set_dpi_measuring(false);
             self.last_snapshot = session.snapshot();
             session.stop();
             self.last_snapshot.capturing = false;
+            self.last_snapshot.dpi_measurement.active = false;
         }
     }
 
     fn reset_capture(&mut self) {
+        self.dpi_measuring = false;
         if let Some(session) = &self.session {
+            session.set_dpi_measuring(false);
             session.request_reset();
             self.last_snapshot = DiagnosticsSnapshot {
                 capturing: true,
@@ -110,6 +153,33 @@ impl InputLabUiState {
         if let Some(session) = &self.session {
             session.set_target(target);
         }
+    }
+
+    fn toggle_dpi_measurement(&mut self, ctx: &egui::Context) {
+        if self.dpi_measuring {
+            self.dpi_measuring = false;
+            if let Some(session) = &self.session {
+                session.set_dpi_measuring(false);
+                self.last_snapshot = session.snapshot();
+            }
+            self.last_snapshot.dpi_measurement.active = false;
+        } else {
+            self.dpi_measuring = true;
+            if self.session.is_none() {
+                self.start_capture(ctx);
+            } else if let Some(session) = &self.session {
+                session.set_dpi_measuring(true);
+            }
+        }
+    }
+
+    fn reset_dpi_measurement(&mut self) {
+        self.dpi_measuring = false;
+        if let Some(session) = &self.session {
+            session.set_dpi_measuring(false);
+            session.request_dpi_reset();
+        }
+        self.last_snapshot.dpi_measurement = Default::default();
     }
 
     fn start_timer_benchmark(&mut self, ctx: &egui::Context) {
@@ -151,8 +221,33 @@ impl InputLabUiState {
         }
     }
 
-    pub fn render(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: Palette, mode: ThemeMode) {
+    pub fn render(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        detected_dpi: Option<u16>,
+    ) {
         self.poll_background();
+
+        // Auto-sync configured DPI from the active detected mouse until the user edits it manually.
+        if !self.dpi_manually_edited {
+            if let Some(dpi) = detected_dpi {
+                if dpi >= 100 {
+                    self.configured_dpi = u32::from(dpi);
+                }
+            }
+        }
+
+        // Allow hands-free Space key toggle during an active DPI ruler slide so you don't nudge
+        // the mouse while clicking Stop at the end of the ruler.
+        if self.dpi_measuring
+            && !ctx.wants_keyboard_input()
+            && ctx.input(|i| i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Enter))
+        {
+            self.toggle_dpi_measurement(ctx);
+        }
 
         // Live viewport-driven width so resizing smaller/larger immediately reflows every chart and card.
         let content_w = (ctx.screen_rect().width() - 36.0).max(320.0);
@@ -166,7 +261,7 @@ impl InputLabUiState {
                 ui.set_max_width(scroll_w);
 
                 // --- 1. CONTROL & LIVE SUMMARY CARD ---
-                self.render_controls_card(ctx, ui, p, scroll_w);
+                self.render_controls_card(ctx, ui, p, scroll_w, detected_dpi);
 
                 if let Some((sev, msg)) = self.notice.clone() {
                     ui.add_space(8.0);
@@ -175,12 +270,17 @@ impl InputLabUiState {
 
                 ui.add_space(10.0);
 
-                // --- 2. POLLING INTERVAL CONSISTENCY & HISTOGRAM CARD ---
+                // --- 2. POLLING CONSISTENCY, HISTOGRAM, VELOCITY & XY TRACE CARD ---
                 self.render_polling_chart_card(ui, p, mode, scroll_w);
 
                 ui.add_space(10.0);
 
-                // --- 3. BOTTOM TWO-COLUMN: CLICK DEBOUNCE + 1S TIMER BENCHMARK ---
+                // --- 3. MEASURED DPI / CPI CALIBRATOR CARD ---
+                self.render_dpi_calibrator_card(ctx, ui, p, mode, scroll_w);
+
+                ui.add_space(10.0);
+
+                // --- 4. BOTTOM TWO-COLUMN: CLICK DEBOUNCE + 1S TIMER BENCHMARK ---
                 if scroll_w < 720.0 {
                     self.render_click_bounce_card(ui, p, mode, scroll_w);
                     ui.add_space(10.0);
@@ -217,6 +317,7 @@ impl InputLabUiState {
         ui: &mut egui::Ui,
         p: Palette,
         card_w: f32,
+        detected_dpi: Option<u16>,
     ) {
         let inner_w = (card_w - 24.0).max(120.0);
         let capturing = self.is_capturing();
@@ -224,21 +325,24 @@ impl InputLabUiState {
         let mut do_reset = false;
         let mut do_copy = false;
         let mut next_target = self.target;
+        let mut dpi_val = self.configured_dpi;
+        let mut dpi_changed = false;
 
         card_frame(ui, p, card_w, |ui| {
-            let split = inner_w < 640.0;
+            let split = inner_w < 740.0;
             let has_data = self.last_snapshot.polling.total_motion_packets > 0
                 || self.last_snapshot.clicks.total_presses > 0
+                || self.last_snapshot.dpi_measurement.packet_count > 0
                 || self.timer_benchmark.is_some();
 
             let draw_primary_actions =
                 |ui: &mut egui::Ui, toggle_capture: &mut bool, do_reset: &mut bool| {
-                    let cap_btn = if capturing {
-                        primary_btn("Stop Capture", p)
+                    let cap_label = if capturing {
+                        "Stop Capture"
                     } else {
-                        primary_btn("Start Capture", p)
+                        "Start Capture"
                     };
-                    if ui.add(cap_btn).clicked() {
+                    if ui.add(primary_btn(cap_label, p)).clicked() {
                         *toggle_capture = true;
                     }
                     if ui.add(secondary_btn("Reset", p)).clicked() {
@@ -247,11 +351,15 @@ impl InputLabUiState {
                 };
 
             let draw_secondary_actions =
-                |ui: &mut egui::Ui, next_target: &mut PollingTarget, do_copy: &mut bool| {
+                |ui: &mut egui::Ui,
+                 next_target: &mut PollingTarget,
+                 dpi_val: &mut u32,
+                 dpi_changed: &mut bool,
+                 do_copy: &mut bool| {
                     ui.label(RichText::new("Target:").color(p.text_muted).size(12.0));
                     egui::ComboBox::from_id_salt("input_lab_target_hz")
                         .selected_text(next_target.label())
-                        .width(116.0)
+                        .width(108.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(next_target, PollingTarget::Auto, "Auto-detect");
                             for hz in STANDARD_RATES_HZ {
@@ -262,6 +370,26 @@ impl InputLabUiState {
                                 );
                             }
                         });
+
+                    ui.label(RichText::new("DPI:").color(p.text_muted).size(12.0));
+                    let dpi_resp = ui
+                    .add(
+                        egui::DragValue::new(dpi_val)
+                            .range(100..=32000)
+                            .speed(50)
+                            .suffix(" DPI"),
+                    )
+                    .on_hover_text(match detected_dpi {
+                        Some(d) => format!(
+                            "Used for IPS, G-force, and DPI accuracy (auto-detected {d} DPI from mouse)"
+                        ),
+                        None => "Configured mouse DPI used for IPS, G-force, and DPI accuracy"
+                            .to_string(),
+                    });
+                    if dpi_resp.changed() {
+                        *dpi_changed = true;
+                    }
+
                     if ui
                         .add_enabled(has_data, secondary_btn("Copy Report", p))
                         .clicked()
@@ -273,23 +401,48 @@ impl InputLabUiState {
             if split {
                 ui.horizontal(|ui| {
                     draw_primary_actions(ui, &mut toggle_capture, &mut do_reset);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (status_text, status_col) = if capturing {
+                            ("LIVE RAW INPUT (QPC)", p.ok)
+                        } else {
+                            ("IDLE · 0% CPU", p.text_muted)
+                        };
+                        ui.label(
+                            RichText::new(status_text)
+                                .size(11.0)
+                                .strong()
+                                .monospace()
+                                .color(status_col),
+                        );
+                    });
                 });
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    draw_secondary_actions(ui, &mut next_target, &mut do_copy);
+                ui.horizontal_wrapped(|ui| {
+                    draw_secondary_actions(
+                        ui,
+                        &mut next_target,
+                        &mut dpi_val,
+                        &mut dpi_changed,
+                        &mut do_copy,
+                    );
                 });
             } else {
                 ui.horizontal(|ui| {
                     draw_primary_actions(ui, &mut toggle_capture, &mut do_reset);
                     ui.add_space(6.0);
-                    draw_secondary_actions(ui, &mut next_target, &mut do_copy);
+                    draw_secondary_actions(
+                        ui,
+                        &mut next_target,
+                        &mut dpi_val,
+                        &mut dpi_changed,
+                        &mut do_copy,
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let status_text = if capturing {
-                            "LIVE RAW INPUT (QPC)"
+                        let (status_text, status_col) = if capturing {
+                            ("LIVE RAW INPUT (QPC)", p.ok)
                         } else {
-                            "IDLE · 0% CPU"
+                            ("IDLE · 0% CPU", p.text_muted)
                         };
-                        let status_col = if capturing { p.ok } else { p.text_muted };
                         ui.label(
                             RichText::new(status_text)
                                 .size(11.0)
@@ -304,6 +457,9 @@ impl InputLabUiState {
             ui.add_space(6.0);
 
             let ps = &self.last_snapshot.polling;
+            let tr = &self.last_snapshot.tracking;
+            let dpi_f = f64::from(dpi_val.max(1));
+
             let eff_str = if ps.effective_hz >= 1.0 {
                 format!("{:.0} Hz", ps.effective_hz)
             } else {
@@ -331,6 +487,13 @@ impl InputLabUiState {
             } else {
                 "—".to_string()
             };
+            let peak_ips = tr.peak_ips(dpi_f);
+            let peak_g = tr.peak_accel_g(dpi_f);
+            let speed_str = if peak_ips >= 0.1 {
+                format!("{:.1} IPS · {:.1} G", peak_ips, peak_g)
+            } else {
+                "—".to_string()
+            };
 
             let pills = vec![
                 ("EFFECTIVE".to_string(), eff_str),
@@ -341,11 +504,16 @@ impl InputLabUiState {
                 ("DROPOUTS".to_string(), ps.true_dropout_count.to_string()),
                 ("SLOW SLOTS".to_string(), ps.slow_slot_count.to_string()),
                 ("BUNCHED".to_string(), ps.bunch_count.to_string()),
+                ("PEAK TRACKING".to_string(), speed_str),
                 ("PACKETS".to_string(), ps.total_motion_packets.to_string()),
             ];
             render_status_pill_rows(ui, p, inner_w, &pills);
         });
 
+        if dpi_changed {
+            self.configured_dpi = dpi_val;
+            self.dpi_manually_edited = true;
+        }
         if next_target != self.target {
             self.set_target(next_target);
         }
@@ -360,8 +528,14 @@ impl InputLabUiState {
             self.reset_capture();
         }
         if do_copy {
-            let report =
-                format_diagnostic_report(&self.last_snapshot, self.timer_benchmark.as_ref());
+            let ruler_in = (self.last_snapshot.dpi_measurement.packet_count > 0)
+                .then(|| self.ruler_unit.to_inches(self.ruler_distance));
+            let report = format_diagnostic_report(
+                &self.last_snapshot,
+                self.configured_dpi,
+                ruler_in,
+                self.timer_benchmark.as_ref(),
+            );
             ctx.copy_text(report);
             self.notice = Some((
                 Severity::Ok,
@@ -379,45 +553,28 @@ impl InputLabUiState {
     ) {
         let inner_w = (card_w - 24.0).max(120.0);
         let ps = &self.last_snapshot.polling;
+        let tr = &self.last_snapshot.tracking;
+        let dpi_f = f64::from(self.configured_dpi.max(1));
 
         card_frame(ui, p, card_w, |ui| {
-            let narrow_hdr = inner_w < 740.0;
-            let draw_controls =
-                |ui: &mut egui::Ui, chart_mode: &mut ChartViewMode, saturated_only: &mut bool| {
-                    for (m, lbl) in [
-                        (ChartViewMode::Split, "Split"),
-                        (ChartViewMode::Intervals, "Intervals"),
-                        (ChartViewMode::Histogram, "Histogram"),
-                    ] {
-                        let btn = if *chart_mode == m {
-                            primary_btn(lbl, p)
-                        } else {
-                            secondary_btn(lbl, p)
-                        };
-                        if ui.add(btn).clicked() {
-                            *chart_mode = m;
-                        }
-                    }
-                    let sat_btn = if *saturated_only {
-                        primary_btn("Saturated only", p)
-                    } else {
-                        secondary_btn("Saturated only", p)
-                    };
-                    if ui
-                        .add(sat_btn)
-                        .on_hover_text(
-                            "Hide slow-hand empty slots and show only motion-saturated intervals",
-                        )
-                        .clicked()
-                    {
-                        *saturated_only = !*saturated_only;
-                    }
-                };
+            let narrow_hdr = inner_w < 860.0;
+            let show_sat_toggle = matches!(
+                self.chart_mode,
+                ChartViewMode::Split | ChartViewMode::Intervals | ChartViewMode::Histogram
+            );
+
+            let modes = [
+                (ChartViewMode::Split, "Split"),
+                (ChartViewMode::Intervals, "Intervals"),
+                (ChartViewMode::Histogram, "Histogram"),
+                (ChartViewMode::Velocity, "Velocity"),
+                (ChartViewMode::XyTrace, "XY Trace"),
+            ];
 
             if narrow_hdr {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Polling Consistency & Wireless Health")
+                        RichText::new("Polling Consistency & Sensor Tracking")
                             .size(14.0)
                             .strong()
                             .color(p.text),
@@ -435,26 +592,17 @@ impl InputLabUiState {
                 });
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
-                    draw_controls(ui, &mut self.chart_mode, &mut self.saturated_only);
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Polling Consistency & Wireless Health")
-                            .size(14.0)
-                            .strong()
-                            .color(p.text),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(sev) = ps.health_severity {
-                            ui.label(
-                                RichText::new(health_badge_label(sev))
-                                    .size(11.0)
-                                    .strong()
-                                    .color(p.severity_fg(sev)),
-                            );
-                            ui.add_space(4.0);
+                    for (m, lbl) in modes {
+                        let btn = if self.chart_mode == m {
+                            primary_btn(lbl, p)
+                        } else {
+                            secondary_btn(lbl, p)
+                        };
+                        if ui.add(btn).clicked() {
+                            self.chart_mode = m;
                         }
+                    }
+                    if show_sat_toggle {
                         let sat_btn = if self.saturated_only {
                             primary_btn("Saturated only", p)
                         } else {
@@ -469,11 +617,43 @@ impl InputLabUiState {
                         {
                             self.saturated_only = !self.saturated_only;
                         }
-                        for (m, lbl) in [
-                            (ChartViewMode::Histogram, "Histogram"),
-                            (ChartViewMode::Intervals, "Intervals"),
-                            (ChartViewMode::Split, "Split"),
-                        ] {
+                    }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Polling Consistency & Sensor Tracking")
+                            .size(14.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(sev) = ps.health_severity {
+                            ui.label(
+                                RichText::new(health_badge_label(sev))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(p.severity_fg(sev)),
+                            );
+                            ui.add_space(4.0);
+                        }
+                        if show_sat_toggle {
+                            let sat_btn = if self.saturated_only {
+                                primary_btn("Saturated only", p)
+                            } else {
+                                secondary_btn("Saturated only", p)
+                            };
+                            if ui
+                                .add(sat_btn)
+                                .on_hover_text(
+                                    "Hide slow-hand empty slots and show only motion-saturated intervals",
+                                )
+                                .clicked()
+                            {
+                                self.saturated_only = !self.saturated_only;
+                            }
+                        }
+                        for (m, lbl) in modes.into_iter().rev() {
                             let btn = if self.chart_mode == m {
                                 primary_btn(lbl, p)
                             } else {
@@ -489,15 +669,26 @@ impl InputLabUiState {
 
             if ps.active_intervals > 0 {
                 ui.add_space(4.0);
-                let stats_text = format!(
-                    "Min {:.3} ms · Median {:.3} ms · p95 {:.3} ms · p99 {:.3} ms · Max {:.3} ms · σ {:.3} ms",
-                    ps.min_us / 1000.0,
-                    ps.median_us / 1000.0,
-                    ps.p95_us / 1000.0,
-                    ps.p99_us / 1000.0,
-                    ps.max_us / 1000.0,
-                    ps.std_dev_us / 1000.0,
-                );
+                let stats_text = match self.chart_mode {
+                    ChartViewMode::Velocity | ChartViewMode::XyTrace => format!(
+                        "Live {:.1} IPS ({:.2} m/s) · Peak {:.1} IPS ({:.2} m/s) · Peak Accel {:.1} G · Configured {} DPI",
+                        tr.current_ips(dpi_f),
+                        tr.current_ips(dpi_f) * 0.0254,
+                        tr.peak_ips(dpi_f),
+                        tr.peak_mps(dpi_f),
+                        tr.peak_accel_g(dpi_f),
+                        self.configured_dpi,
+                    ),
+                    _ => format!(
+                        "Min {:.3} ms · Median {:.3} ms · p95 {:.3} ms · p99 {:.3} ms · Max {:.3} ms · σ {:.3} ms",
+                        ps.min_us / 1000.0,
+                        ps.median_us / 1000.0,
+                        ps.p95_us / 1000.0,
+                        ps.p99_us / 1000.0,
+                        ps.max_us / 1000.0,
+                        ps.std_dev_us / 1000.0,
+                    ),
+                };
                 ui.add(
                     egui::Label::new(
                         RichText::new(stats_text)
@@ -513,10 +704,16 @@ impl InputLabUiState {
 
             match self.chart_mode {
                 ChartViewMode::Intervals => {
-                    paint_interval_chart(ui, p, inner_w, 185.0, ps, self.saturated_only);
+                    paint_interval_chart(ui, p, inner_w, 190.0, ps, self.saturated_only);
                 }
                 ChartViewMode::Histogram => {
-                    paint_histogram_chart(ui, p, inner_w, 185.0, ps, self.saturated_only);
+                    paint_histogram_chart(ui, p, inner_w, 190.0, ps, self.saturated_only);
+                }
+                ChartViewMode::Velocity => {
+                    paint_velocity_chart(ui, p, inner_w, 200.0, ps, tr, dpi_f);
+                }
+                ChartViewMode::XyTrace => {
+                    paint_xy_trace_chart(ui, p, inner_w, 220.0, tr, dpi_f);
                 }
                 ChartViewMode::Split => {
                     if inner_w >= 760.0 {
@@ -539,12 +736,184 @@ impl InputLabUiState {
             ui.add_space(8.0);
             let sev = ps.health_severity.unwrap_or(Severity::Info);
             let msg = if ps.health_summary.is_empty() {
-                "Click Start Capture and move your mouse in brisk, steady circles anywhere on screen to test 1K–8K polling consistency and wireless dropouts."
+                "Click Start Capture and move your mouse in brisk, steady circles anywhere on screen to test 1K–8K polling consistency, IPS/G tracking, and wireless dropouts."
             } else {
                 &ps.health_summary
             };
             semantic_banner(ui, p, mode, inner_w, sev, msg);
         });
+    }
+
+    fn render_dpi_calibrator_card(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(160.0);
+        let snap = self.last_snapshot.dpi_measurement.clone();
+        let dist_in = self.ruler_unit.to_inches(self.ruler_distance);
+        let eval = snap.evaluate(f64::from(self.configured_dpi.max(1)), dist_in);
+
+        let mut toggle_run = false;
+        let mut clear_run = false;
+
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Measured DPI / CPI Calibrator")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.dpi_measuring {
+                        ui.label(
+                            RichText::new("MEASURING · PRESS SPACE TO FINISH")
+                                .size(11.0)
+                                .strong()
+                                .monospace()
+                                .color(p.ok),
+                        );
+                    } else if let Some(res) = eval {
+                        ui.label(
+                            RichText::new(format!(
+                                "{:.0} DPI ({:+.1}%)",
+                                res.measured_dpi, res.deviation_pct
+                            ))
+                            .size(11.5)
+                            .strong()
+                            .monospace()
+                            .color(p.severity_fg(res.severity)),
+                        );
+                    }
+                });
+            });
+
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Place a ruler next to your mouse, click Start DPI Slide, glide straight for the exact distance below, then press Space (or click Finish) without nudging the mouse.",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(8.0);
+
+            ui.horizontal_wrapped(|ui| {
+                let run_label = if self.dpi_measuring {
+                    "Finish Slide (Space)"
+                } else {
+                    "Start DPI Slide"
+                };
+                if ui.add(primary_btn(run_label, p)).clicked() {
+                    toggle_run = true;
+                }
+                if ui
+                    .add_enabled(
+                        snap.packet_count > 0 || self.dpi_measuring,
+                        secondary_btn("Clear", p),
+                    )
+                    .clicked()
+                {
+                    clear_run = true;
+                }
+
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Ruler distance:")
+                        .color(p.text_muted)
+                        .size(12.0),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.ruler_distance)
+                        .range(1.0..=100.0)
+                        .speed(0.5)
+                        .fixed_decimals(1),
+                );
+
+                for unit in [RulerUnit::Cm, RulerUnit::Inches] {
+                    let btn = if self.ruler_unit == unit {
+                        primary_btn(unit.label(), p)
+                    } else {
+                        secondary_btn(unit.label(), p)
+                    };
+                    if ui.add(btn).clicked() && self.ruler_unit != unit {
+                        // Convert existing ruler distance cleanly when switching units.
+                        self.ruler_distance = match unit {
+                            RulerUnit::Inches => (self.ruler_distance / 2.54 * 10.0).round() / 10.0,
+                            RulerUnit::Cm => (self.ruler_distance * 2.54 * 10.0).round() / 10.0,
+                        }
+                        .clamp(1.0, 100.0);
+                        self.ruler_unit = unit;
+                    }
+                }
+            });
+
+            if snap.packet_count > 0 {
+                ui.add_space(8.0);
+                let mut pills = vec![
+                    (
+                        "NET COUNTS".to_string(),
+                        format!(
+                            "{:.0} (dx {}, dy {})",
+                            snap.net_counts, snap.net_x, snap.net_y
+                        ),
+                    ),
+                    (
+                        "STRAIGHTNESS".to_string(),
+                        format!("{:.1}%", snap.straightness_pct),
+                    ),
+                ];
+                if let Some(res) = eval {
+                    pills.push((
+                        "MEASURED DPI".to_string(),
+                        format!("{:.0} DPI", res.measured_dpi),
+                    ));
+                    pills.push((
+                        "DEVIATION".to_string(),
+                        format!("{:+.2}%", res.deviation_pct),
+                    ));
+                    pills.push((
+                        "SENS MATCH".to_string(),
+                        format!("{:.3}×", res.sensitivity_multiplier),
+                    ));
+                }
+                render_status_pill_rows(ui, p, inner_w, &pills);
+
+                if let Some(res) = eval {
+                    ui.add_space(6.0);
+                    let straight_note = if snap.straightness_pct < 96.0 {
+                        " Tip: straightness was below 96% — try sliding against a straight edge for higher precision."
+                    } else {
+                        ""
+                    };
+                    let summary = format!(
+                        "Configured {} DPI measured {:.0} DPI ({:+.2}%) over {:.1} {}. Multiply in-game sensitivity by {:.3}× to match a true {} DPI baseline.{straight_note}",
+                        self.configured_dpi,
+                        res.measured_dpi,
+                        res.deviation_pct,
+                        self.ruler_distance,
+                        self.ruler_unit.label(),
+                        res.sensitivity_multiplier,
+                        self.configured_dpi,
+                    );
+                    semantic_banner(ui, p, mode, inner_w, res.severity, &summary);
+                }
+            }
+        });
+
+        if toggle_run {
+            self.toggle_dpi_measurement(ctx);
+        }
+        if clear_run {
+            self.reset_dpi_measurement();
+        }
     }
 
     fn render_click_bounce_card(
@@ -927,7 +1296,6 @@ fn paint_interval_chart(
         plot.bottom() - clamped * plot.height()
     };
 
-    // Subtle ±15% healthy band around nominal interval.
     let band_top = y_to_px(nominal * 1.15);
     let band_bot = y_to_px(nominal * 0.85);
     painter.rect_filled(
@@ -939,7 +1307,6 @@ fn paint_interval_chart(
         p.surface_alt,
     );
 
-    // Horizontal reference lines (1x nominal, 2x nominal).
     for (mult, label_col) in [(1.0, p.text_muted), (2.0, p.border)] {
         let val = nominal * mult;
         if val <= y_max {
@@ -997,7 +1364,6 @@ fn paint_interval_chart(
         } else if sample.saturated {
             p.text
         } else {
-            // Unsaturated slow-hand slots stay muted gray so they never look like red radio faults.
             p.text_muted
         };
 
@@ -1124,7 +1490,6 @@ fn paint_histogram_chart(
     let slot_w = plot.width() / (bin_count as f32);
     let bar_w = (slot_w - 1.5).max(2.0);
 
-    // Subtle header inside histogram box.
     painter.text(
         Pos2::new(plot.left(), rect.top() + 4.0),
         Align2::LEFT_TOP,
@@ -1140,7 +1505,6 @@ fn paint_histogram_chart(
         p.text_muted,
     );
 
-    // Baseline axis
     painter.line_segment(
         [
             Pos2::new(plot.left(), plot.bottom()),
@@ -1180,7 +1544,6 @@ fn paint_histogram_chart(
         if total_c > 0 {
             let total_h = ((total_c as f32) / (max_count as f32) * plot.height()).max(2.0);
             if !saturated_only && bin.unsaturated_count > 0 {
-                // Draw unsaturated slow-hand backdrop in muted border/gray tone.
                 painter.rect_filled(
                     Rect::from_min_max(
                         Pos2::new(x0, plot.bottom() - total_h),
@@ -1218,7 +1581,6 @@ fn paint_histogram_chart(
         }
     }
 
-    // Key harmonic X-axis markers: 0, 1x nominal, 2x missed-frame harmonic, 2.8x+
     let tick_y = plot.bottom() + 4.0;
     let draw_tick = |bin_pos: f32, label: &str, align: Align2, col: Color32| {
         let x = plot.left() + bin_pos * slot_w;
@@ -1248,6 +1610,308 @@ fn paint_histogram_chart(
     if let Some(tip) = hovered_tip {
         resp.on_hover_text(tip);
     }
+}
+
+/// MouseTester-style Velocity (IPS) line + signed `dx`/`dy` counts strip.
+fn paint_velocity_chart(
+    ui: &mut egui::Ui,
+    p: Palette,
+    width: f32,
+    height: f32,
+    ps: &PollingStats,
+    tr: &TrackingStats,
+    dpi: f64,
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect(
+        rect,
+        CornerRadius::same(6),
+        p.bg,
+        Stroke::new(1.0_f32, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    if ps.recent_samples.is_empty() {
+        paint_centered_hint(
+            &painter,
+            rect,
+            p,
+            "Start Capture and swipe your mouse to plot IPS velocity and raw dx/dy counts",
+        );
+        return;
+    }
+
+    let pad_left = 54.0;
+    let pad_right = 10.0;
+    let pad_top = 12.0;
+    let pad_bottom = 18.0;
+
+    let inner_h = (height - pad_top - pad_bottom).max(40.0);
+    let vel_h = inner_h * 0.58;
+    let counts_top = rect.top() + pad_top + vel_h + 10.0;
+
+    let vel_plot = Rect::from_min_max(
+        Pos2::new(rect.left() + pad_left, rect.top() + pad_top),
+        Pos2::new(rect.right() - pad_right, rect.top() + pad_top + vel_h),
+    );
+    let cnt_plot = Rect::from_min_max(
+        Pos2::new(rect.left() + pad_left, counts_top),
+        Pos2::new(rect.right() - pad_right, rect.bottom() - pad_bottom),
+    );
+
+    let max_ips = ps
+        .recent_samples
+        .iter()
+        .map(|s| s.speed_cps / dpi)
+        .fold(10.0_f64, f64::max)
+        .max(tr.peak_ips(dpi) * 0.5)
+        * 1.1;
+
+    // Velocity plot horizontal guides
+    for frac in [0.0_f32, 0.5, 1.0] {
+        let y = vel_plot.bottom() - frac * vel_plot.height();
+        painter.line_segment(
+            [
+                Pos2::new(vel_plot.left(), y),
+                Pos2::new(vel_plot.right(), y),
+            ],
+            Stroke::new(1.0_f32, p.border),
+        );
+        painter.text(
+            Pos2::new(vel_plot.left() - 5.0, y),
+            Align2::RIGHT_CENTER,
+            format!("{:.0} IPS", max_ips * f64::from(frac)),
+            FontId::monospace(9.5),
+            p.text_muted,
+        );
+    }
+
+    let n = ps.recent_samples.len();
+    let step_x = if n > 1 {
+        vel_plot.width() / ((n - 1) as f32)
+    } else {
+        0.0
+    };
+
+    let mut prev_pt: Option<Pos2> = None;
+    for (i, s) in ps.recent_samples.iter().enumerate() {
+        let ips = (s.speed_cps / dpi).clamp(0.0, max_ips);
+        let x = vel_plot.left() + (i as f32) * step_x;
+        let y = vel_plot.bottom() - ((ips / max_ips) as f32) * vel_plot.height();
+        let pt = Pos2::new(x, y);
+        if let Some(p0) = prev_pt {
+            painter.line_segment([p0, pt], Stroke::new(1.5_f32, p.text));
+        }
+        prev_pt = Some(pt);
+    }
+
+    // Lower strip: signed dx (crisp monochrome) & dy (semantic info blue) raw counts.
+    let cnt_mid_y = cnt_plot.center().y;
+    let max_cnt = ps
+        .recent_samples
+        .iter()
+        .map(|s| s.dx.abs().max(s.dy.abs()))
+        .max()
+        .unwrap_or(1)
+        .max(4) as f32;
+
+    painter.line_segment(
+        [
+            Pos2::new(cnt_plot.left(), cnt_mid_y),
+            Pos2::new(cnt_plot.right(), cnt_mid_y),
+        ],
+        Stroke::new(1.0_f32, p.border),
+    );
+    painter.text(
+        Pos2::new(cnt_plot.left() - 5.0, cnt_plot.top()),
+        Align2::RIGHT_TOP,
+        format!("+{max_cnt:.0}"),
+        FontId::monospace(9.5),
+        p.text_muted,
+    );
+    painter.text(
+        Pos2::new(cnt_plot.left() - 5.0, cnt_plot.bottom()),
+        Align2::RIGHT_BOTTOM,
+        format!("-{max_cnt:.0}"),
+        FontId::monospace(9.5),
+        p.text_muted,
+    );
+
+    let half_h = cnt_plot.height() * 0.48;
+    for (i, s) in ps.recent_samples.iter().enumerate() {
+        let x = cnt_plot.left() + (i as f32) * step_x;
+        if s.dx != 0 {
+            let y_dx = cnt_mid_y - ((s.dx as f32) / max_cnt).clamp(-1.0, 1.0) * half_h;
+            painter.line_segment(
+                [Pos2::new(x, cnt_mid_y), Pos2::new(x, y_dx)],
+                Stroke::new(1.1_f32, p.text),
+            );
+        }
+        if s.dy != 0 {
+            let y_dy = cnt_mid_y - ((s.dy as f32) / max_cnt).clamp(-1.0, 1.0) * half_h;
+            painter.line_segment(
+                [Pos2::new(x, cnt_mid_y), Pos2::new(x, y_dy)],
+                Stroke::new(1.1_f32, p.info),
+            );
+        }
+    }
+
+    painter.text(
+        Pos2::new(cnt_plot.right(), rect.bottom() - 3.0),
+        Align2::RIGHT_BOTTOM,
+        format!("Top: Smoothed IPS · Bottom: raw dx (mono) & dy (blue) · last {n} reports"),
+        FontId::monospace(9.5),
+        p.text_muted,
+    );
+}
+
+/// Aspect-ratio-preserving 2D XY motion path plot exposing angle snapping, jitter, and spinouts.
+fn paint_xy_trace_chart(
+    ui: &mut egui::Ui,
+    p: Palette,
+    width: f32,
+    height: f32,
+    tr: &TrackingStats,
+    dpi: f64,
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect(
+        rect,
+        CornerRadius::same(6),
+        p.bg,
+        Stroke::new(1.0_f32, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    if tr.xy_trace.len() < 2 {
+        paint_centered_hint(
+            &painter,
+            rect,
+            p,
+            "Start Capture and draw circles or straight lines to inspect your 2D XY tracking path",
+        );
+        return;
+    }
+
+    let plot = Rect::from_min_max(
+        Pos2::new(rect.left() + 14.0, rect.top() + 18.0),
+        Pos2::new(rect.right() - 14.0, rect.bottom() - 20.0),
+    );
+    if plot.width() <= 20.0 || plot.height() <= 20.0 {
+        return;
+    }
+
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for pt in &tr.xy_trace {
+        min_x = min_x.min(pt.x);
+        max_x = max_x.max(pt.x);
+        min_y = min_y.min(pt.y);
+        max_y = max_y.max(pt.y);
+    }
+
+    let span_x = (max_x - min_x).max(20.0);
+    let span_y = (max_y - min_y).max(20.0);
+    // Uniform scale keeps circles truly circular (1:1 X/Y aspect ratio).
+    let scale = (plot.width() / span_x).min(plot.height() / span_y) * 0.92;
+    let mid_x = (min_x + max_x) * 0.5;
+    let mid_y = (min_y + max_y) * 0.5;
+
+    let to_screen = |x: f32, y: f32| -> Pos2 {
+        Pos2::new(
+            plot.center().x + (x - mid_x) * scale,
+            plot.center().y + (y - mid_y) * scale,
+        )
+    };
+
+    // Subtle center crosshair
+    painter.line_segment(
+        [
+            Pos2::new(plot.left(), plot.center().y),
+            Pos2::new(plot.right(), plot.center().y),
+        ],
+        Stroke::new(1.0_f32, p.surface_alt),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(plot.center().x, plot.top()),
+            Pos2::new(plot.center().x, plot.bottom()),
+        ],
+        Stroke::new(1.0_f32, p.surface_alt),
+    );
+
+    let peak_cps = tr.peak_cps.max(1.0) as f32;
+    for pair in tr.xy_trace.windows(2) {
+        let a = to_screen(pair[0].x, pair[0].y);
+        let b = to_screen(pair[1].x, pair[1].y);
+        let col = if pair[1].speed_cps > peak_cps * 0.8 && peak_cps > 15_000.0 {
+            p.info
+        } else {
+            p.text
+        };
+        painter.line_segment([a, b], Stroke::new(1.4_f32, col));
+    }
+
+    // Highlight trail start (muted) and live cursor head (ok green).
+    if let Some(first) = tr.xy_trace.first() {
+        painter.circle_filled(to_screen(first.x, first.y), 2.5, p.text_muted);
+    }
+    if let Some(last) = tr.xy_trace.last() {
+        painter.circle_filled(to_screen(last.x, last.y), 3.5, p.ok);
+    }
+
+    let cm_x = (f64::from(span_x) / dpi) * 2.54;
+    let cm_y = (f64::from(span_y) / dpi) * 2.54;
+    painter.text(
+        Pos2::new(plot.left(), rect.top() + 4.0),
+        Align2::LEFT_TOP,
+        "2D XY Motion Trace (1:1 aspect)",
+        FontId::monospace(9.5),
+        p.text_muted,
+    );
+    painter.text(
+        Pos2::new(plot.right(), rect.bottom() - 3.0),
+        Align2::RIGHT_BOTTOM,
+        format!(
+            "Span {:.0}×{:.0} counts ({:.1}×{:.1} cm) · {} pts",
+            span_x,
+            span_y,
+            cm_x,
+            cm_y,
+            tr.xy_trace.len()
+        ),
+        FontId::monospace(9.5),
+        p.text_muted,
+    );
+}
+
+fn paint_centered_hint(painter: &egui::Painter, rect: Rect, p: Palette, msg: &str) {
+    let galley = painter.layout(
+        msg.to_string(),
+        FontId::proportional(11.5),
+        p.text_muted,
+        (rect.width() - 28.0).max(80.0),
+    );
+    painter.galley(
+        Pos2::new(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        p.text_muted,
+    );
 }
 
 fn paint_timer_sparkline(
@@ -1361,17 +2025,7 @@ fn paint_empty_chart_box(ui: &mut egui::Ui, p: Palette, width: f32, height: f32,
         Stroke::new(1.0_f32, p.border),
         egui::StrokeKind::Inside,
     );
-    let galley = painter.layout(
-        msg.to_string(),
-        FontId::proportional(11.5),
-        p.text_muted,
-        (width - 28.0).max(80.0),
-    );
-    let pos = Pos2::new(
-        rect.center().x - galley.size().x * 0.5,
-        rect.center().y - galley.size().y * 0.5,
-    );
-    painter.galley(pos, galley, p.text_muted);
+    paint_centered_hint(&painter, rect, p, msg);
 }
 
 fn card_frame(

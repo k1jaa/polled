@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::diagnostics::analyzer::{
-    ClickBounceAnalyzer, DiagnosticsSnapshot, MouseButtonKind, PollingAnalyzer, PollingTarget,
+    ClickBounceAnalyzer, DiagnosticsSnapshot, DpiCalibrator, MouseButtonKind, PollingAnalyzer,
+    PollingTarget,
 };
 
 const TARGET_AUTO_SENTINEL: u32 = 0;
@@ -34,6 +35,8 @@ pub struct RawInputCaptureSession {
     snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
     running: Arc<AtomicBool>,
     reset_requested: Arc<AtomicBool>,
+    dpi_measuring: Arc<AtomicBool>,
+    dpi_reset_requested: Arc<AtomicBool>,
     target_hz_atomic: Arc<AtomicU32>,
     msg_hwnd: Arc<AtomicIsize>,
     join_handle: Option<JoinHandle<()>>,
@@ -58,22 +61,42 @@ impl RawInputCaptureSession {
         }));
         let running = Arc::new(AtomicBool::new(true));
         let reset_requested = Arc::new(AtomicBool::new(false));
+        let dpi_measuring = Arc::new(AtomicBool::new(false));
+        let dpi_reset_requested = Arc::new(AtomicBool::new(false));
         let target_hz_atomic = Arc::new(AtomicU32::new(initial_target_raw));
         let msg_hwnd = Arc::new(AtomicIsize::new(0));
 
         let snap_bg = Arc::clone(&snapshot);
         let run_bg = Arc::clone(&running);
         let reset_bg = Arc::clone(&reset_requested);
+        let dpi_meas_bg = Arc::clone(&dpi_measuring);
+        let dpi_reset_bg = Arc::clone(&dpi_reset_requested);
         let target_bg = Arc::clone(&target_hz_atomic);
         let hwnd_bg = Arc::clone(&msg_hwnd);
 
         let handle = std::thread::spawn(move || {
             #[cfg(windows)]
-            run_win32_capture_loop(snap_bg, run_bg, reset_bg, target_bg, hwnd_bg, on_update);
+            run_win32_capture_loop(
+                snap_bg,
+                run_bg,
+                reset_bg,
+                dpi_meas_bg,
+                dpi_reset_bg,
+                target_bg,
+                hwnd_bg,
+                on_update,
+            );
 
             #[cfg(not(windows))]
             {
-                let _ = (run_bg, reset_bg, target_bg, hwnd_bg);
+                let _ = (
+                    run_bg,
+                    reset_bg,
+                    dpi_meas_bg,
+                    dpi_reset_bg,
+                    target_bg,
+                    hwnd_bg,
+                );
                 if let Ok(mut guard) = snap_bg.lock() {
                     guard.capturing = false;
                     guard.error =
@@ -87,6 +110,8 @@ impl RawInputCaptureSession {
             snapshot,
             running,
             reset_requested,
+            dpi_measuring,
+            dpi_reset_requested,
             target_hz_atomic,
             msg_hwnd,
             join_handle: Some(handle),
@@ -103,6 +128,16 @@ impl RawInputCaptureSession {
             PollingTarget::FixedHz(hz) => hz,
         };
         self.target_hz_atomic.store(raw, Ordering::SeqCst);
+        self.post_sync_wakeup();
+    }
+
+    pub fn set_dpi_measuring(&self, active: bool) {
+        self.dpi_measuring.store(active, Ordering::SeqCst);
+        self.post_sync_wakeup();
+    }
+
+    pub fn request_dpi_reset(&self) {
+        self.dpi_reset_requested.store(true, Ordering::SeqCst);
         self.post_sync_wakeup();
     }
 
@@ -160,10 +195,13 @@ impl Drop for RawInputCaptureSession {
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn run_win32_capture_loop<F>(
     snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
     running: Arc<AtomicBool>,
     reset_requested: Arc<AtomicBool>,
+    dpi_measuring: Arc<AtomicBool>,
+    dpi_reset_requested: Arc<AtomicBool>,
     target_hz_atomic: Arc<AtomicU32>,
     msg_hwnd: Arc<AtomicIsize>,
     on_update: F,
@@ -199,20 +237,35 @@ fn run_win32_capture_loop<F>(
     struct CaptureThreadState {
         qpc_freq: u64,
         polling: PollingAnalyzer,
+        dpi_cal: DpiCalibrator,
         clicks: ClickBounceAnalyzer,
         last_target_raw: u32,
         snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
         reset_requested: Arc<AtomicBool>,
+        dpi_measuring: Arc<AtomicBool>,
+        dpi_reset_requested: Arc<AtomicBool>,
         target_hz_atomic: Arc<AtomicU32>,
         on_update: Box<dyn Fn() + Send>,
     }
 
     impl CaptureThreadState {
+        fn sync_dpi_flags(&mut self) {
+            if self.dpi_reset_requested.swap(false, Ordering::SeqCst) {
+                self.dpi_cal.reset();
+            }
+            let want_active = self.dpi_measuring.load(Ordering::SeqCst);
+            if want_active != self.dpi_cal.is_active() {
+                self.dpi_cal.set_active(want_active);
+            }
+        }
+
         fn sync_and_publish(&mut self) {
             if self.reset_requested.swap(false, Ordering::SeqCst) {
                 self.polling.reset();
                 self.clicks.reset();
+                self.dpi_cal.reset();
             }
+            self.sync_dpi_flags();
             let target_raw = self.target_hz_atomic.load(Ordering::SeqCst);
             if target_raw != self.last_target_raw {
                 self.polling.set_target(decode_target(target_raw));
@@ -223,6 +276,8 @@ fn run_win32_capture_loop<F>(
                 capturing: true,
                 target: self.polling.target(),
                 polling: self.polling.snapshot(Some(now_ns)),
+                tracking: self.polling.tracking_snapshot(Some(now_ns)),
+                dpi_measurement: self.dpi_cal.snapshot(),
                 clicks: self.clicks.snapshot(),
                 error: None,
             };
@@ -286,6 +341,8 @@ fn run_win32_capture_loop<F>(
                     state
                         .polling
                         .record_motion(ts_ns, mouse.lLastX, mouse.lLastY);
+                    state.sync_dpi_flags();
+                    state.dpi_cal.record_motion(mouse.lLastX, mouse.lLastY);
 
                     // SAFETY: Standard Windows `RAWMOUSE` button flags union access.
                     let flags = u32::from(unsafe { mouse.Anonymous.Anonymous.usButtonFlags });
@@ -478,10 +535,13 @@ fn run_win32_capture_loop<F>(
         *cell.borrow_mut() = Some(CaptureThreadState {
             qpc_freq,
             polling: PollingAnalyzer::new(initial_target),
+            dpi_cal: DpiCalibrator::default(),
             clicks: ClickBounceAnalyzer::new(),
             last_target_raw: initial_target_raw,
             snapshot: Arc::clone(&snapshot),
             reset_requested,
+            dpi_measuring,
+            dpi_reset_requested,
             target_hz_atomic,
             on_update: Box::new(on_update),
         });

@@ -12,9 +12,11 @@ pub mod raw_capture;
 
 pub use analyzer::{
     format_diagnostic_report, snap_nominal_hz, ButtonBounceStats, ClickBounceAnalyzer,
-    ClickBounceSnapshot, ClickEventRecord, DiagnosticsSnapshot, HistogramBin, IntervalSample,
-    MouseButtonKind, PollingAnalyzer, PollingStats, PollingTarget, TimerJitterBenchmark,
-    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, PAUSE_THRESHOLD_US, STANDARD_RATES_HZ,
+    ClickBounceSnapshot, ClickEventRecord, DiagnosticsSnapshot, DpiCalibrationResult,
+    DpiCalibrator, DpiMeasurementSnapshot, HistogramBin, IntervalSample, MouseButtonKind,
+    PollingAnalyzer, PollingStats, PollingTarget, TimerJitterBenchmark, TrackingStats,
+    XyTracePoint, BOUNCE_THRESHOLD_MS, GRAVITY_MPS2, HISTOGRAM_BASE_BINS, PAUSE_THRESHOLD_US,
+    STANDARD_RATES_HZ,
 };
 pub use raw_capture::RawInputCaptureSession;
 

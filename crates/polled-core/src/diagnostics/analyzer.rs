@@ -4,7 +4,7 @@
 
 //! Pure-Rust statistical analyzers for high-polling mouse motion consistency (up to 8,000 Hz),
 //! motion-saturated wireless dropout vs. slow-movement separation, interval distribution
-//! histograms, and mouse switch double-click bounce testing.
+//! histograms, smoothed IPS/G sensor tracking, measured DPI calibration, and switch bounce testing.
 
 use std::collections::VecDeque;
 
@@ -26,9 +26,15 @@ pub const STANDARD_RATES_HZ: [u32; 7] = [125, 250, 500, 1000, 2000, 4000, 8000];
 /// Number of equal-width bins spanning `0.0 .. 2.8x` nominal interval (plus 1 overflow bin).
 pub const HISTOGRAM_BASE_BINS: usize = 28;
 
+/// Standard gravity in m/s² used to convert mouse acceleration into G-force.
+pub const GRAVITY_MPS2: f64 = 9.80665;
+
 const ROLLING_INTERVAL_CAPACITY: usize = 1_200;
 const CHART_POINTS_LIMIT: usize = 400;
 const EFFECTIVE_WINDOW_NS: u64 = 500_000_000; // 500 ms rolling rate window
+const SPEED_WINDOW_NS: u64 = 4_000_000; // 4 ms sliding window suppresses 4K/8K quantization spikes
+const SPEED_MIN_SPAN_NS: u64 = 1_500_000; // 1.5 ms minimum span for clean IPS calculation
+const ACCEL_MIN_DT_NS: u64 = 4_000_000; // 4 ms minimum span for clean G calculation
 const RECENT_CLICK_LOG_LIMIT: usize = 24;
 
 /// Target polling rate used to evaluate jitter, wireless gaps, and bunched bursts.
@@ -88,10 +94,14 @@ impl MouseButtonKind {
     }
 }
 
-/// Single plotted motion interval with its saturation classification.
+/// Single plotted motion interval with its saturation flag, raw counts, and smoothed speed.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct IntervalSample {
     pub dt_us: f64,
+    pub dx: i32,
+    pub dy: i32,
+    /// Smoothed local speed in counts/sec at this sample (divide by DPI for IPS).
+    pub speed_cps: f64,
     /// `true` when motion velocity was high enough to guarantee >= 1–2 counts per poll slot,
     /// so any long gap represents a genuine wireless/USB dropout rather than slow hand speed.
     pub saturated: bool,
@@ -110,6 +120,175 @@ pub struct HistogramBin {
 impl HistogramBin {
     pub fn total_count(&self) -> u32 {
         self.saturated_count + self.unsaturated_count
+    }
+}
+
+/// Single point on the 2D XY relative motion trace.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct XyTracePoint {
+    pub x: f32,
+    pub y: f32,
+    pub speed_cps: f32,
+}
+
+/// Live & peak velocity/acceleration metrics (stored in raw counts/sec so DPI can change live).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TrackingStats {
+    /// Live smoothed speed in counts/sec (`0.0` when mouse is stationary).
+    pub current_cps: f64,
+    /// Peak smoothed flick speed observed in counts/sec.
+    pub peak_cps: f64,
+    /// Peak smoothed acceleration observed in counts/sec².
+    pub peak_accel_cps2: f64,
+    /// Recent relative 2D path points (up to 400 points) for the XY Trace plot.
+    pub xy_trace: Vec<XyTracePoint>,
+}
+
+impl TrackingStats {
+    pub fn current_ips(&self, dpi: f64) -> f64 {
+        if dpi > 0.0 {
+            self.current_cps / dpi
+        } else {
+            0.0
+        }
+    }
+
+    pub fn peak_ips(&self, dpi: f64) -> f64 {
+        if dpi > 0.0 {
+            self.peak_cps / dpi
+        } else {
+            0.0
+        }
+    }
+
+    pub fn peak_mps(&self, dpi: f64) -> f64 {
+        self.peak_ips(dpi) * 0.0254
+    }
+
+    pub fn peak_accel_g(&self, dpi: f64) -> f64 {
+        if dpi > 0.0 {
+            (self.peak_accel_cps2 / dpi) * 0.0254 / GRAVITY_MPS2
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Raw counts accumulated during a physical ruler DPI calibration slide.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DpiMeasurementSnapshot {
+    pub active: bool,
+    pub net_x: i64,
+    pub net_y: i64,
+    pub net_counts: f64,
+    pub path_counts: f64,
+    pub straightness_pct: f64,
+    pub packet_count: u64,
+}
+
+/// Computed real-world DPI calibration result for a known physical ruler distance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DpiCalibrationResult {
+    pub measured_dpi: f64,
+    pub deviation_pct: f64,
+    /// Multiply in-game sensitivity by this factor to match a true `configured_dpi` sensor.
+    pub sensitivity_multiplier: f64,
+    pub severity: Severity,
+}
+
+impl DpiMeasurementSnapshot {
+    /// Computes real measured DPI and deviation against `configured_dpi` for `distance_inches`.
+    pub fn evaluate(
+        &self,
+        configured_dpi: f64,
+        distance_inches: f64,
+    ) -> Option<DpiCalibrationResult> {
+        if self.net_counts < 10.0 || configured_dpi <= 0.0 || distance_inches <= 0.0 {
+            return None;
+        }
+        let measured_dpi = self.net_counts / distance_inches;
+        let deviation_pct = ((measured_dpi - configured_dpi) / configured_dpi) * 100.0;
+        let sensitivity_multiplier = if measured_dpi > 0.0 {
+            configured_dpi / measured_dpi
+        } else {
+            1.0
+        };
+        let abs_dev = deviation_pct.abs();
+        let severity = if abs_dev <= 2.5 {
+            Severity::Ok
+        } else if abs_dev <= 5.5 {
+            Severity::Info
+        } else {
+            Severity::Warn
+        };
+        Some(DpiCalibrationResult {
+            measured_dpi,
+            deviation_pct,
+            sensitivity_multiplier,
+            severity,
+        })
+    }
+}
+
+/// Accumulates raw relative counts during an explicit physical-ruler DPI test run.
+#[derive(Debug, Default)]
+pub struct DpiCalibrator {
+    active: bool,
+    net_x: i64,
+    net_y: i64,
+    path_counts: f64,
+    packet_count: u64,
+}
+
+impl DpiCalibrator {
+    pub fn set_active(&mut self, active: bool) {
+        if active && !self.active {
+            // Starting a fresh measurement run clears previous counts automatically.
+            self.net_x = 0;
+            self.net_y = 0;
+            self.path_counts = 0.0;
+            self.packet_count = 0;
+        }
+        self.active = active;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn reset(&mut self) {
+        self.net_x = 0;
+        self.net_y = 0;
+        self.path_counts = 0.0;
+        self.packet_count = 0;
+    }
+
+    pub fn record_motion(&mut self, dx: i32, dy: i32) {
+        if !self.active || (dx == 0 && dy == 0) {
+            return;
+        }
+        self.net_x += i64::from(dx);
+        self.net_y += i64::from(dy);
+        self.path_counts += f64::from(dx).hypot(f64::from(dy));
+        self.packet_count += 1;
+    }
+
+    pub fn snapshot(&self) -> DpiMeasurementSnapshot {
+        let net_counts = (self.net_x as f64).hypot(self.net_y as f64);
+        let straightness_pct = if self.path_counts > 0.0 {
+            (net_counts / self.path_counts * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        DpiMeasurementSnapshot {
+            active: self.active,
+            net_x: self.net_x,
+            net_y: self.net_y,
+            net_counts,
+            path_counts: self.path_counts,
+            straightness_pct,
+            packet_count: self.packet_count,
+        }
     }
 }
 
@@ -229,6 +408,8 @@ pub struct DiagnosticsSnapshot {
     pub capturing: bool,
     pub target: PollingTarget,
     pub polling: PollingStats,
+    pub tracking: TrackingStats,
+    pub dpi_measurement: DpiMeasurementSnapshot,
     pub clicks: ClickBounceSnapshot,
     pub error: Option<String>,
 }
@@ -252,9 +433,12 @@ pub fn snap_nominal_hz(median_us: f64) -> u32 {
 #[derive(Debug, Clone, Copy)]
 struct RawIntervalRecord {
     dt_us: f64,
+    dx: i32,
+    dy: i32,
     axis_counts: f64,
     inst_rate_cps: f64,
     prev_rate_cps: f64,
+    smoothed_cps: f64,
 }
 
 impl RawIntervalRecord {
@@ -278,7 +462,14 @@ impl RawIntervalRecord {
     }
 }
 
-/// High-precision mouse polling interval & wireless health analyzer.
+#[derive(Debug, Clone, Copy)]
+struct SpeedWindowPacket {
+    ts_ns: u64,
+    dx: i32,
+    dy: i32,
+}
+
+/// High-precision mouse polling interval, wireless health, and IPS/G/XY tracking analyzer.
 #[derive(Debug, Default)]
 pub struct PollingAnalyzer {
     target: PollingTarget,
@@ -288,6 +479,13 @@ pub struct PollingAnalyzer {
     active_intervals: u64,
     rolling: VecDeque<RawIntervalRecord>,
     recent_timestamps_ns: VecDeque<u64>,
+    speed_window: VecDeque<SpeedWindowPacket>,
+    current_cps: f64,
+    peak_cps: f64,
+    last_accel_sample: Option<(u64, f64)>,
+    peak_accel_cps2: f64,
+    xy_cursor: (f32, f32),
+    xy_trace: VecDeque<XyTracePoint>,
     peak_hz: f64,
     cumulative_true_dropouts: u64,
     cumulative_slow_slots: u64,
@@ -323,18 +521,105 @@ impl PollingAnalyzer {
         }
         self.total_motion_packets += 1;
 
+        let mut is_pause = false;
         if let Some(prev_ns) = self.last_motion_ns {
             if timestamp_ns >= prev_ns {
                 let delta_us = (timestamp_ns - prev_ns) as f64 / 1_000.0;
-                if delta_us <= PAUSE_THRESHOLD_US && delta_us > 0.0 {
+                if delta_us > PAUSE_THRESHOLD_US {
+                    is_pause = true;
+                }
+            }
+        }
+
+        if is_pause {
+            // User paused mouse movement; reset rolling speed/rate streaks cleanly.
+            self.recent_timestamps_ns.clear();
+            self.speed_window.clear();
+            self.last_rate_cps = 0.0;
+            self.current_cps = 0.0;
+            self.last_accel_sample = None;
+        }
+
+        // Update 4 ms sliding speed window (filters 4K/8K sub-millisecond quantization spikes).
+        self.speed_window.push_back(SpeedWindowPacket {
+            ts_ns: timestamp_ns,
+            dx,
+            dy,
+        });
+        while let Some(front) = self.speed_window.front() {
+            if timestamp_ns.saturating_sub(front.ts_ns) > SPEED_WINDOW_NS {
+                self.speed_window.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let mut smoothed_cps = self.current_cps;
+        if self.speed_window.len() >= 2 {
+            if let (Some(first), Some(last)) = (self.speed_window.front(), self.speed_window.back())
+            {
+                let span_ns = last.ts_ns.saturating_sub(first.ts_ns);
+                if span_ns >= SPEED_MIN_SPAN_NS {
+                    // Sum displacement after the opening anchor packet to match exact `span_ns`.
+                    let (sum_x, sum_y) = self
+                        .speed_window
+                        .iter()
+                        .skip(1)
+                        .fold((0i64, 0i64), |(sx, sy), p| {
+                            (sx + i64::from(p.dx), sy + i64::from(p.dy))
+                        });
+                    let dist = (sum_x as f64).hypot(sum_y as f64);
+                    let cps = dist / (span_ns as f64 / 1_000_000_000.0);
+                    if cps.is_finite() {
+                        smoothed_cps = cps;
+                        self.current_cps = cps;
+                        self.peak_cps = self.peak_cps.max(cps);
+
+                        if let Some((prev_a_ts, prev_a_cps)) = self.last_accel_sample {
+                            let dt_ns = timestamp_ns.saturating_sub(prev_a_ts);
+                            if dt_ns >= ACCEL_MIN_DT_NS {
+                                let accel =
+                                    (cps - prev_a_cps).abs() / (dt_ns as f64 / 1_000_000_000.0);
+                                if accel.is_finite() {
+                                    self.peak_accel_cps2 = self.peak_accel_cps2.max(accel);
+                                }
+                                self.last_accel_sample = Some((timestamp_ns, cps));
+                            }
+                        } else {
+                            self.last_accel_sample = Some((timestamp_ns, cps));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update 2D XY motion trace.
+        self.xy_cursor.0 += dx as f32;
+        self.xy_cursor.1 += dy as f32;
+        if self.xy_trace.len() >= CHART_POINTS_LIMIT {
+            self.xy_trace.pop_front();
+        }
+        self.xy_trace.push_back(XyTracePoint {
+            x: self.xy_cursor.0,
+            y: self.xy_cursor.1,
+            speed_cps: smoothed_cps as f32,
+        });
+
+        if let Some(prev_ns) = self.last_motion_ns {
+            if !is_pause && timestamp_ns >= prev_ns {
+                let delta_us = (timestamp_ns - prev_ns) as f64 / 1_000.0;
+                if delta_us > 0.0 && delta_us <= PAUSE_THRESHOLD_US {
                     self.active_intervals += 1;
                     let axis_counts = dx.abs().max(dy.abs()) as f64;
                     let inst_rate_cps = axis_counts / (delta_us / 1_000_000.0);
                     let rec = RawIntervalRecord {
                         dt_us: delta_us,
+                        dx,
+                        dy,
                         axis_counts,
                         inst_rate_cps,
                         prev_rate_cps: self.last_rate_cps,
+                        smoothed_cps,
                     };
                     self.last_rate_cps = inst_rate_cps;
 
@@ -354,10 +639,6 @@ impl PollingAnalyzer {
                             self.cumulative_bunches += 1;
                         }
                     }
-                } else if delta_us > PAUSE_THRESHOLD_US {
-                    // User paused mouse movement; reset rolling rate & speed streak cleanly.
-                    self.recent_timestamps_ns.clear();
-                    self.last_rate_cps = 0.0;
                 }
             }
         }
@@ -398,8 +679,6 @@ impl PollingAnalyzer {
                 }
                 let mut sorted: Vec<f64> = self.rolling.iter().map(|r| r.dt_us).collect();
                 sorted.sort_by(|a, b| a.total_cmp(b));
-                // Use lower quartile (p25) when auto-detecting so occasional slow hand movement
-                // cannot pull a 4000 Hz mouse down to 1000 Hz!
                 let p25 = sorted[sorted.len() / 4];
                 let hz = snap_nominal_hz(p25);
                 Some((hz, 1_000_000.0 / f64::from(hz)))
@@ -431,6 +710,21 @@ impl PollingAnalyzer {
         self.cumulative_true_dropouts = dropouts;
         self.cumulative_slow_slots = slow_slots;
         self.cumulative_bunches = bunches;
+    }
+
+    /// Returns a snapshot of smoothed velocity, peak acceleration, and the recent 2D XY trace.
+    pub fn tracking_snapshot(&self, now_ns: Option<u64>) -> TrackingStats {
+        let is_moving = match (now_ns, self.last_motion_ns) {
+            (Some(now), Some(last)) => now.saturating_sub(last) <= 200_000_000,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        TrackingStats {
+            current_cps: if is_moving { self.current_cps } else { 0.0 },
+            peak_cps: self.peak_cps,
+            peak_accel_cps2: self.peak_accel_cps2,
+            xy_trace: self.xy_trace.iter().copied().collect(),
+        }
     }
 
     /// Computes a complete snapshot of timing consistency, saturation, histogram, and wireless health.
@@ -497,7 +791,6 @@ impl PollingAnalyzer {
         let nominal_hz = match self.target {
             PollingTarget::FixedHz(hz) if hz > 0 => hz,
             _ => {
-                // p25 keeps auto-detection locked to true hardware rate even during mixed-speed swipes.
                 let p25 = percentile_sorted(&sorted, 0.25);
                 snap_nominal_hz(p25)
             }
@@ -514,7 +807,6 @@ impl PollingAnalyzer {
         let mut rolling_slow_slots = 0usize;
         let mut rolling_bunches = 0usize;
 
-        // Build 28 equal bins of 0.1x nominal (0.0 .. 2.8x) + 1 overflow bin (> 2.8x).
         let bin_width = (nominal_interval_us * 0.10).max(5.0);
         let mut histogram_bins: Vec<HistogramBin> = (0..=HISTOGRAM_BASE_BINS)
             .map(|i| {
@@ -574,8 +866,6 @@ impl PollingAnalyzer {
             0.0
         };
 
-        // Evaluate wireless/USB health using motion-saturated samples so slow hand movement
-        // never triggers false dropout warnings on 4K/8K mice.
         let (health_severity, health_summary) = if n < 40 {
             (
                 Some(Severity::Info),
@@ -624,6 +914,9 @@ impl PollingAnalyzer {
             .skip(chart_start)
             .map(|r| IntervalSample {
                 dt_us: r.dt_us,
+                dx: r.dx,
+                dy: r.dy,
+                speed_cps: r.smoothed_cps,
                 saturated: r.is_saturated(nominal_hz, nominal_interval_us),
             })
             .collect();
@@ -767,9 +1060,12 @@ impl ClickBounceAnalyzer {
 /// Formats a clean plain-text diagnostic report suitable for clipboard export or issue tickets.
 pub fn format_diagnostic_report(
     snap: &DiagnosticsSnapshot,
+    configured_dpi: u32,
+    dpi_ruler_inches: Option<f64>,
     timer: Option<&TimerJitterBenchmark>,
 ) -> String {
     let p = &snap.polling;
+    let dpi_f = f64::from(configured_dpi.max(1));
     let mut lines = vec![
         "Polled Input Lab Diagnostic Report".to_string(),
         format!(
@@ -793,12 +1089,36 @@ pub fn format_diagnostic_report(
             "Anomalies:      true dropouts: {} | slow empty slots: {} | bunched: {} | packets: {}",
             p.true_dropout_count, p.slow_slot_count, p.bunch_count, p.total_motion_packets
         ),
-        format!("Assessment:     {}", p.health_summary),
         format!(
-            "Click Debounce: {} total presses | {} bounce faults (< {:.0} ms)",
-            snap.clicks.total_presses, snap.clicks.total_bounce_faults, BOUNCE_THRESHOLD_MS
+            "Tracking:       peak {:.1} IPS ({:.2} m/s) | peak accel {:.1} G (at {} DPI)",
+            snap.tracking.peak_ips(dpi_f),
+            snap.tracking.peak_mps(dpi_f),
+            snap.tracking.peak_accel_g(dpi_f),
+            configured_dpi
         ),
+        format!("Assessment:     {}", p.health_summary),
     ];
+
+    if let Some(dist_in) = dpi_ruler_inches {
+        if let Some(cal) = snap.dpi_measurement.evaluate(dpi_f, dist_in) {
+            lines.push(format!(
+                "DPI Calibrator: configured {} DPI -> measured {:.0} DPI ({:+.1}%) | net {:.0} counts over {:.2} in ({:.1} cm) | straightness {:.1}% | sens match {:.3}x",
+                configured_dpi,
+                cal.measured_dpi,
+                cal.deviation_pct,
+                snap.dpi_measurement.net_counts,
+                dist_in,
+                dist_in * 2.54,
+                snap.dpi_measurement.straightness_pct,
+                cal.sensitivity_multiplier
+            ));
+        }
+    }
+
+    lines.push(format!(
+        "Click Debounce: {} total presses | {} bounce faults (< {:.0} ms)",
+        snap.clicks.total_presses, snap.clicks.total_bounce_faults, BOUNCE_THRESHOLD_MS
+    ));
 
     for btn in &snap.clicks.buttons {
         if btn.press_count > 0 {
@@ -868,7 +1188,6 @@ mod tests {
         assert!(stats.saturated_pct > 95.0);
         assert!(stats.saturated_within_15_pct > 95.0);
         assert_eq!(stats.health_severity, Some(Severity::Ok));
-        // Main 1.0x nominal histogram bin (index 9..=10) should hold almost all samples.
         let peak_bin =
             stats.histogram_bins[9].saturated_count + stats.histogram_bins[10].saturated_count;
         assert!(peak_bin >= 190, "peak_bin={peak_bin}");
@@ -878,12 +1197,10 @@ mod tests {
     fn slow_hand_movement_at_4000hz_counts_as_slow_slots_not_wireless_dropouts() {
         let mut analyzer = PollingAnalyzer::new(PollingTarget::FixedHz(4000));
         let mut t_ns = 1_000_000_000u64;
-        // First 60 fast saturated packets (3 counts every 250 us)
         for _ in 0..60 {
             analyzer.record_motion(t_ns, 3, 0);
             t_ns += 250_000;
         }
-        // Then slow hand movement: only 1 count every 750 us (1,333 counts/s << 5,600 sat threshold)
         for _ in 0..20 {
             t_ns += 750_000;
             analyzer.record_motion(t_ns, 1, 0);
@@ -891,15 +1208,8 @@ mod tests {
 
         let stats = analyzer.snapshot(Some(t_ns));
         assert_eq!(stats.nominal_hz, 4000);
-        assert_eq!(
-            stats.true_dropout_count, 0,
-            "Slow 1-count intervals must NOT be flagged as wireless dropouts"
-        );
-        assert!(
-            stats.slow_slot_count >= 19,
-            "slow_slot_count={}",
-            stats.slow_slot_count
-        );
+        assert_eq!(stats.true_dropout_count, 0);
+        assert!(stats.slow_slot_count >= 19);
         assert_eq!(stats.health_severity, Some(Severity::Ok));
     }
 
@@ -909,11 +1219,9 @@ mod tests {
         let mut t_ns = 1_000_000_000u64;
         for i in 0..100u64 {
             if i % 10 == 5 {
-                // Dropped 1 wireless frame at 4K -> 500 us (2.0x nominal) with 6 accumulated counts!
                 t_ns += 500_000;
                 analyzer.record_motion(t_ns, 6, 1);
             } else if i % 10 == 6 {
-                // Bunched catch-up burst 40 us later (< 0.35x 250 us)
                 t_ns += 40_000;
                 analyzer.record_motion(t_ns, 2, 0);
             } else {
@@ -924,19 +1232,73 @@ mod tests {
 
         let stats = analyzer.snapshot(Some(t_ns));
         assert_eq!(stats.nominal_hz, 4000);
-        assert!(
-            stats.true_dropout_count >= 9,
-            "true_dropouts={}",
-            stats.true_dropout_count
-        );
-        assert!(stats.bunch_count >= 9, "bunches={}", stats.bunch_count);
+        assert!(stats.true_dropout_count >= 9);
+        assert!(stats.bunch_count >= 9);
         assert_eq!(stats.health_severity, Some(Severity::Bad));
-        // 500 us = 2.0x of 250 us -> lands right in bin 20 (2.0x..2.1x)!
+        assert!(stats.histogram_bins[20].saturated_count >= 9);
+    }
+
+    #[test]
+    fn computes_smoothed_ips_and_g_acceleration_accurately() {
+        let mut analyzer = PollingAnalyzer::new(PollingTarget::FixedHz(1000));
+        let mut t_ns = 1_000_000_000u64;
+        // Phase 1: 10 ms steady sweep at 16 counts/ms = 16,000 cps (= 10.0 IPS at 1600 DPI)
+        for _ in 0..15 {
+            analyzer.record_motion(t_ns, 16, 0);
+            t_ns += 1_000_000;
+        }
+        // Phase 2: accelerate to 48 counts/ms = 48,000 cps (= 30.0 IPS at 1600 DPI)
+        for _ in 0..15 {
+            analyzer.record_motion(t_ns, 48, 0);
+            t_ns += 1_000_000;
+        }
+
+        let tr = analyzer.tracking_snapshot(Some(t_ns));
+        let peak_ips = tr.peak_ips(1600.0);
+        assert!((peak_ips - 30.0).abs() < 1.0, "peak_ips={peak_ips}");
         assert!(
-            stats.histogram_bins[20].saturated_count >= 9,
-            "2x harmonic bin={}",
-            stats.histogram_bins[20].saturated_count
+            tr.peak_accel_g(1600.0) > 5.0,
+            "accel_g={}",
+            tr.peak_accel_g(1600.0)
         );
+        assert_eq!(tr.xy_trace.len(), 30);
+    }
+
+    #[test]
+    fn dpi_calibrator_measures_true_cpi_deviation_and_sens_multiplier() {
+        let mut cal = DpiCalibrator::default();
+        // Inactive ignores motion
+        cal.record_motion(500, 0);
+        assert_eq!(cal.snapshot().packet_count, 0);
+
+        cal.set_active(true);
+        // Simulate sliding 10 cm (3.93700787 in) on a mouse configured at 1600 DPI that truly reads 1552 DPI (-3.0%)
+        // Expected counts = 1552 * (10 / 2.54) = 6110.24 counts
+        for _ in 0..611 {
+            cal.record_motion(10, 0);
+        }
+        cal.set_active(false);
+        // After stopping, extra motion must be ignored
+        cal.record_motion(999, 0);
+
+        let snap = cal.snapshot();
+        assert!(!snap.active);
+        assert_eq!(snap.net_x, 6110);
+        assert!((snap.straightness_pct - 100.0).abs() < 0.01);
+
+        let eval = snap.evaluate(1600.0, 10.0 / 2.54).unwrap();
+        assert!(
+            (eval.measured_dpi - 1552.0).abs() < 1.0,
+            "dpi={}",
+            eval.measured_dpi
+        );
+        assert!(
+            (eval.deviation_pct - (-3.0)).abs() < 0.1,
+            "dev={}",
+            eval.deviation_pct
+        );
+        assert!((eval.sensitivity_multiplier - (1600.0 / eval.measured_dpi)).abs() < 0.001);
+        assert_eq!(eval.severity, Severity::Info);
     }
 
     #[test]
@@ -944,18 +1306,15 @@ mod tests {
         let mut clicks = ClickBounceAnalyzer::new();
         let mut t_ns = 1_000_000_000u64;
 
-        // Normal click #1: hold 60 ms, wait 120 ms
         clicks.record_button(MouseButtonKind::Left, true, t_ns);
         t_ns += 60_000_000;
         clicks.record_button(MouseButtonKind::Left, false, t_ns);
         t_ns += 120_000_000;
 
-        // Normal click #2: hold 55 ms
         clicks.record_button(MouseButtonKind::Left, true, t_ns);
         t_ns += 55_000_000;
         clicks.record_button(MouseButtonKind::Left, false, t_ns);
 
-        // Faulty bounce 12 ms after release (< 35 ms threshold!)
         t_ns += 12_000_000;
         clicks.record_button(MouseButtonKind::Left, true, t_ns);
         t_ns += 8_000_000;

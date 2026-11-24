@@ -765,7 +765,14 @@ impl eframe::App for PolledApp {
                     return;
                 }
                 if self.active_view == ActiveView::InputLab {
-                    self.input_lab_ui.render(ctx, ui, p, mode);
+                    let detected_dpi = self
+                        .profiles_ui
+                        .runtime_snapshot
+                        .as_ref()
+                        .and_then(|s| s.active_devices.first())
+                        .and_then(|d| d.settings.as_ref())
+                        .and_then(|st| st.dpi);
+                    self.input_lab_ui.render(ctx, ui, p, mode, detected_dpi);
                     return;
                 }
 
