@@ -32,8 +32,8 @@
 use hidapi::{HidApi, HidDevice};
 
 use crate::devices::{
-    DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice, MouseSettings,
-    SupportTier, WriteMode,
+    BatteryStatus, DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice,
+    MouseSettings, SupportTier, WriteMode,
 };
 use crate::error::{PolledError, Result};
 use crate::hid::parse_hid_report_descriptor;
@@ -41,6 +41,8 @@ use crate::hid::parse_hid_report_descriptor;
 // --- Shared Compx / Nordic Transport Signature ---
 pub const COMPX_VID: u16 = 0x3554;
 pub const PULSAR_SONIX_VID: u16 = 0x3710;
+pub const GWOLVES_VID: u16 = 0x33E4;
+pub const HITSCAN_VID: u16 = 0x3770;
 
 pub const X2_CRAZYLIGHT_WIRELESS_PID: u16 = 0x5406;
 pub const X2_CRAZYLIGHT_WIRED_PID: u16 = 0x3414;
@@ -52,6 +54,34 @@ pub const LAMZU_WIRED_PID: u16 = 0xF50F;
 pub const PULSAR_NORDIC_WIRED_PID: u16 = 0xF507;
 pub const PULSAR_NORDIC_WIRELESS_PID: u16 = 0xF508;
 pub const PULSAR_NORDIC_ALT_PID: u16 = 0xF509;
+
+pub const VGN_F2_WIRELESS_PID: u16 = 0xFB56;
+pub const VGN_F2_WIRED_PID: u16 = 0xFB57;
+
+pub const SCYROX_V8_WIRELESS_PID: u16 = 0xF5F7;
+/// Scyrox V8S uses a separate PAW3955 DPI flash layout at address 6912 (`0x1B00`);
+/// excluded from legacy 0x000C CompX fallback so legacy defaults are never misread.
+const SCYROX_V8S_3955_PIDS: &[u16] = &[0xF515, 0xF517];
+
+const ATK_VXE_COMPX_PIDS: &[u16] = &[0xF58A, 0xF58C, 0xF58E, 0xF58F];
+
+/// G-Wolves XVI:0 mice speaking the 17-byte `Report ID 0x08` 0x55-checksum protocol
+/// (HTX Ultra, HTS Plus / Pro, Lycan, Fenrir Pro/Asym, HTX Mini, WARG).
+const GWOLVES_XVI0_MODELS: &[(u16, &str, bool)] = &[
+    (0x3854, "G-Wolves HTX Ultra Wireless", false),
+    (0x5618, "G-Wolves HTX Ultra Wired", true),
+    (0x5219, "G-Wolves HTS Plus Pro Wired", true),
+    (0x5418, "G-Wolves HTS Plus Wired", true),
+    (0x4718, "G-Wolves Lycan Wired", true),
+    (0x4719, "G-Wolves Lycan Wired", true),
+    (0x5619, "G-Wolves HTX Ultra Wired", true),
+    (0x5419, "G-Wolves HTS Plus Wired", true),
+    (0x3619, "G-Wolves Fenrir Pro Wired", true),
+    (0x2719, "G-Wolves HTX Mini Wired", true),
+    (0x4219, "G-Wolves WARG Wired", true),
+    (0x2619, "G-Wolves HTX Mini Asym Wired", true),
+    (0x3519, "G-Wolves Fenrir Asym Wired", true),
+];
 
 /// Vendor-defined Top-Level Collection shared by Compx / Nordic 17-byte config devices.
 pub const COMPX_USAGE_PAGE: u16 = 0xFF02;
@@ -70,6 +100,7 @@ const X3_LHD_CRAZYLIGHT_MID: u8 = 0x68;
 
 // --- Command IDs ---
 const CMD_HANDSHAKE: u8 = 0x01;
+const CMD_BATTERY: u8 = 0x04;
 const CMD_MEM_SET: u8 = 0x07;
 const CMD_MEM_GET: u8 = 0x08;
 const CMD_EVENT: u8 = 0x0A;
@@ -81,6 +112,9 @@ const ADDR_LOD_MM: u16 = 0x000A;
 const ADDR_DPI_BASE: u16 = 0x000C;
 const DPI_STAGE_STRIDE: u16 = 4;
 const ADDR_DEBOUNCE: u16 = 0x00A9;
+const ADDR_MOTION_SYNC: u16 = 0x00AB;
+const ADDR_ANGLE_SNAPPING: u16 = 0x00AF;
+const ADDR_RIPPLE_CONTROL: u16 = 0x00B1;
 
 const READ_TIMEOUT_MS: i32 = 1000;
 const MAX_SKIPPED_REPORTS: usize = 8;
@@ -228,9 +262,9 @@ pub fn encode_dpi_raw(dpi: u16, encoding: DpiEncoding) -> Option<[u8; 3]> {
             Some([low, low, high])
         }
         DpiEncoding::SingleMode50Step => {
-            // Standard Compx CX52850 / LAMZU / Pulsar Nordic encoding:
+            // Standard Compx CX52850 / LAMZU / Pulsar Nordic / VGN / G-Wolves / Hitscan / Scyrox V8:
             // dpi = (lo + 1 + 256 * page) * 50, with `high` nibble storing rot2(page).
-            if !(50..=26000).contains(&dpi) {
+            if !(50..=30000).contains(&dpi) {
                 return None;
             }
             let units = u32::from(dpi) / 50;
@@ -389,6 +423,144 @@ pub fn resolve_variant_spec(
             debounce_max_ms: 30,
             support_tier: SupportTier::ImplementedFromDocs,
         }),
+        // VGN Dragonfly F2 Master+ (3554:fb56 wireless / 3554:fb57 wired)
+        (COMPX_VID, VGN_F2_WIRELESS_PID | VGN_F2_WIRED_PID) => Some(CompxVariantSpec {
+            id_slug: format!("vgn_f2_{pid:04x}"),
+            display_name: product
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("VGN Dragonfly F2 Master+")
+                .to_string(),
+            vendor: "VGN".to_string(),
+            connection_label: if pid == VGN_F2_WIRED_PID {
+                "Wired USB (8K)".to_string()
+            } else {
+                "Wireless 2.4 GHz (8K Receiver)".to_string()
+            },
+            wired_1k_cap: false,
+            dpi_encoding: DpiEncoding::SingleMode50Step,
+            dpi_min: 50,
+            dpi_max: 26000,
+            dpi_step: 50,
+            max_dpi_stages: 8,
+            polling_rates_hz: vec![125, 250, 500, 1000, 2000, 4000, 8000],
+            lod_options: LiftOffDistance::ALL.to_vec(),
+            debounce_max_ms: 30,
+            support_tier: SupportTier::ImplementedFromDocs,
+        }),
+        // Scyrox V8 (3554:f5f7, PAW3950 legacy DPI layout, up to 30,000 DPI & 8K Hz)
+        (COMPX_VID, SCYROX_V8_WIRELESS_PID) => Some(CompxVariantSpec {
+            id_slug: "scyrox_v8_8k".to_string(),
+            display_name: product
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("Scyrox V8 8K")
+                .to_string(),
+            vendor: "Scyrox".to_string(),
+            connection_label: "Wireless 2.4 GHz (8K Dongle)".to_string(),
+            wired_1k_cap: false,
+            dpi_encoding: DpiEncoding::SingleMode50Step,
+            dpi_min: 50,
+            dpi_max: 30000,
+            dpi_step: 50,
+            max_dpi_stages: 5,
+            polling_rates_hz: vec![125, 250, 500, 1000, 2000, 4000, 8000],
+            lod_options: LiftOffDistance::ALL.to_vec(),
+            debounce_max_ms: 15,
+            support_tier: SupportTier::ImplementedFromDocs,
+        }),
+        // Scyrox V8S (PAW3955 flash 6912 layout) is deliberately skipped by legacy 0x000C fallback.
+        (COMPX_VID, p) if SCYROX_V8S_3955_PIDS.contains(&p) => None,
+        // ATK / VXE R1 CompX transports (3554:f58a/f58c/f58e/f58f)
+        (COMPX_VID, p) if ATK_VXE_COMPX_PIDS.contains(&p) => {
+            let wired = matches!(p, 0xF58C | 0xF58F);
+            Some(CompxVariantSpec {
+                id_slug: format!("vxe_r1_compx_{p:04x}"),
+                display_name: product
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("VXE R1 Series")
+                    .to_string(),
+                vendor: "ATK / VXE".to_string(),
+                connection_label: if wired {
+                    "Wired USB".to_string()
+                } else {
+                    "Wireless 2.4 GHz Receiver".to_string()
+                },
+                wired_1k_cap: wired,
+                dpi_encoding: DpiEncoding::SingleMode50Step,
+                dpi_min: 50,
+                dpi_max: 26000,
+                dpi_step: 50,
+                max_dpi_stages: 8,
+                polling_rates_hz: if wired {
+                    vec![125, 250, 500, 1000]
+                } else {
+                    vec![125, 250, 500, 1000, 2000, 4000]
+                },
+                lod_options: vec![LiftOffDistance::Mm10, LiftOffDistance::Mm20],
+                debounce_max_ms: 20,
+                support_tier: SupportTier::ImplementedFromDocs,
+            })
+        }
+        // G-Wolves XVI:0 mice (0x33E4: HTX Ultra, HTS Plus / Pro, Lycan, Fenrir, HTX Mini, WARG)
+        (GWOLVES_VID, p) => {
+            let &(_, model_name, wired) =
+                GWOLVES_XVI0_MODELS.iter().find(|&&(id, _, _)| id == p)?;
+            Some(CompxVariantSpec {
+                id_slug: format!("gwolves_{p:04x}"),
+                display_name: model_name.to_string(),
+                vendor: "G-Wolves".to_string(),
+                connection_label: if wired {
+                    "Wired USB (XVI:0)".to_string()
+                } else {
+                    "Wireless 2.4 GHz Receiver (8K)".to_string()
+                },
+                wired_1k_cap: false,
+                dpi_encoding: DpiEncoding::SingleMode50Step,
+                dpi_min: 50,
+                dpi_max: 26000,
+                dpi_step: 50,
+                max_dpi_stages: 8,
+                polling_rates_hz: vec![125, 250, 500, 1000, 2000, 4000, 8000],
+                lod_options: LiftOffDistance::ALL.to_vec(),
+                debounce_max_ms: 20,
+                support_tier: SupportTier::ImplementedFromDocs,
+            })
+        }
+        // Hitscan Hyperlight (0x3770:0100 wired / 0200 1K / 0300 8K)
+        (HITSCAN_VID, p @ (0x0100 | 0x0200 | 0x0300)) => {
+            let (name, conn, rates) = match p {
+                0x0100 => (
+                    "Hitscan Hyperlight Wired",
+                    "Wired USB",
+                    vec![125, 250, 500, 1000],
+                ),
+                0x0200 => (
+                    "Hitscan Hyperlight (1K)",
+                    "Wireless 2.4 GHz (1K Receiver)",
+                    vec![125, 250, 500, 1000],
+                ),
+                _ => (
+                    "Hitscan Hyperlight (8K)",
+                    "Wireless 2.4 GHz (8K Receiver)",
+                    vec![125, 250, 500, 1000, 2000, 4000, 8000],
+                ),
+            };
+            Some(CompxVariantSpec {
+                id_slug: format!("hitscan_{p:04x}"),
+                display_name: name.to_string(),
+                vendor: "Hitscan".to_string(),
+                connection_label: conn.to_string(),
+                wired_1k_cap: p == 0x0100,
+                dpi_encoding: DpiEncoding::SingleMode50Step,
+                dpi_min: 50,
+                dpi_max: 26000,
+                dpi_step: 50,
+                max_dpi_stages: 4,
+                polling_rates_hz: rates,
+                lod_options: vec![LiftOffDistance::Mm10, LiftOffDistance::Mm20],
+                debounce_max_ms: 20,
+                support_tier: SupportTier::ImplementedFromDocs,
+            })
+        }
         // Generic auto-detection for any other Compx (0x3554) mouse exposing 0xFF02 Report 0x08 17B.
         (COMPX_VID, _) => {
             let name = product
@@ -548,6 +720,35 @@ impl CompxDevice {
         let bytes = self.mem_read(ADDR_ACTIVE_DPI_STAGE, 2)?;
         Ok(bytes[0].min(self.spec.max_dpi_stages.saturating_sub(1)))
     }
+
+    fn read_bool_scalar(&mut self, addr: u16) -> Option<bool> {
+        let bytes = self.mem_read(addr, 2).ok()?;
+        if bytes.len() < 2 || checksum(&[bytes[0]]) != bytes[1] {
+            return None;
+        }
+        Some(bytes[0] != 0)
+    }
+}
+
+/// Decodes a 17-byte Compx `CMD_BATTERY (0x04)` reply (`[0x08, 0x04, status, ..., pct, chg, v_hi, v_lo]`).
+pub fn decode_compx_battery(reply: &[u8]) -> Option<BatteryStatus> {
+    if reply.len() < REPORT_LEN || !verify_packet_checksum(reply) {
+        return None;
+    }
+    if reply[1] != CMD_BATTERY || reply[2] != 0x00 {
+        return None;
+    }
+    let percent = reply[6];
+    if percent > 100 {
+        return None;
+    }
+    let charging = reply[7] == 1;
+    let raw_mv = u16::from_be_bytes([reply[8], reply[9]]);
+    Some(BatteryStatus {
+        percent,
+        charging,
+        voltage_mv: (raw_mv > 0).then_some(raw_mv),
+    })
 }
 
 impl MouseDevice for CompxDevice {
@@ -572,12 +773,20 @@ impl MouseDevice for CompxDevice {
             supports_debounce: true,
             debounce_min_ms: 0,
             debounce_max_ms: self.spec.debounce_max_ms,
+            supports_motion_sync: true,
+            supports_angle_snapping: true,
+            supports_ripple_control: true,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} uses Compx/Nordic onboard profile flash (no volatile RAM-only write command). Polled diffs every register and rate-limits writes to prevent flash wear.",
                 self.spec.display_name
             )),
         }
+    }
+
+    fn read_battery(&mut self) -> Option<BatteryStatus> {
+        let reply = self.send_command(CMD_BATTERY, 0, 0, &[]).ok()?;
+        decode_compx_battery(&reply)
     }
 
     fn read_settings(&mut self) -> Result<MouseSettings> {
@@ -609,11 +818,18 @@ impl MouseDevice for CompxDevice {
         let debounce_bytes = self.mem_read(ADDR_DEBOUNCE, 2)?;
         let debounce_ms = debounce_bytes[0];
 
+        let motion_sync = self.read_bool_scalar(ADDR_MOTION_SYNC);
+        let angle_snapping = self.read_bool_scalar(ADDR_ANGLE_SNAPPING);
+        let ripple_control = self.read_bool_scalar(ADDR_RIPPLE_CONTROL);
+
         Ok(MouseSettings {
             dpi: Some(dpi),
             polling_rate_hz: Some(effective_hz),
             lod: Some(lod),
             debounce_ms: Some(debounce_ms),
+            motion_sync,
+            angle_snapping,
+            ripple_control,
         })
     }
 
@@ -664,6 +880,24 @@ impl MouseDevice for CompxDevice {
         if let Some(target_db) = settings.debounce_ms {
             if current.debounce_ms != Some(target_db) {
                 self.write_byte_with_checksum(ADDR_DEBOUNCE, target_db)?;
+            }
+        }
+
+        if let Some(target_ms) = settings.motion_sync {
+            if current.motion_sync != Some(target_ms) {
+                self.write_byte_with_checksum(ADDR_MOTION_SYNC, u8::from(target_ms))?;
+            }
+        }
+
+        if let Some(target_ang) = settings.angle_snapping {
+            if current.angle_snapping != Some(target_ang) {
+                self.write_byte_with_checksum(ADDR_ANGLE_SNAPPING, u8::from(target_ang))?;
+            }
+        }
+
+        if let Some(target_rip) = settings.ripple_control {
+            if current.ripple_control != Some(target_rip) {
+                self.write_byte_with_checksum(ADDR_RIPPLE_CONTROL, u8::from(target_rip))?;
             }
         }
 
@@ -859,5 +1093,29 @@ mod tests {
             Some("Pulsar X2 CrazyLight Wired")
         );
         assert_eq!(resolve_crazylight_model_name(0x57, 0x68, false), None);
+    }
+
+    #[test]
+    fn resolves_wave2_vgn_scyrox_gwolves_hitscan_and_decodes_battery() {
+        let vgn = resolve_variant_spec(COMPX_VID, VGN_F2_WIRELESS_PID, None, None).unwrap();
+        assert_eq!(vgn.vendor, "VGN");
+        assert!(vgn.polling_rates_hz.contains(&8000));
+
+        let scyrox = resolve_variant_spec(COMPX_VID, SCYROX_V8_WIRELESS_PID, None, None).unwrap();
+        assert_eq!(scyrox.dpi_max, 30_000);
+        assert!(resolve_variant_spec(COMPX_VID, 0xF515, None, None).is_none());
+
+        let gw = resolve_variant_spec(GWOLVES_VID, 0x3854, None, None).unwrap();
+        assert_eq!(gw.vendor, "G-Wolves");
+
+        let hs = resolve_variant_spec(HITSCAN_VID, 0x0300, None, None).unwrap();
+        assert_eq!(hs.vendor, "Hitscan");
+        assert!(hs.polling_rates_hz.contains(&8000));
+
+        let batt_pkt = build_packet(CMD_BATTERY, 0, 4, &[78, 1, 0x0F, 0xFA]);
+        let batt = decode_compx_battery(&batt_pkt).unwrap();
+        assert_eq!(batt.percent, 78);
+        assert!(batt.charging);
+        assert_eq!(batt.voltage_mv, Some(0x0FFA));
     }
 }

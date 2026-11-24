@@ -65,6 +65,11 @@ impl AppPaths {
     pub fn custom_tweaks_path(&self) -> PathBuf {
         self.root.join("custom_tweaks.json")
     }
+
+    /// Directory where exported Input Lab PNG benchmark cards and CSV interval captures are saved.
+    pub fn exports_dir(&self) -> PathBuf {
+        self.root.join("exports")
+    }
 }
 
 #[cfg(test)]

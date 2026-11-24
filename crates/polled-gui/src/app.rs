@@ -694,8 +694,24 @@ impl PolledApp {
                 WorkerMsg::ProfileRuntimeUpdated(snap) => {
                     self.auto_switch_state
                         .store(snap.auto_switch_enabled, Ordering::SeqCst);
-                    self.tray
-                        .update_status(snap.auto_switch_enabled, &snap.active_profile_name);
+                    let battery_parts: Vec<String> = snap
+                        .active_devices
+                        .iter()
+                        .filter_map(|d| {
+                            d.battery
+                                .map(|b| format!("{} {}", d.info.name, b.compact_label()))
+                        })
+                        .collect();
+                    let battery_summary = if battery_parts.is_empty() {
+                        None
+                    } else {
+                        Some(battery_parts.join(", "))
+                    };
+                    self.tray.update_status(
+                        snap.auto_switch_enabled,
+                        &snap.active_profile_name,
+                        battery_summary.as_deref(),
+                    );
                     if self.settings.auto_switch_on_startup != snap.auto_switch_enabled {
                         self.settings.auto_switch_on_startup = snap.auto_switch_enabled;
                         let _ = self

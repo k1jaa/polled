@@ -8,6 +8,7 @@
 //! - On-demand 1-second OS timer jitter benchmark
 
 pub mod analyzer;
+pub mod export;
 pub mod raw_capture;
 
 pub use analyzer::{
@@ -18,6 +19,7 @@ pub use analyzer::{
     XyTracePoint, BOUNCE_THRESHOLD_MS, GRAVITY_MPS2, HISTOGRAM_BASE_BINS, PAUSE_THRESHOLD_US,
     STANDARD_RATES_HZ,
 };
+pub use export::{format_intervals_csv, render_report_png};
 pub use raw_capture::RawInputCaptureSession;
 
 use crate::error::Result;

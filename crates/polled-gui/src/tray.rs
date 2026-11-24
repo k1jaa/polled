@@ -221,14 +221,28 @@ impl TrayController {
     }
 
     /// Synchronizes the tray menu checkmark and hover tooltip with the live profile runtime.
-    pub fn update_status(&self, auto_switch_enabled: bool, active_profile_name: &str) {
+    pub fn update_status(
+        &self,
+        auto_switch_enabled: bool,
+        active_profile_name: &str,
+        battery_summary: Option<&str>,
+    ) {
         self.auto_switch_item.set_checked(auto_switch_enabled);
         if let Some(tray) = &self.tray {
-            let tooltip = if auto_switch_enabled {
+            let mut tooltip = if auto_switch_enabled {
                 format!("Polled — Auto-Switch ON · {active_profile_name}")
             } else {
                 "Polled — Auto-Switch OFF".to_string()
             };
+            if let Some(batt) = battery_summary.filter(|s| !s.is_empty()) {
+                tooltip.push_str(" · ");
+                tooltip.push_str(batt);
+            }
+            // Windows NOTIFYICONDATAW.szTip is capped at 127 UTF-16 code units.
+            if tooltip.chars().count() > 120 {
+                let truncated: String = tooltip.chars().take(117).collect();
+                tooltip = format!("{truncated}...");
+            }
             let _ = tray.set_tooltip(Some(tooltip));
         }
     }

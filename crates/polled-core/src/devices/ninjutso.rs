@@ -20,8 +20,8 @@ use std::time::Duration;
 use hidapi::{HidApi, HidDevice};
 
 use crate::devices::{
-    DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice, MouseSettings,
-    SupportTier, WriteMode,
+    BatteryStatus, DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice,
+    MouseSettings, SupportTier, WriteMode,
 };
 use crate::error::{PolledError, Result};
 use crate::hid::parse_hid_report_descriptor;
@@ -48,6 +48,8 @@ pub const REPORT_CONTROL: u8 = 3;
 pub const CONTROL_PAYLOAD_LEN: usize = 63;
 
 const CMD_PROFILE: u8 = 16;
+const CMD_BATTERY_CHARGING: u8 = 17;
+const CMD_BATTERY_PERCENT: u8 = 18;
 const CMD_ACTIVE_DPI_STAGE: u8 = 28;
 const CMD_DPI_GET: u8 = 4;
 const CMD_DPI_SET: u8 = 3;
@@ -55,6 +57,8 @@ const CMD_POLLING_GET: u8 = 6;
 const CMD_POLLING_SET: u8 = 5;
 const CMD_LOD_GET: u8 = 8;
 const CMD_LOD_SET: u8 = 7;
+const CMD_MOTION_SYNC_SET: u8 = 13;
+const CMD_MOTION_SYNC_GET: u8 = 14;
 const CMD_PAIRED_PID: u8 = 167;
 
 const RESPONSE_DELAY_MS: u64 = 30;
@@ -364,12 +368,33 @@ impl MouseDevice for NinjutsoDevice {
             supports_debounce: false,
             debounce_min_ms: 0,
             debounce_max_ms: 0,
+            supports_motion_sync: true,
+            supports_angle_snapping: false,
+            supports_ripple_control: false,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists profile settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
                 self.display_name
             )),
         }
+    }
+
+    fn read_battery(&mut self) -> Option<BatteryStatus> {
+        if self.legacy {
+            return None;
+        }
+        let pct_reply = self.read_current(CMD_BATTERY_PERCENT, &[], 2).ok()?;
+        let percent = (*pct_reply.first()?).min(100);
+        let charging = self
+            .read_current(CMD_BATTERY_CHARGING, &[], 2)
+            .ok()
+            .and_then(|r| r.first().copied())
+            .is_some_and(|c| c != 0);
+        Some(BatteryStatus {
+            percent,
+            charging,
+            voltage_mv: None,
+        })
     }
 
     fn read_settings(&mut self) -> Result<MouseSettings> {
@@ -394,11 +419,15 @@ impl MouseDevice for NinjutsoDevice {
                 1000
             };
             let lod = decode_lod(data.get(22).copied().unwrap_or(1));
+            let motion_sync = data.get(23).copied().map(|v| v == 1);
             return Ok(MouseSettings {
                 dpi: Some(dpi),
                 polling_rate_hz: Some(rate),
                 lod,
                 debounce_ms: None,
+                motion_sync,
+                angle_snapping: None,
+                ripple_control: None,
             });
         }
 
@@ -427,12 +456,20 @@ impl MouseDevice for NinjutsoDevice {
             .unwrap_or(1000);
         let lod_reply = self.read_current(CMD_LOD_GET, &[], 4)?;
         let lod = lod_reply.first().copied().and_then(decode_lod);
+        let motion_sync = self
+            .read_current(CMD_MOTION_SYNC_GET, &[], 2)
+            .ok()
+            .and_then(|r| r.first().copied())
+            .map(|v| v == 1);
 
         Ok(MouseSettings {
             dpi: Some(dpi),
             polling_rate_hz: Some(polling_rate_hz),
             lod,
             debounce_ms: None,
+            motion_sync,
+            angle_snapping: None,
+            ripple_control: None,
         })
     }
 
@@ -501,6 +538,15 @@ impl MouseDevice for NinjutsoDevice {
                         .map_err(|e| self.dev_err(format!("Sora V2 LOD write failed: {e}")))?;
                 }
             }
+            if let Some(target_ms) = settings.motion_sync {
+                if current.motion_sync != Some(target_ms) {
+                    let pkt =
+                        build_ninjutso_legacy_request(6, self.profile, Some(u8::from(target_ms)));
+                    self.hid.send_feature_report(&pkt).map_err(|e| {
+                        self.dev_err(format!("Sora V2 Motion Sync write failed: {e}"))
+                    })?;
+                }
+            }
             return Ok(());
         }
 
@@ -540,6 +586,12 @@ impl MouseDevice for NinjutsoDevice {
         if let Some(target_lod) = settings.lod {
             if current.lod != Some(target_lod) {
                 self.send_current(CMD_LOD_SET, &[encode_lod(target_lod)])?;
+            }
+        }
+
+        if let Some(target_ms) = settings.motion_sync {
+            if current.motion_sync != Some(target_ms) {
+                self.send_current(CMD_MOTION_SYNC_SET, &[u8::from(target_ms)])?;
             }
         }
 

@@ -8,11 +8,36 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## Known Issues & Limitations (Current)
 
 - **Unsigned Windows binaries:** Release executables (`polled.exe`, `polled-gui.exe`) are not yet signed with a commercial code-signing certificate, so Windows Defender SmartScreen may prompt on first run. Every release ships `SHA256SUMS.txt` and builds publicly via GitHub Actions.
-- **Unverified mouse models (`Implemented from docs`):** Only **Pulsar X2 CrazyLight Mini Wireless** (`3710:5406`) and **LAMZU 4K Receiver** (`3554:f510`) have been verified on physical hardware in Polled. Razer, CompX 64B (WLMouse / LAMZU Maya X & Inca / Attack Shark / Vancer / RAWM), Endgame Gear, Finalmouse, VAXEE, Ninjutso, Logitech HID++ 2.0, and other CompX 17B models are implemented from open-source protocol documentation and prompt for confirmation before the first write in a session (see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
+- **Unverified mouse models (`Implemented from docs`):** Only **Pulsar X2 CrazyLight Mini Wireless** (`3710:5406`) and **LAMZU 4K Receiver** (`3554:f510`) have been verified on physical hardware in Polled. Razer, CompX 64B (WLMouse / LAMZU Maya X & Inca / Attack Shark / Vancer / RAWM), Endgame Gear, Finalmouse, VAXEE, Ninjutso, MCHOSE, Incott, Keychron, Logitech HID++ 2.0, and Wave 2 CompX 17B models (VGN, Scyrox V8, ATK/VXE R1, G-Wolves XVI:0, Hitscan Hyperlight) are implemented from open-source protocol documentation and prompt for confirmation before the first write in a session (see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
 - **Onboard flash writes:** Most wireless gaming mice persist settings to onboard memory rather than RAM; Polled mitigates flash wear via register diffing, focus debouncing, and a 4-writes / 60-second sliding-window cap.
 - **No built-in auto-updater:** Portable zip releases are updated manually.
 - **Minimum window size:** The GUI enforces a minimum viewport of `680×540` px to avoid crowding Input Lab plots and Profile editors.
 - **Version metadata in `v0.2.0`:** The `v0.2.0` tagged binaries reported `0.1.0` from `polled --version` because workspace `Cargo.toml` was not bumped prior to tagging `v0.2.0` (fixed in `v0.2.1`+).
+
+---
+
+## [0.4.0] - 2026-11-24
+
+### Added
+- **Wave 2 Esports Mouse Support** (`SupportTier::ImplementedFromDocs`, ported with full attribution from [`OpenMouse-Project/mouse-protocol`](https://github.com/OpenMouse-Project/mouse-protocol)):
+  - **MCHOSE (`devices/mchose.rs`)**: A7 V2 Pro / Pro+ / Ultra / Ultra+, A7 Ultra, L7 Pro / Pro+ (`0x3837` / `0x5253`, bit-inverted Feature Reports `0x11`/`0x12`, explicitly excluding MagDock and V3 PIDs).
+  - **Incott (`devices/incott.rs`)**: G23 / G23 V2 / G24 / Ghero / Zero 29 / Zero 39 (`0x093A:522C/622C`, Feature Report `0x09` with dual-`0xFF05` collection probing).
+  - **Keychron (`devices/keychron.rs`)**: M1–M8, G3–G10, LM7 wired + Link / Ultra-Link / TurboLink receivers (`0x3434`, `0xFFC1` Launcher 8K protocol, excluding 8K Nordic PIDs).
+  - **Expanded CompX 17B (`devices/compx.rs`)**: **VGN Dragonfly F2 Master+** (`3554:fb56/fb57`), **Scyrox V8** (`3554:f5f7`), **ATK / VXE R1 CompX** (`3554:f58a–f58f`), **G-Wolves XVI:0** (`33e4:*` HTX Ultra, HTS Plus/Pro, Lycan, Fenrir, HTX Mini, WARG), and **Hitscan Hyperlight** (`3770:0100/0200/0300`).
+  - **Expanded Razer (`devices/razer.rs`)**: **Razer Viper V4 Pro** (`1532:00e5` wired / `00e6` wireless, 50,000 DPI, 8,000 Hz, V4 multi-stage DPI protocol).
+- **Live Wireless Battery Telemetry & Low-Battery Alerts:**
+  - Implemented read-only `MouseDevice::read_battery()` across CompX 17B (`0x04`), CompX 64B (`0x83`), Razer (`0x07/0x80` & `0x84`), Logitech HID++ 2.0 (`0x1004`/`0x1000`/`0x1001`), Finalmouse (`cmd 5/37/38`), VAXEE (`0x0B`/`0x10`), Ninjutso (`17/18`), MCHOSE (`0x06`), Keychron (`status[19]`), and `DryRunDevice`.
+  - Surfaced live battery % + charging/voltage status in the **Profiles** status pills, **System Tray hover tooltip**, and **`polled --detect`** (human & JSON), polled every 60 seconds with a one-shot Windows notification + warning banner when discharging `<= 15%`.
+- **Per-Game Sensor Controls:**
+  - Added optional **Motion Sync**, **Angle Snapping**, and **Ripple Control** toggles to `MouseSettings`, `DeviceCapabilities`, `ProfilesUiState`, and supported drivers (CompX 17B, CompX 64B, Endgame Gear, Finalmouse motion sync, Ninjutso motion sync, MCHOSE, Incott, Keychron, DryRun).
+- **Per-Game Windows Power Plan Switching:**
+  - Added optional **Power Plan** preset (`Balanced` / `High Performance` / `Ultimate Performance`) to `GameProfile`, automatically applied on profile switch (gracefully skipping unavailable schemes on Modern Standby laptops).
+- **Shareable Input Lab Reports (PNG + CSV Export):**
+  - Added zero-dependency pure-Rust **960×560 monochrome PNG benchmark card renderer** (`render_report_png`) and **CSV raw interval exporter** (`format_intervals_csv`) in `polled-core::diagnostics::export`.
+  - Added **Save PNG**, **Save CSV**, and **Exports** folder buttons to the Input Lab toolbar, saving files to `%LOCALAPPDATA%\Polled\exports\`.
+
+### Fixed
+- Fixed VAXEE VID typo (`2c2e` -> `3057`) in `docs/COMPATIBILITY.md`.
 
 ---
 

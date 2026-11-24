@@ -22,8 +22,8 @@ use std::time::Duration;
 use hidapi::{HidApi, HidDevice};
 
 use crate::devices::{
-    DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice, MouseSettings,
-    SupportTier, WriteMode,
+    BatteryStatus, DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice,
+    MouseSettings, SupportTier, WriteMode,
 };
 use crate::error::{PolledError, Result};
 use crate::hid::parse_hid_report_descriptor;
@@ -42,6 +42,8 @@ const CMD_POLLING: u8 = 0x07;
 const CMD_TRACKING: u8 = 0x08;
 const CMD_LOD: u8 = 0x09;
 const CMD_MOUSE_PID: u8 = 0x0A;
+const CMD_BATTERY: u8 = 0x0B;
+const CMD_CHARGING: u8 = 0x10;
 
 pub const VAXEE_PRODUCT_IDS: &[u16] = &[
     0x0005, 0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1006, 0x1007, 0x1008, 0x1009, 0x1010, 0x1011,
@@ -211,12 +213,31 @@ impl MouseDevice for VaxeeDevice {
             supports_debounce: false,
             debounce_min_ms: 0,
             debounce_max_ms: 0,
+            supports_motion_sync: false,
+            supports_angle_snapping: false,
+            supports_ripple_control: false,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
                 self.display_name
             )),
         }
+    }
+
+    fn read_battery(&mut self) -> Option<BatteryStatus> {
+        let steps = self.exchange(CMD_BATTERY, 1, &[], 1, false).ok()?[5];
+        if steps > 20 {
+            return None;
+        }
+        let charging = self
+            .exchange(CMD_CHARGING, 1, &[], 1, false)
+            .ok()
+            .is_some_and(|r| r[5] != 0);
+        Some(BatteryStatus {
+            percent: steps * 5,
+            charging,
+            voltage_mv: None,
+        })
     }
 
     fn read_settings(&mut self) -> Result<MouseSettings> {
@@ -242,7 +263,7 @@ impl MouseDevice for VaxeeDevice {
             dpi: Some(dpi),
             polling_rate_hz: Some(polling_rate_hz),
             lod,
-            debounce_ms: None,
+            ..Default::default()
         })
     }
 

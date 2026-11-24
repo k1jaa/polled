@@ -13,7 +13,7 @@ use eframe::egui::{
 };
 use polled_core::{
     export_profile_json, import_profile_json, AppPaths, DeviceCapabilities, GameProfile,
-    LiftOffDistance, MouseSettings, ProfileStore, Severity, SupportTier,
+    LiftOffDistance, MouseSettings, PowerPlanPreset, ProfileStore, Severity, SupportTier,
 };
 
 use crate::profile_runtime::{
@@ -64,8 +64,16 @@ pub struct ProfileDraft {
     pub lod: LiftOffDistance,
     pub set_debounce: bool,
     pub debounce_ms: u8,
+    pub set_motion_sync: bool,
+    pub motion_sync: bool,
+    pub set_angle_snapping: bool,
+    pub angle_snapping: bool,
+    pub set_ripple_control: bool,
+    pub ripple_control: bool,
     pub set_win_speed: bool,
     pub win_speed: u32,
+    pub set_power_plan: bool,
+    pub power_plan: PowerPlanPreset,
     pub author: String,
     pub notes: String,
 }
@@ -88,8 +96,18 @@ impl ProfileDraft {
             lod: LiftOffDistance::Mm10,
             set_debounce: false,
             debounce_ms: 4,
+            set_motion_sync: false,
+            motion_sync: true,
+            set_angle_snapping: false,
+            angle_snapping: false,
+            set_ripple_control: false,
+            ripple_control: false,
             set_win_speed: p.windows_pointer_speed.is_some(),
             win_speed: p.windows_pointer_speed.unwrap_or(10),
+            set_power_plan: p.windows_power_plan.is_some(),
+            power_plan: p
+                .windows_power_plan
+                .unwrap_or(PowerPlanPreset::HighPerformance),
             author: p.author.clone().unwrap_or_default(),
             notes: p.notes.clone().unwrap_or_default(),
         };
@@ -106,6 +124,12 @@ impl ProfileDraft {
         self.lod = m.lod.unwrap_or(LiftOffDistance::Mm10);
         self.set_debounce = m.debounce_ms.is_some();
         self.debounce_ms = m.debounce_ms.unwrap_or(4);
+        self.set_motion_sync = m.motion_sync.is_some();
+        self.motion_sync = m.motion_sync.unwrap_or(true);
+        self.set_angle_snapping = m.angle_snapping.is_some();
+        self.angle_snapping = m.angle_snapping.unwrap_or(false);
+        self.set_ripple_control = m.ripple_control.is_some();
+        self.ripple_control = m.ripple_control.unwrap_or(false);
     }
 
     fn current_mouse_fields(&self) -> MouseSettings {
@@ -114,6 +138,9 @@ impl ProfileDraft {
             polling_rate_hz: self.set_polling.then_some(self.polling_rate_hz),
             lod: self.set_lod.then_some(self.lod),
             debounce_ms: self.set_debounce.then_some(self.debounce_ms),
+            motion_sync: self.set_motion_sync.then_some(self.motion_sync),
+            angle_snapping: self.set_angle_snapping.then_some(self.angle_snapping),
+            ripple_control: self.set_ripple_control.then_some(self.ripple_control),
         }
     }
 
@@ -193,6 +220,7 @@ impl ProfileDraft {
             mouse: copy.default_mouse,
             device_overrides: copy.device_overrides,
             windows_pointer_speed: copy.set_win_speed.then_some(copy.win_speed.clamp(1, 20)),
+            windows_power_plan: copy.set_power_plan.then_some(copy.power_plan),
             author: (!copy.author.trim().is_empty()).then(|| copy.author.trim().to_string()),
             notes: (!copy.notes.trim().is_empty()).then(|| copy.notes.trim().to_string()),
         }
@@ -777,6 +805,7 @@ impl ProfilesUiState {
                     s.foreground_exe.as_deref().unwrap_or("(none)").to_string(),
                 ));
                 pills.push(("ACTIVE PROFILE".to_string(), s.active_profile_name.clone()));
+                let multi_dev = s.active_devices.len() > 1;
                 for dev in &s.active_devices {
                     let summary = dev
                         .settings
@@ -784,6 +813,21 @@ impl ProfilesUiState {
                         .map(|st| st.summary_string())
                         .unwrap_or_else(|| "asleep / move mouse".to_string());
                     pills.push((dev.info.name.to_uppercase(), summary));
+                    if let Some(batt) = dev.battery {
+                        let lbl = if multi_dev {
+                            format!("{} BATT", dev.info.name.to_uppercase())
+                        } else {
+                            "BATTERY".to_string()
+                        };
+                        let val = match (batt.charging, batt.voltage_mv) {
+                            (true, _) => format!("{}% CHG", batt.percent),
+                            (false, Some(mv)) if mv > 0 => {
+                                format!("{}% ({:.2}V)", batt.percent, f32::from(mv) / 1000.0)
+                            }
+                            (false, _) => format!("{}%", batt.percent),
+                        };
+                        pills.push((lbl, val));
+                    }
                 }
                 if let Some(pending) = &s.pending_exe {
                     pills.push(("DEBOUNCING".to_string(), pending.clone()));
@@ -795,6 +839,30 @@ impl ProfilesUiState {
                     ));
                 }
                 render_status_pill_rows(ui, p, inner_w, &pills);
+
+                let low_batt_msgs: Vec<String> = s
+                    .active_devices
+                    .iter()
+                    .filter_map(|d| {
+                        d.battery
+                            .filter(|b| !b.charging && b.percent <= 15)
+                            .map(|b| format!("{} ({}%)", d.info.name, b.percent))
+                    })
+                    .collect();
+                if !low_batt_msgs.is_empty() {
+                    ui.add_space(6.0);
+                    semantic_banner(
+                        ui,
+                        p,
+                        mode,
+                        inner_w,
+                        Severity::Warn,
+                        &format!(
+                            "Low mouse battery: {}. Plug in or dock soon to prevent wireless polling dropouts.",
+                            low_batt_msgs.join(", ")
+                        ),
+                    );
+                }
 
                 let unverified_names: Vec<&str> = s
                     .active_devices
@@ -856,9 +924,13 @@ impl ProfilesUiState {
                                 polling_rate_hz: Some(4000),
                                 lod: Some(LiftOffDistance::Mm10),
                                 debounce_ms: Some(1),
+                                motion_sync: None,
+                                angle_snapping: None,
+                                ripple_control: None,
                             },
                             device_overrides: BTreeMap::new(),
                             windows_pointer_speed: None,
+                            windows_power_plan: None,
                             author: None,
                             notes: None,
                         };
@@ -1070,6 +1142,15 @@ impl ProfilesUiState {
             let db_max = active_target_caps
                 .as_ref()
                 .map_or(20, |c| c.debounce_max_ms);
+            let supports_motion_sync = active_target_caps
+                .as_ref()
+                .is_none_or(|c| c.supports_motion_sync);
+            let supports_angle_snapping = active_target_caps
+                .as_ref()
+                .is_none_or(|c| c.supports_angle_snapping);
+            let supports_ripple_control = active_target_caps
+                .as_ref()
+                .is_none_or(|c| c.supports_ripple_control);
 
             let mut next_target: Option<(Option<String>, Option<DeviceCapabilities>)> = None;
             let mut remove_override = false;
@@ -1266,6 +1347,36 @@ impl ProfilesUiState {
                             }
                             ui.end_row();
 
+                            render_bool_sensor_row(
+                                ui,
+                                p,
+                                "Motion Sync",
+                                supports_motion_sync,
+                                &mut self.editor.set_motion_sync,
+                                &mut self.editor.motion_sync,
+                            );
+                            ui.end_row();
+
+                            render_bool_sensor_row(
+                                ui,
+                                p,
+                                "Angle Snapping",
+                                supports_angle_snapping,
+                                &mut self.editor.set_angle_snapping,
+                                &mut self.editor.angle_snapping,
+                            );
+                            ui.end_row();
+
+                            render_bool_sensor_row(
+                                ui,
+                                p,
+                                "Ripple Control",
+                                supports_ripple_control,
+                                &mut self.editor.set_ripple_control,
+                                &mut self.editor.ripple_control,
+                            );
+                            ui.end_row();
+
                             ui.checkbox(&mut self.editor.set_win_speed, "Windows Speed");
                             ui.add_enabled(
                                 self.editor.set_win_speed,
@@ -1273,6 +1384,22 @@ impl ProfilesUiState {
                                     .range(1..=20)
                                     .suffix("/20 (10 = 6/11)"),
                             );
+                            ui.end_row();
+
+                            ui.checkbox(&mut self.editor.set_power_plan, "Power Plan");
+                            ui.add_enabled_ui(self.editor.set_power_plan, |ui| {
+                                egui::ComboBox::from_id_salt("power_plan_combo")
+                                    .selected_text(self.editor.power_plan.label())
+                                    .show_ui(ui, |ui| {
+                                        for preset in PowerPlanPreset::ALL {
+                                            ui.selectable_value(
+                                                &mut self.editor.power_plan,
+                                                preset,
+                                                preset.label(),
+                                            );
+                                        }
+                                    });
+                            });
                             ui.end_row();
 
                             ui.label(RichText::new("Notes (optional)").color(p.text_muted));
@@ -1431,6 +1558,49 @@ fn secondary_btn(label: &str, p: Palette) -> egui::Button<'_> {
         .fill(p.surface_alt)
         .stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(CornerRadius::same(6))
+}
+
+fn render_bool_sensor_row(
+    ui: &mut egui::Ui,
+    p: Palette,
+    label: &str,
+    supported: bool,
+    enabled: &mut bool,
+    value: &mut bool,
+) {
+    if !supported {
+        ui.label(RichText::new(label).color(p.text_muted));
+        ui.add(
+            egui::Label::new(
+                RichText::new("Not configurable on this mouse")
+                    .size(12.0)
+                    .color(p.text_muted),
+            )
+            .wrap(),
+        );
+    } else {
+        ui.checkbox(enabled, label);
+        ui.add_enabled_ui(*enabled, |ui| {
+            ui.horizontal(|ui| {
+                let on_btn = if *value {
+                    primary_btn("ON", p)
+                } else {
+                    secondary_btn("ON", p)
+                };
+                if ui.add(on_btn).clicked() {
+                    *value = true;
+                }
+                let off_btn = if !*value {
+                    primary_btn("OFF", p)
+                } else {
+                    secondary_btn("OFF", p)
+                };
+                if ui.add(off_btn).clicked() {
+                    *value = false;
+                }
+            });
+        });
+    }
 }
 
 /// Pre-measures all status pills and packs them into rows strictly bounded by `max_row_w`

@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::devices::{
-    DeviceCapabilities, DeviceInfo, LiftOffDistance, MouseDevice, MouseSettings, SupportTier,
-    WriteMode,
+    BatteryStatus, DeviceCapabilities, DeviceInfo, LiftOffDistance, MouseDevice, MouseSettings,
+    SupportTier, WriteMode,
 };
 use crate::error::Result;
 
@@ -40,6 +40,9 @@ impl DryRunDevice {
                 polling_rate_hz: Some(1000),
                 lod: Some(LiftOffDistance::Mm10),
                 debounce_ms: Some(4),
+                motion_sync: Some(false),
+                angle_snapping: Some(false),
+                ripple_control: Some(false),
             },
             simulate_next_mismatch: false,
             write_count: Arc::new(AtomicU64::new(0)),
@@ -95,6 +98,9 @@ impl MouseDevice for DryRunDevice {
             supports_debounce: true,
             debounce_min_ms: 0,
             debounce_max_ms: 20,
+            supports_motion_sync: true,
+            supports_angle_snapping: true,
+            supports_ripple_control: true,
             supports_volatile_writes: self.supports_volatile_writes,
             flash_write_warning: if self.supports_volatile_writes {
                 None
@@ -105,6 +111,14 @@ impl MouseDevice for DryRunDevice {
                 )
             },
         }
+    }
+
+    fn read_battery(&mut self) -> Option<BatteryStatus> {
+        Some(BatteryStatus {
+            percent: 84,
+            charging: false,
+            voltage_mv: Some(4080),
+        })
     }
 
     fn read_settings(&mut self) -> Result<MouseSettings> {

@@ -9,6 +9,9 @@ pub mod dry_run;
 pub mod endgame_gear;
 pub mod finalmouse;
 pub mod hidpp20;
+pub mod incott;
+pub mod keychron;
+pub mod mchose;
 pub mod ninjutso;
 pub mod razer;
 pub mod vaxee;
@@ -27,6 +30,9 @@ pub use dry_run::DryRunDevice;
 pub use endgame_gear::{EndgameGearOp1Device, EndgameGearOp1ProtocolDriver};
 pub use finalmouse::{FinalmouseDevice, FinalmouseProtocolDriver};
 pub use hidpp20::{Hidpp20Device, Hidpp20ProtocolDriver};
+pub use incott::{IncottDevice, IncottProtocolDriver};
+pub use keychron::{KeychronDevice, KeychronProtocolDriver};
+pub use mchose::{MchoseDevice, MchoseProtocolDriver};
 pub use ninjutso::{NinjutsoDevice, NinjutsoProtocolDriver};
 pub use razer::{RazerDevice, RazerProtocolDriver};
 pub use vaxee::{VaxeeDevice, VaxeeProtocolDriver};
@@ -102,19 +108,59 @@ impl fmt::Display for LiftOffDistance {
     }
 }
 
+/// Read-only wireless mouse battery snapshot reported by supported HID protocols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatteryStatus {
+    /// Charge percentage (`0..=100`).
+    pub percent: u8,
+    /// `true` when charging over USB or on a charging dock.
+    pub charging: bool,
+    /// Optional cell voltage in millivolts when reported by firmware.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voltage_mv: Option<u16>,
+}
+
+impl BatteryStatus {
+    pub fn compact_label(self) -> String {
+        if self.charging {
+            format!("{}% CHG", self.percent)
+        } else {
+            format!("{}%", self.percent)
+        }
+    }
+
+    pub fn detail_label(self) -> String {
+        let state = if self.charging {
+            "Charging"
+        } else {
+            "Discharging"
+        };
+        match self.voltage_mv {
+            Some(mv) if mv > 0 => format!("{}% ({state}, {mv} mV)", self.percent),
+            _ => format!("{}% ({state})", self.percent),
+        }
+    }
+}
+
 /// Hardware mouse settings managed by a profile.
 ///
 /// Any `None` field means "leave unchanged" when applying a profile.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MouseSettings {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dpi: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub polling_rate_hz: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lod: Option<LiftOffDistance>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debounce_ms: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_sync: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle_snapping: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ripple_control: Option<bool>,
 }
 
 impl MouseSettings {
@@ -123,6 +169,9 @@ impl MouseSettings {
             && self.polling_rate_hz.is_none()
             && self.lod.is_none()
             && self.debounce_ms.is_none()
+            && self.motion_sync.is_none()
+            && self.angle_snapping.is_none()
+            && self.ripple_control.is_none()
     }
 
     /// Returns `true` if every `Some(...)` field in `desired` matches `self`.
@@ -147,6 +196,21 @@ impl MouseSettings {
                 return false;
             }
         }
+        if let Some(ms) = desired.motion_sync {
+            if self.motion_sync != Some(ms) {
+                return false;
+            }
+        }
+        if let Some(ang) = desired.angle_snapping {
+            if self.angle_snapping != Some(ang) {
+                return false;
+            }
+        }
+        if let Some(rip) = desired.ripple_control {
+            if self.ripple_control != Some(rip) {
+                return false;
+            }
+        }
         true
     }
 
@@ -157,6 +221,9 @@ impl MouseSettings {
             polling_rate_hz: desired.polling_rate_hz.or(self.polling_rate_hz),
             lod: desired.lod.or(self.lod),
             debounce_ms: desired.debounce_ms.or(self.debounce_ms),
+            motion_sync: desired.motion_sync.or(self.motion_sync),
+            angle_snapping: desired.angle_snapping.or(self.angle_snapping),
+            ripple_control: desired.ripple_control.or(self.ripple_control),
         }
     }
 
@@ -173,6 +240,15 @@ impl MouseSettings {
         }
         if let Some(db) = self.debounce_ms {
             parts.push(format!("Debounce {db} ms"));
+        }
+        if let Some(ms) = self.motion_sync {
+            parts.push(format!("Motion Sync {}", if ms { "ON" } else { "OFF" }));
+        }
+        if let Some(ang) = self.angle_snapping {
+            parts.push(format!("Angle Snap {}", if ang { "ON" } else { "OFF" }));
+        }
+        if let Some(rip) = self.ripple_control {
+            parts.push(format!("Ripple {}", if rip { "ON" } else { "OFF" }));
         }
         if parts.is_empty() {
             "(no mouse changes)".to_string()
@@ -202,6 +278,12 @@ pub struct DeviceCapabilities {
     pub supports_debounce: bool,
     pub debounce_min_ms: u8,
     pub debounce_max_ms: u8,
+    #[serde(default)]
+    pub supports_motion_sync: bool,
+    #[serde(default)]
+    pub supports_angle_snapping: bool,
+    #[serde(default)]
+    pub supports_ripple_control: bool,
     /// If `false`, writes touch onboard flash and MUST be diffed and rate-limited.
     pub supports_volatile_writes: bool,
     pub flash_write_warning: Option<String>,
@@ -267,6 +349,25 @@ impl DeviceCapabilities {
                     ),
                 });
             }
+        }
+
+        if settings.motion_sync.is_some() && !self.supports_motion_sync {
+            return Err(PolledError::UnsupportedSetting {
+                device: device_name.to_string(),
+                detail: format!("Motion Sync is not configurable on {device_name}"),
+            });
+        }
+        if settings.angle_snapping.is_some() && !self.supports_angle_snapping {
+            return Err(PolledError::UnsupportedSetting {
+                device: device_name.to_string(),
+                detail: format!("Angle Snapping is not configurable on {device_name}"),
+            });
+        }
+        if settings.ripple_control.is_some() && !self.supports_ripple_control {
+            return Err(PolledError::UnsupportedSetting {
+                device: device_name.to_string(),
+                detail: format!("Ripple Control is not configurable on {device_name}"),
+            });
         }
 
         Ok(())
@@ -344,6 +445,19 @@ impl DeviceCapabilities {
             }
         }
 
+        if desired.motion_sync.is_some() && !self.supports_motion_sync {
+            notes.push("Motion Sync skipped".to_string());
+            out.motion_sync = None;
+        }
+        if desired.angle_snapping.is_some() && !self.supports_angle_snapping {
+            notes.push("Angle Snapping skipped".to_string());
+            out.angle_snapping = None;
+        }
+        if desired.ripple_control.is_some() && !self.supports_ripple_control {
+            notes.push("Ripple Control skipped".to_string());
+            out.ripple_control = None;
+        }
+
         (out, notes)
     }
 }
@@ -354,6 +468,12 @@ pub trait MouseDevice: Send {
     fn capabilities(&self) -> DeviceCapabilities;
     fn read_settings(&mut self) -> Result<MouseSettings>;
     fn apply_settings(&mut self, settings: &MouseSettings, mode: WriteMode) -> Result<()>;
+
+    /// Optional read-only battery query. Returns `None` for wired mice, sleeping receivers,
+    /// or protocols without a verified battery command.
+    fn read_battery(&mut self) -> Option<BatteryStatus> {
+        None
+    }
 }
 
 /// Discovery factory that scans connected HID interfaces for devices it supports.
@@ -377,6 +497,9 @@ pub fn detect_hardware_devices() -> Result<Vec<Box<dyn MouseDevice>>> {
         Box::new(FinalmouseProtocolDriver),
         Box::new(VaxeeProtocolDriver),
         Box::new(NinjutsoProtocolDriver),
+        Box::new(MchoseProtocolDriver),
+        Box::new(IncottProtocolDriver),
+        Box::new(KeychronProtocolDriver),
     ];
     let mut devices = Vec::new();
     for driver in &drivers {
@@ -418,6 +541,9 @@ mod tests {
             supports_debounce: true,
             debounce_min_ms: 0,
             debounce_max_ms: 15,
+            supports_motion_sync: true,
+            supports_angle_snapping: true,
+            supports_ripple_control: true,
             supports_volatile_writes: false,
             flash_write_warning: None,
         };
@@ -427,6 +553,9 @@ mod tests {
             polling_rate_hz: Some(8000),
             lod: Some(LiftOffDistance::Mm07),
             debounce_ms: Some(20),
+            motion_sync: Some(true),
+            angle_snapping: Some(false),
+            ripple_control: Some(false),
         };
 
         let (adapted, notes) = lamzu_caps.adapt_settings(&pulsar_profile);
@@ -434,6 +563,7 @@ mod tests {
         assert_eq!(adapted.polling_rate_hz, Some(4000));
         assert_eq!(adapted.lod, Some(LiftOffDistance::Mm10));
         assert_eq!(adapted.debounce_ms, Some(15));
+        assert_eq!(adapted.motion_sync, Some(true));
         assert_eq!(notes.len(), 4);
         assert!(lamzu_caps.validate("LAMZU 4K", &adapted).is_ok());
     }
@@ -449,6 +579,9 @@ mod tests {
             supports_debounce: false,
             debounce_min_ms: 0,
             debounce_max_ms: 0,
+            supports_motion_sync: false,
+            supports_angle_snapping: false,
+            supports_ripple_control: false,
             supports_volatile_writes: true,
             flash_write_warning: None,
         };
@@ -458,6 +591,9 @@ mod tests {
             polling_rate_hz: Some(4000),
             lod: Some(LiftOffDistance::Mm07),
             debounce_ms: Some(4),
+            motion_sync: Some(true),
+            angle_snapping: Some(false),
+            ripple_control: Some(false),
         };
 
         let (adapted, notes) = logi_caps.adapt_settings(&desired);
@@ -465,7 +601,10 @@ mod tests {
         assert_eq!(adapted.polling_rate_hz, Some(1000));
         assert_eq!(adapted.lod, None);
         assert_eq!(adapted.debounce_ms, None);
-        assert_eq!(notes.len(), 3);
+        assert_eq!(adapted.motion_sync, None);
+        assert_eq!(adapted.angle_snapping, None);
+        assert_eq!(adapted.ripple_control, None);
+        assert_eq!(notes.len(), 6);
         assert!(logi_caps.validate("PRO X SUPERLIGHT", &adapted).is_ok());
     }
 }

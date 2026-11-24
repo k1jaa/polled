@@ -14,14 +14,19 @@ use eframe::egui;
 use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
     detect_hardware_devices, hid_topology_fingerprint, match_profile, AppPaths, ApplyOutcome,
-    DeviceCapabilities, DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent, ForegroundWatcher,
-    GameProfile, MouseSettings, PolledError, ProfileStore, SafeDeviceController, Severity,
+    BatteryStatus, DeviceCapabilities, DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent,
+    ForegroundWatcher, GameProfile, MouseSettings, PolledError, ProfileStore, SafeDeviceController,
+    Severity,
 };
 
 use crate::app::WorkerMsg;
+use crate::notifications::notify_low_battery;
 
 const MAX_LOG_ENTRIES: usize = 50;
 const HOTPLUG_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const LOW_BATTERY_WARN_PCT: u8 = 15;
+const LOW_BATTERY_RESET_PCT: u8 = 25;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendSelection {
@@ -44,6 +49,7 @@ pub struct ConnectedDeviceStatus {
     pub info: DeviceInfo,
     pub caps: DeviceCapabilities,
     pub settings: Option<MouseSettings>,
+    pub battery: Option<BatteryStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +118,46 @@ impl Drop for ProfileRuntimeHandle {
 struct ManagedController {
     controller: SafeDeviceController,
     last_settings: Option<MouseSettings>,
+    last_battery: Option<BatteryStatus>,
+    low_battery_notified: bool,
+}
+
+impl ManagedController {
+    fn init(mut controller: SafeDeviceController) -> Self {
+        let last_settings = controller.read_settings().ok();
+        let last_battery = controller.read_battery();
+        let mut low_battery_notified = false;
+        if let Some(batt) = last_battery {
+            if !batt.charging && batt.percent <= LOW_BATTERY_WARN_PCT {
+                notify_low_battery(&controller.info().name, batt.percent);
+                low_battery_notified = true;
+            }
+        }
+        Self {
+            controller,
+            last_settings,
+            last_battery,
+            low_battery_notified,
+        }
+    }
+
+    fn refresh_battery(&mut self) -> bool {
+        let next = self.controller.read_battery();
+        if let Some(batt) = next {
+            if batt.charging || batt.percent >= LOW_BATTERY_RESET_PCT {
+                self.low_battery_notified = false;
+            } else if batt.percent <= LOW_BATTERY_WARN_PCT && !self.low_battery_notified {
+                notify_low_battery(&self.controller.info().name, batt.percent);
+                self.low_battery_notified = true;
+            }
+        }
+        if next != self.last_battery {
+            self.last_battery = next;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct RuntimeState {
@@ -122,6 +168,7 @@ struct RuntimeState {
     controllers: Vec<ManagedController>,
     last_topology: Vec<(u16, u16, u16, u16)>,
     last_topology_check: Instant,
+    last_battery_poll: Instant,
     debouncer: FocusDebouncer,
     watcher: Option<ForegroundWatcher>,
     focus_rx: Option<Receiver<FocusEvent>>,
@@ -156,6 +203,7 @@ impl RuntimeState {
                 info: m.controller.info(),
                 caps: m.controller.capabilities(),
                 settings: m.last_settings.clone(),
+                battery: m.last_battery,
             })
             .collect();
 
@@ -237,33 +285,22 @@ impl RuntimeState {
         let effective_selection = match selection {
             BackendSelection::AutoConnected => {
                 if hardware.is_empty() {
-                    let mut ctrl =
-                        SafeDeviceController::new(Box::new(DryRunDevice::new_volatile()));
-                    let settings = ctrl.read_settings().ok();
-                    next_controllers.push(ManagedController {
-                        controller: ctrl,
-                        last_settings: settings,
-                    });
+                    next_controllers.push(ManagedController::init(SafeDeviceController::new(
+                        Box::new(DryRunDevice::new_volatile()),
+                    )));
                 } else {
                     for dev in hardware {
-                        let mut ctrl = SafeDeviceController::new(dev);
-                        let settings = ctrl.read_settings().ok();
-                        next_controllers.push(ManagedController {
-                            controller: ctrl,
-                            last_settings: settings,
-                        });
+                        next_controllers
+                            .push(ManagedController::init(SafeDeviceController::new(dev)));
                     }
                 }
                 BackendSelection::AutoConnected
             }
             BackendSelection::HardwareIndex(idx) => {
                 if idx < hardware.len() {
-                    let mut ctrl = SafeDeviceController::new(hardware.remove(idx));
-                    let settings = ctrl.read_settings().ok();
-                    next_controllers.push(ManagedController {
-                        controller: ctrl,
-                        last_settings: settings,
-                    });
+                    next_controllers.push(ManagedController::init(SafeDeviceController::new(
+                        hardware.remove(idx),
+                    )));
                     BackendSelection::HardwareIndex(idx)
                 } else {
                     self.push_log(
@@ -274,36 +311,35 @@ impl RuntimeState {
                 }
             }
             BackendSelection::DryRunVolatile => {
-                let mut ctrl = SafeDeviceController::new(Box::new(DryRunDevice::new_volatile()));
-                let settings = ctrl.read_settings().ok();
-                next_controllers.push(ManagedController {
-                    controller: ctrl,
-                    last_settings: settings,
-                });
+                next_controllers.push(ManagedController::init(SafeDeviceController::new(
+                    Box::new(DryRunDevice::new_volatile()),
+                )));
                 BackendSelection::DryRunVolatile
             }
             BackendSelection::DryRunFlashOnly => {
-                let mut ctrl = SafeDeviceController::new(Box::new(DryRunDevice::new_flash_only()));
-                let settings = ctrl.read_settings().ok();
-                next_controllers.push(ManagedController {
-                    controller: ctrl,
-                    last_settings: settings,
-                });
+                next_controllers.push(ManagedController::init(SafeDeviceController::new(
+                    Box::new(DryRunDevice::new_flash_only()),
+                )));
                 BackendSelection::DryRunFlashOnly
             }
         };
 
         self.selection = effective_selection;
         self.controllers = next_controllers;
+        self.last_battery_poll = Instant::now();
 
         let summary: Vec<String> = self
             .controllers
             .iter()
             .map(|m| {
                 let info = m.controller.info();
+                let batt_suffix = m
+                    .last_battery
+                    .map(|b| format!(" · {}", b.compact_label()))
+                    .unwrap_or_default();
                 match &m.last_settings {
-                    Some(s) => format!("{} ({})", info.name, s.summary_string()),
-                    None => format!("{} (asleep / move mouse to wake)", info.name),
+                    Some(s) => format!("{} ({}{batt_suffix})", info.name, s.summary_string()),
+                    None => format!("{} (asleep / move mouse to wake{batt_suffix})", info.name),
                 }
             })
             .collect();
@@ -312,6 +348,21 @@ impl RuntimeState {
             Severity::Info,
             format!("Devices ({reason}): {}", summary.join(" | ")),
         );
+    }
+
+    fn poll_batteries(&mut self) -> bool {
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_battery_poll) < BATTERY_POLL_INTERVAL {
+            return false;
+        }
+        self.last_battery_poll = now;
+        let mut any_changed = false;
+        for managed in &mut self.controllers {
+            if managed.refresh_battery() {
+                any_changed = true;
+            }
+        }
+        any_changed
     }
 
     /// Checks whether USB HID devices were plugged in or unplugged and auto-refreshes when changed.
@@ -354,6 +405,47 @@ impl RuntimeState {
                         ),
                     }
                 }
+            }
+        }
+
+        if let Some(preset) = profile.windows_power_plan {
+            let env = WindowsEnv;
+            match env.list_power_schemes() {
+                Ok(schemes) => {
+                    if let Some(target) = preset.resolve_scheme(&schemes) {
+                        let already_active = env
+                            .get_active_power_scheme()
+                            .ok()
+                            .is_some_and(|cur| cur.guid.eq_ignore_ascii_case(&target.guid));
+                        if !already_active {
+                            match env.set_active_power_scheme(&target.guid) {
+                                Ok(()) => self.push_log(
+                                    Severity::Info,
+                                    format!("Windows power plan -> {} ({reason})", target.name),
+                                ),
+                                Err(e) => self.push_log(
+                                    Severity::Warn,
+                                    format!(
+                                        "Failed to switch Windows power plan to '{}': {e}",
+                                        target.name
+                                    ),
+                                ),
+                            }
+                        }
+                    } else {
+                        self.push_log(
+                            Severity::Info,
+                            format!(
+                                "Windows power plan '{}' is not available on this host (skipped).",
+                                preset.label()
+                            ),
+                        );
+                    }
+                }
+                Err(e) => self.push_log(
+                    Severity::Warn,
+                    format!("Could not list Windows power plans: {e}"),
+                ),
             }
         }
 
@@ -450,7 +542,9 @@ impl RuntimeState {
                     ));
                 }
             }
+            managed.refresh_battery();
         }
+        self.last_battery_poll = Instant::now();
 
         if let Some(wait_secs) = max_rate_limit_wait {
             if self.auto_switch_enabled {
@@ -493,6 +587,7 @@ fn run_runtime_loop(
         controllers: Vec::new(),
         last_topology: Vec::new(),
         last_topology_check: Instant::now(),
+        last_battery_poll: Instant::now(),
         debouncer: FocusDebouncer::new(debounce),
         watcher: None,
         focus_rx: None,
@@ -511,6 +606,9 @@ fn run_runtime_loop(
 
     loop {
         let mut changed = state.check_hotplug();
+        if state.poll_batteries() {
+            changed = true;
+        }
 
         if let Some(rx) = &state.focus_rx {
             while let Ok(evt) = rx.try_recv() {

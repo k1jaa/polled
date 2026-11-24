@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::devices::{DeviceCapabilities, DeviceInfo, MouseDevice, MouseSettings, WriteMode};
+use crate::devices::{
+    BatteryStatus, DeviceCapabilities, DeviceInfo, MouseDevice, MouseSettings, WriteMode,
+};
 use crate::error::{PolledError, Result};
 
 /// Default sliding window for flash-wear protection on mice without volatile RAM writes.
@@ -86,6 +88,10 @@ impl SafeDeviceController {
 
     pub fn read_settings(&mut self) -> Result<MouseSettings> {
         self.device.read_settings()
+    }
+
+    pub fn read_battery(&mut self) -> Option<BatteryStatus> {
+        self.device.read_battery()
     }
 
     pub fn apply_profile_settings(&mut self, desired: &MouseSettings) -> Result<ApplyOutcome> {
@@ -200,6 +206,9 @@ mod tests {
             polling_rate_hz: Some(4000),
             lod: Some(LiftOffDistance::Mm07),
             debounce_ms: Some(2),
+            motion_sync: Some(true),
+            angle_snapping: Some(false),
+            ripple_control: Some(false),
         };
         let outcome = ctrl.apply_profile_settings(&desired).unwrap();
         assert_eq!(

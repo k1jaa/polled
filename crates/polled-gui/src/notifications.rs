@@ -47,6 +47,15 @@ pub fn notify_if_regressed(summary: &ScanSummary) {
     let _ = Notification::new().summary(title).body(&body).show();
 }
 
+/// Sends a one-shot Windows notification when a connected wireless mouse battery drops to <= 15%.
+pub fn notify_low_battery(device_name: &str, percent: u8) {
+    let title = format!("Polled: Low mouse battery ({percent}%)");
+    let body = format!(
+        "{device_name} is at {percent}% battery. Plug in or dock it soon to avoid wireless dropouts."
+    );
+    let _ = Notification::new().summary(&title).body(&body).show();
+}
+
 /// Spawns a lightweight watcher that periodically checks whether the Windows build/UBR
 /// changed (e.g., after a Windows Update) and triggers a re-scan + regression alert.
 pub fn spawn_windows_build_watcher(tx: Sender<WorkerMsg>, ctx: egui::Context) {

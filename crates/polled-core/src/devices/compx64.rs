@@ -33,8 +33,8 @@ use std::time::Duration;
 use hidapi::{HidApi, HidDevice};
 
 use crate::devices::{
-    DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice, MouseSettings,
-    SupportTier, WriteMode,
+    BatteryStatus, DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice,
+    MouseSettings, SupportTier, WriteMode,
 };
 use crate::error::{PolledError, Result};
 use crate::hid::parse_hid_report_descriptor;
@@ -58,6 +58,7 @@ const PAGE_DEVICE: u8 = 0x00;
 const PAGE_PROFILE: u8 = 0x01;
 
 const CMD_READ_FIRMWARE: u8 = 0x81;
+const CMD_READ_BATTERY: u8 = 0x83;
 const CMD_READ_ACTIVE_PROFILE: u8 = 0x85;
 const CMD_READ_DEBOUNCE: u8 = 0x88;
 const CMD_READ_PAIRED_PRODUCT: u8 = 0x8B;
@@ -65,11 +66,17 @@ const CMD_READ_PAIRED_PRODUCT: u8 = 0x8B;
 const CMD_READ_POLLING: u8 = 0x80;
 const CMD_READ_DPI_STAGES: u8 = 0x81;
 const CMD_READ_ACTIVE_STAGE: u8 = 0x82;
+const CMD_READ_ANGLE_SNAPPING: u8 = 0x84;
 const CMD_READ_LOD: u8 = 0x88;
+const CMD_READ_MOTION_SYNC: u8 = 0x89;
+const CMD_READ_RIPPLE_CONTROL: u8 = 0x8A;
 
 const CMD_WRITE_POLLING: u8 = 0x00;
 const CMD_WRITE_DPI_STAGES: u8 = 0x01;
+const CMD_WRITE_ANGLE_SNAPPING: u8 = 0x04;
 const CMD_WRITE_LOD: u8 = 0x08;
+const CMD_WRITE_MOTION_SYNC: u8 = 0x09;
+const CMD_WRITE_RIPPLE_CONTROL: u8 = 0x0A;
 const CMD_WRITE_DEBOUNCE: u8 = 0x08;
 
 const DPI_STEP: u16 = 50;
@@ -670,12 +677,37 @@ impl MouseDevice for Compx64Device {
             supports_debounce: true,
             debounce_min_ms: 0,
             debounce_max_ms: DEBOUNCE_MAX_MS,
+            supports_motion_sync: true,
+            supports_angle_snapping: true,
+            supports_ripple_control: true,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} writes profile settings to onboard flash. Polled diffs unchanged fields and rate-limits rapid writes.",
                 self.display_name
             )),
         }
+    }
+
+    fn read_battery(&mut self) -> Option<BatteryStatus> {
+        let reply = Self::exchange_raw(
+            &self.hid,
+            self.spec.mouse_target,
+            PAGE_DEVICE,
+            CMD_READ_BATTERY,
+            0x02,
+            &[],
+            2,
+        )
+        .ok()?;
+        let percent = *reply.get(1)?;
+        if percent > 100 {
+            return None;
+        }
+        Some(BatteryStatus {
+            percent,
+            charging: reply.first().copied() == Some(1),
+            voltage_mv: None,
+        })
     }
 
     fn read_settings(&mut self) -> Result<MouseSettings> {
@@ -737,11 +769,48 @@ impl MouseDevice for Compx64Device {
             .ok();
         let debounce_ms = db_reply.as_deref().and_then(|r| r.get(1).copied());
 
+        let motion_sync = self
+            .request(
+                self.spec.mouse_target,
+                PAGE_PROFILE,
+                CMD_READ_MOTION_SYNC,
+                0x02,
+                &[profile],
+            )
+            .ok()
+            .and_then(|r| r.get(1).copied())
+            .map(|v| v != 0);
+        let angle_snapping = self
+            .request(
+                self.spec.mouse_target,
+                PAGE_PROFILE,
+                CMD_READ_ANGLE_SNAPPING,
+                0x02,
+                &[profile],
+            )
+            .ok()
+            .and_then(|r| r.get(1).copied())
+            .map(|v| v != 0);
+        let ripple_control = self
+            .request(
+                self.spec.mouse_target,
+                PAGE_PROFILE,
+                CMD_READ_RIPPLE_CONTROL,
+                0x02,
+                &[profile],
+            )
+            .ok()
+            .and_then(|r| r.get(1).copied())
+            .map(|v| v != 0);
+
         Ok(MouseSettings {
             dpi,
             polling_rate_hz,
             lod,
             debounce_ms,
+            motion_sync,
+            angle_snapping,
+            ripple_control,
         })
     }
 
@@ -809,6 +878,39 @@ impl MouseDevice for Compx64Device {
         if let Some(target_db) = settings.debounce_ms {
             if current.debounce_ms != Some(target_db) {
                 self.write_profile_cmd(PAGE_DEVICE, CMD_WRITE_DEBOUNCE, profile, &[target_db])?;
+            }
+        }
+
+        if let Some(target_ms) = settings.motion_sync {
+            if current.motion_sync != Some(target_ms) {
+                self.write_profile_cmd(
+                    PAGE_PROFILE,
+                    CMD_WRITE_MOTION_SYNC,
+                    profile,
+                    &[u8::from(target_ms)],
+                )?;
+            }
+        }
+
+        if let Some(target_ang) = settings.angle_snapping {
+            if current.angle_snapping != Some(target_ang) {
+                self.write_profile_cmd(
+                    PAGE_PROFILE,
+                    CMD_WRITE_ANGLE_SNAPPING,
+                    profile,
+                    &[u8::from(target_ang)],
+                )?;
+            }
+        }
+
+        if let Some(target_rip) = settings.ripple_control {
+            if current.ripple_control != Some(target_rip) {
+                self.write_profile_cmd(
+                    PAGE_PROFILE,
+                    CMD_WRITE_RIPPLE_CONTROL,
+                    profile,
+                    &[u8::from(target_rip)],
+                )?;
             }
         }
 

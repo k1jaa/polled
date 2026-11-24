@@ -112,10 +112,12 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
                     let info = d.info();
                     let caps = d.capabilities();
                     let settings = d.read_settings().ok();
+                    let battery = d.read_battery();
                     serde_json::json!({
                         "info": info,
                         "capabilities": caps,
                         "current_settings": settings,
+                        "battery": battery,
                     })
                 })
                 .collect();
@@ -142,6 +144,9 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
                 match d.read_settings() {
                     Ok(s) => println!("  Current:    {}", s.summary_string()),
                     Err(e) => println!("  Current:    Unavailable ({e})"),
+                }
+                if let Some(batt) = d.read_battery() {
+                    println!("  Battery:    {}", batt.detail_label());
                 }
                 println!();
             }

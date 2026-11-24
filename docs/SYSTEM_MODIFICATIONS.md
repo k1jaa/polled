@@ -93,6 +93,7 @@ All persistent files created by Polled live under **`%LOCALAPPDATA%\Polled\`**:
 | `profiles.json` | User-created per-game mouse profiles, per-mouse overrides, and focus debounce delay. |
 | `settings.json` | UI theme (`dark` / `light`) and whether Auto-Switch starts enabled on launch. |
 | `custom_tweaks.json` | User-defined custom reversible registry tweaks. |
+| `exports/` | Optional user-triggered Input Lab PNG benchmark cards (`polled_lab_*.png`) and CSV raw interval exports (`polled_lab_*.csv`). |
 
 **Optional Windows Startup Entry (OFF by default):**
 - When you toggle **Startup: OFF → ON**, Polled writes:
@@ -108,24 +109,31 @@ All persistent files created by Polled live under **`%LOCALAPPDATA%\Polled\`**:
 When **Auto-Switch** is enabled or you click **Apply Now**, Polled can modify:
 
 1. **Optional Windows Pointer Speed** (only if checked on the profile): calls `SystemParametersInfoW(SPI_SETMOUSESPEED)` with the chosen `1..=20` value.
-2. **Mouse Hardware Settings over USB HID** (only on matching protocol-family devices):
-   - **CompX / Nordic 17-byte protocol** (`usage_page 0xFF02`, `usage 0x0002`, `Report ID 0x08`, `CMD_MEM_SET = 0x07`):
-     - Writes **only changed registers** among: Polling Rate (`0x0000`), Active DPI Stage X/Y (`0x000C + 4*stage`), Lift-Off Distance (`0x000A`), and Debounce (`0x00A9`). Never sends factory reset (`0x09`).
+2. **Optional Windows Power Plan** (only if checked on the profile): calls `powrprof.dll` `PowerSetActiveScheme` to switch between installed `Balanced`, `High Performance`, or `Ultimate Performance` power schemes (skips gracefully if a scheme is unavailable on Modern Standby laptops).
+3. **Mouse Hardware Settings over USB HID** (only on matching protocol-family devices):
+   - **CompX / Nordic 17-byte protocol** (`usage_page 0xFF02`, `usage 0x0002`, `Report ID 0x08`, `CMD_MEM_SET = 0x07`, Pulsar / LAMZU / VGN / Scyrox V8 / ATK & VXE R1 / G-Wolves XVI:0 / Hitscan Hyperlight):
+     - Writes **only changed registers** among: Polling Rate (`0x0000`), Active DPI Stage X/Y (`0x000C + 4*stage`), Lift-Off Distance (`0x000A`), Debounce (`0x00A9`), Motion Sync (`0x00AB`), Angle Snapping (`0x00AF`), and Ripple Control (`0x00B1`). Reads battery via read-only `CMD_BATTERY = 0x04`. Never sends factory reset (`0x09`).
    - **CompX 64-byte Page-Command protocol** (`Report ID 0x00`, WLMouse / LAMZU Maya X & Inca / Attack Shark / Vancer / RAWM / CRDRAKO / LunaFury):
-     - Writes active-profile DPI stage table (`page 0x01, cmd 0x01`), polling rate (`cmd 0x00`), LOD (`cmd 0x08`), and debounce (`page 0x00, cmd 0x08`) to onboard profile storage.
+     - Writes active-profile DPI stage table (`page 0x01, cmd 0x01`), polling rate (`cmd 0x00`), LOD (`cmd 0x08`), debounce (`page 0x00, cmd 0x08`), Motion Sync (`0x09`), Angle Snapping (`0x04`), and Ripple Control (`0x0A`) to onboard profile storage. Reads battery via read-only `0x83`.
    - **Razer 90-byte Feature Report protocol** (`VID 0x1532`, `Report ID 0x00`, XOR checksum byte 88):
-     - Writes DPI (`class 0x04, id 0x05`), legacy (`0x00/0x05`) or extended (`0x00/0x40` + commit selector `0x01` where required) polling rate, and symmetric tracking distance (`0x0B/0x0B`, only on verified LOD-capable models). Never writes button remaps or lighting.
+     - Writes DPI (`class 0x04, id 0x05`, or V4 multi-stage `0x04/0x06` on Viper V4 Pro), legacy (`0x00/0x05`) or extended (`0x00/0x40` + commit selector `0x01` where required) polling rate, and symmetric tracking distance (`0x0B/0x0B`, only on verified LOD-capable models). Reads battery via read-only `0x07/0x80` & `0x07/0x84`. Never writes button remaps or lighting.
    - **Endgame Gear K26/W26 protocol** (`VID 0x3367`, Feature Report `0xA0`/`0xA1`):
-     - Updates enabled CPI stages, polling divider, and LOD via full config store (`0x11`) on wired 8K models or changed-only block writes (`0x14`/`0x15`) on wireless 4K models. Never issues factory reset (`0x13`).
+     - Updates enabled CPI stages, polling divider, LOD, Motion Sync, Angle Snapping, and Ripple Control via full config store (`0x11`) on wired 8K models or changed-only block writes (`0x14`/`0x15`) on wireless 4K models. Never issues factory reset (`0x13`).
    - **Finalmouse ULX / SLX protocol** (`VID 0x361D`, Output Report `0x04`/`0x01`):
-     - Sends DPI (`cmd 16`), polling rate (`cmd 17`, ULX only), and LOD (`cmd 21` / `cmd 25`).
+     - Sends DPI (`cmd 16`), polling rate (`cmd 17`, ULX only), LOD (`cmd 21` / `cmd 25`), and Motion Sync (`cmd 18`). Reads battery via read-only telemetry (`cmd 5/37/38`).
    - **VAXEE Control Center v3.6 protocol** (`VID 0x3057`, Feature Report `0x0E` on `0xFF05:0x01`):
-     - Updates active-stage DPI (`0x04`), polling rate (`0x07`), and LOD (`0x09`).
+     - Updates active-stage DPI (`0x04`), polling rate (`0x07`), and LOD (`0x09`). Reads battery via read-only `0x0B` & `0x10`.
    - **Ninjutso NinjaForce protocol** (`VID 0x093A` Feature Report `0x06`/`0x03`, `VID 0x1915` Feature Report `0x05`/`0x04`):
-     - Updates active-stage DPI, polling rate, and LOD.
+     - Updates active-stage DPI, polling rate, LOD, and Motion Sync. Reads battery on current-gen models via read-only cmds `17/18`.
+   - **MCHOSE V2 / Ultra protocol** (`VID 0x3837` / `0x5253`, Feature Reports `0x11`/`0x12` on `0xFF01:0x01`):
+     - Updates DPI stages, polling rate (`0x42`), LOD, debounce, Motion Sync, Angle Snapping, and Ripple Control via read-modify-write config blob (`0x67`/`0x57`). Reads battery via read-only `0x06`.
+   - **Incott protocol** (`VID 0x093A:522C/622C`, Feature Report `0x09` on `0xFF05`):
+     - Updates polling rate (`0x01`), active-stage DPI (`0x02`), LOD / Ripple / Angle Snap / Motion Sync (`0x04`), and debounce (`0x05`).
+   - **Keychron Launcher 8K protocol** (`VID 0x3434`, Output/Input Reports `0xB3`/`0xB4`/`0xB5`/`0xB6` on `0xFFC1:0x01`):
+     - Updates active-stage DPI (`0x40`/`0x48`), polling rate (`0x41`/`0x4A`), LOD / Motion Sync / Angle Snap / Ripple (`0x42`), and debounce (`0x43`). Reads battery from read-only status report (`0x06`, byte 19).
    - **Logitech HID++ 2.0 protocol** (`usage_page 0xFF00`, `Report ID 0x11`):
-     - Switches `0x8100` (Onboard Profiles) to Host Mode (`0x02`) when present, then updates DPI/LOD via `0x2201` / `0x2202` and report rate via `0x8060` / `0x8061`. **Volatile RAM only** — never writes or erases `0x8100` onboard flash sectors.
-3. **Safety invariants (`SafeDeviceController`):**
+     - Switches `0x8100` (Onboard Profiles) to Host Mode (`0x02`) when present, then updates DPI/LOD via `0x2201` / `0x2202` and report rate via `0x8060` / `0x8061`. Reads battery via read-only `0x1004`/`0x1000`/`0x1001`. **Volatile RAM only** — never writes or erases `0x8100` onboard flash sectors.
+4. **Safety invariants (`SafeDeviceController`):**
    - Validates ranges/steps against device capabilities before sending any HID packet.
    - Reads current device settings first and performs **zero writes** if already matching.
    - Enforces a sliding-window write limit (**max 4 writes per 60 seconds**) on onboard-flash devices.

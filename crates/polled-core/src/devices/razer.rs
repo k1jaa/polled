@@ -27,8 +27,8 @@ use std::time::Duration;
 use hidapi::{HidApi, HidDevice};
 
 use crate::devices::{
-    DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice, MouseSettings,
-    SupportTier, WriteMode,
+    BatteryStatus, DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice,
+    MouseSettings, SupportTier, WriteMode,
 };
 use crate::error::{PolledError, Result};
 
@@ -113,6 +113,7 @@ pub struct RazerProductSpec {
     pub lift_off: bool,
     pub vendor_control_interface: bool,
     pub probe_polling_rates: bool,
+    pub v4_dpi_protocol: bool,
     pub connection_label: Option<&'static str>,
 }
 
@@ -134,7 +135,7 @@ const TRANSACTION_1F: &[u16] = &[
     0x0099, 0x009A, 0x009C, 0x009E, 0x009F, 0x00A1, 0x00A4, 0x00A5, 0x00A6, 0x00A7, 0x00A8, 0x00AA,
     0x00AB, 0x00AF, 0x00B0, 0x00B2, 0x00B3, 0x00B4, 0x00B6, 0x00B7, 0x00B8, 0x00B9, 0x00BE, 0x00BF,
     0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C7, 0x00C8, 0x00CB, 0x00CC, 0x00CD, 0x00D0,
-    0x00D1, 0x00D3, 0x00D4, 0x00D6, 0x00D7, 0x00DE, 0x00DF, 0x00EF, 0x00F0,
+    0x00D1, 0x00D3, 0x00D4, 0x00D6, 0x00D7, 0x00DE, 0x00DF, 0x00E5, 0x00E6, 0x00EF, 0x00F0,
 ];
 
 /// Returns the Razer protocol transaction ID for a catalogued product ID (`0x3F`, `0x1F`, or `0xFF`).
@@ -161,6 +162,7 @@ const fn std_wired(pid: u16, model: &'static str, max_dpi: u16) -> RazerProductS
         lift_off: false,
         vendor_control_interface: true,
         probe_polling_rates: false,
+        v4_dpi_protocol: false,
         connection_label: None,
     }
 }
@@ -185,6 +187,7 @@ const fn modern_wired(pid: u16, model: &'static str, max_dpi: u16) -> RazerProdu
         lift_off: false,
         vendor_control_interface: false,
         probe_polling_rates: false,
+        v4_dpi_protocol: false,
         connection_label: None,
     }
 }
@@ -211,6 +214,17 @@ const fn hyperpolling_receiver(pid: u16, model: &'static str, max_dpi: u16) -> R
 
 /// Complete catalog of Razer mice speaking the 90-byte HID feature-report protocol.
 pub const RAZER_PRODUCTS: &[RazerProductSpec] = &[
+    // --- Flagship Viper V4 Pro (V4 multi-stage DPI protocol) ---
+    RazerProductSpec {
+        polling_rates: RATES_8K,
+        high_rate_polling: true,
+        v4_dpi_protocol: true,
+        ..modern_wired(0x00E5, "Viper V4 Pro (Wired)", 50_000)
+    },
+    RazerProductSpec {
+        v4_dpi_protocol: true,
+        ..hyperpolling_receiver(0x00E6, "Viper V4 Pro", 50_000)
+    },
     // --- Flagship Viper V2 Pro / V3 Pro ---
     RazerProductSpec {
         lift_off: true,
@@ -559,6 +573,101 @@ pub fn cmd_set_tracking_distance(lod: LiftOffDistance) -> RazerCommand {
     }
 }
 
+pub fn cmd_read_battery() -> RazerCommand {
+    RazerCommand {
+        command_class: 0x07,
+        command_id: 0x80,
+        data_size: 0x02,
+        args: vec![0x00, 0x00],
+    }
+}
+
+pub fn cmd_read_charging() -> RazerCommand {
+    RazerCommand {
+        command_class: 0x07,
+        command_id: 0x84,
+        data_size: 0x02,
+        args: vec![0x00, 0x00],
+    }
+}
+
+pub fn cmd_read_v4_dpi_stages() -> RazerCommand {
+    RazerCommand {
+        command_class: 0x04,
+        command_id: 0x86,
+        data_size: 80,
+        args: Vec::new(),
+    }
+}
+
+pub fn cmd_read_v4_polling() -> RazerCommand {
+    RazerCommand {
+        command_class: 0x00,
+        command_id: 0xC0,
+        data_size: 0x02,
+        args: vec![0x01],
+    }
+}
+
+pub fn decode_razer_battery(
+    level_args: &[u8],
+    charging_args: Option<&[u8]>,
+) -> Option<BatteryStatus> {
+    let raw = *level_args.get(1)?;
+    let percent = ((u16::from(raw) * 100 + 127) / 255).min(100) as u8;
+    let charging = charging_args.and_then(|a| a.get(1)).copied() == Some(1);
+    Some(BatteryStatus {
+        percent,
+        charging,
+        voltage_mv: None,
+    })
+}
+
+/// Decodes Razer Viper V4 Pro `0x04/0x86` multi-stage DPI payload -> `(active_stage_0based, stages)`.
+pub fn decode_razer_v4_dpi_stages(args: &[u8]) -> Option<(usize, Vec<(u16, u16)>)> {
+    let count = usize::from((*args.get(2)?).min(5));
+    if count == 0 {
+        return None;
+    }
+    let mut stages = Vec::with_capacity(count);
+    for idx in 0..count {
+        let off = 3 + idx * 7;
+        if off + 5 > args.len() {
+            return None;
+        }
+        let x = u16::from_be_bytes([args[off + 1], args[off + 2]]);
+        let y = u16::from_be_bytes([args[off + 3], args[off + 4]]);
+        stages.push((x, y));
+    }
+    let active = usize::from(args.get(1).copied().unwrap_or(1).saturating_sub(1))
+        .min(stages.len().saturating_sub(1));
+    Some((active, stages))
+}
+
+pub fn cmd_set_v4_dpi_stages(active_stage: usize, stages: &[(u16, u16)]) -> RazerCommand {
+    let mut args = vec![0u8; 3 + stages.len() * 7];
+    args[0] = 1;
+    args[1] = (active_stage + 1) as u8;
+    args[2] = stages.len() as u8;
+    for (idx, &(x, y)) in stages.iter().enumerate() {
+        let off = 3 + idx * 7;
+        args[off] = idx as u8;
+        let xbe = x.to_be_bytes();
+        let ybe = y.to_be_bytes();
+        args[off + 1] = xbe[0];
+        args[off + 2] = xbe[1];
+        args[off + 3] = ybe[0];
+        args[off + 4] = ybe[1];
+    }
+    let len = args.len() as u8;
+    RazerCommand {
+        command_class: 0x04,
+        command_id: 0x06,
+        data_size: len,
+        args,
+    }
+}
+
 pub fn decode_dpi(args: &[u8]) -> Option<(u16, u16)> {
     if args.len() < 5 {
         return None;
@@ -783,6 +892,9 @@ impl MouseDevice for RazerDevice {
             supports_debounce: false,
             debounce_min_ms: 0,
             debounce_max_ms: 0,
+            supports_motion_sync: false,
+            supports_angle_snapping: false,
+            supports_ripple_control: false,
             supports_volatile_writes: volatile,
             flash_write_warning: (!volatile).then(|| {
                 format!(
@@ -793,7 +905,30 @@ impl MouseDevice for RazerDevice {
         }
     }
 
+    fn read_battery(&mut self) -> Option<BatteryStatus> {
+        if !self.spec.wireless {
+            return None;
+        }
+        let level = self.request(&cmd_read_battery(), None).ok()?;
+        let charging = self.request(&cmd_read_charging(), None).ok();
+        decode_razer_battery(&level, charging.as_deref())
+    }
+
     fn read_settings(&mut self) -> Result<MouseSettings> {
+        if self.spec.v4_dpi_protocol {
+            let dpi_reply = self.request(&cmd_read_v4_dpi_stages(), None)?;
+            let (active, stages) = decode_razer_v4_dpi_stages(&dpi_reply)
+                .ok_or_else(|| self.dev_err("Could not decode Razer V4 DPI stages"))?;
+            let poll_reply = self.request(&cmd_read_v4_polling(), None)?;
+            let polling_rate_hz = decode_extended_polling_rate(&poll_reply)
+                .ok_or_else(|| self.dev_err("Could not decode Razer V4 polling rate"))?;
+            return Ok(MouseSettings {
+                dpi: Some(stages[active].0),
+                polling_rate_hz: Some(polling_rate_hz),
+                ..Default::default()
+            });
+        }
+
         let dpi_reply = self.request(&cmd_read_dpi(self.spec.dpi_storage_byte), None)?;
         let (dpi_x, _) = decode_dpi(&dpi_reply)
             .ok_or_else(|| self.dev_err("Could not decode Razer DPI reply"))?;
@@ -810,12 +945,39 @@ impl MouseDevice for RazerDevice {
             dpi: Some(dpi_x),
             polling_rate_hz: Some(polling_rate_hz),
             lod,
-            debounce_ms: None,
+            ..Default::default()
         })
     }
 
     fn apply_settings(&mut self, settings: &MouseSettings, _mode: WriteMode) -> Result<()> {
         let current = self.read_settings()?;
+
+        if self.spec.v4_dpi_protocol {
+            if let Some(target_dpi) = settings.dpi {
+                if current.dpi != Some(target_dpi) {
+                    let dpi_reply = self.request(&cmd_read_v4_dpi_stages(), None)?;
+                    let (active, mut stages) = decode_razer_v4_dpi_stages(&dpi_reply)
+                        .ok_or_else(|| self.dev_err("Could not decode Razer V4 DPI stages"))?;
+                    stages[active] = (target_dpi, target_dpi);
+                    self.request(&cmd_set_v4_dpi_stages(active, &stages), None)?;
+                }
+            }
+            if let Some(target_hz) = settings.polling_rate_hz {
+                if current.polling_rate_hz != Some(target_hz) {
+                    let cmd = cmd_set_extended_polling(0x01, target_hz).ok_or_else(|| {
+                        PolledError::UnsupportedSetting {
+                            device: self.display_name.clone(),
+                            detail: format!("Unsupported Razer V4 polling rate {target_hz} Hz"),
+                        }
+                    })?;
+                    self.request(&cmd, None)?;
+                    if self.spec.wireless {
+                        thread::sleep(Duration::from_millis(POLLING_LINK_SETTLE_MS));
+                    }
+                }
+            }
+            return Ok(());
+        }
 
         if let Some(target_dpi) = settings.dpi {
             if current.dpi != Some(target_dpi) {
@@ -1017,5 +1179,23 @@ mod tests {
             decode_razer_response(&reply, &cmd),
             Err(RazerDecodeError::StaleReply)
         );
+    }
+
+    #[test]
+    fn decodes_razer_battery_and_viper_v4_pro_stages() {
+        let v4 = lookup_razer_product(0x00E6).unwrap();
+        assert_eq!(v4.model, "Viper V4 Pro");
+        assert_eq!(v4.max_dpi, 50_000);
+        assert!(v4.v4_dpi_protocol);
+        assert_eq!(v4.transaction_id(), RAZER_TX_1F);
+
+        let cmd = cmd_set_v4_dpi_stages(1, &[(800, 800), (1600, 1600), (3200, 3200)]);
+        let (active, stages) = decode_razer_v4_dpi_stages(&cmd.args).unwrap();
+        assert_eq!(active, 1);
+        assert_eq!(stages, vec![(800, 800), (1600, 1600), (3200, 3200)]);
+
+        let batt = decode_razer_battery(&[0x00, 204], Some(&[0x00, 1])).unwrap();
+        assert_eq!(batt.percent, 80);
+        assert!(batt.charging);
     }
 }

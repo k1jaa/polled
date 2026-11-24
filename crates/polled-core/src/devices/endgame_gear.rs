@@ -49,6 +49,8 @@ const STATUS_SLEEP: u8 = 0x08;
 
 const OFFSET_POLLING_DIVIDER: usize = 21;
 const OFFSET_LOD: usize = 25;
+const OFFSET_ANGLE_SNAPPING: usize = 26;
+const OFFSET_RIPPLE_CONTROL: usize = 27;
 const OFFSET_MOTION_SYNC: usize = 28;
 const OFFSET_CPI_LEVELS: usize = 30;
 const OFFSET_FIRST_CPI_SPLIT: usize = 51;
@@ -711,6 +713,9 @@ impl MouseDevice for EndgameGearOp1Device {
             supports_debounce: false,
             debounce_min_ms: 0,
             debounce_max_ms: 0,
+            supports_motion_sync: true,
+            supports_angle_snapping: true,
+            supports_ripple_control: true,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} stores settings in onboard flash. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -735,6 +740,9 @@ impl MouseDevice for EndgameGearOp1Device {
             polling_rate_hz: Some(polling_rate_hz),
             lod,
             debounce_ms: None,
+            motion_sync: Some(config[OFFSET_MOTION_SYNC] != 0),
+            angle_snapping: Some(config[OFFSET_ANGLE_SNAPPING] != 0),
+            ripple_control: Some(config[OFFSET_RIPPLE_CONTROL] != 0),
         })
     }
 
@@ -788,6 +796,24 @@ impl MouseDevice for EndgameGearOp1Device {
                     }
                 })?;
             config[OFFSET_LOD] = encoded;
+        }
+
+        if let Some(target_ms) = settings.motion_sync {
+            let effective_hz =
+                decode_egg_polling_rate(self.profile, config[OFFSET_POLLING_DIVIDER])
+                    .unwrap_or(1000);
+            if target_ms && effective_hz == 8000 && !self.profile.motion_sync_at_8k {
+                return Err(self.dev_err(
+                    "Motion Sync cannot be enabled at 8000 Hz on this Endgame Gear model",
+                ));
+            }
+            config[OFFSET_MOTION_SYNC] = u8::from(target_ms);
+        }
+        if let Some(target_ang) = settings.angle_snapping {
+            config[OFFSET_ANGLE_SNAPPING] = u8::from(target_ang);
+        }
+        if let Some(target_rip) = settings.ripple_control {
+            config[OFFSET_RIPPLE_CONTROL] = u8::from(target_rip);
         }
 
         if config == before {

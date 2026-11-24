@@ -24,8 +24,8 @@ use std::collections::HashSet;
 use hidapi::{HidApi, HidDevice};
 
 use crate::devices::{
-    DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice, MouseSettings,
-    SupportTier, WriteMode,
+    BatteryStatus, DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice,
+    MouseSettings, SupportTier, WriteMode,
 };
 use crate::error::{PolledError, Result};
 use crate::hid::parse_hid_report_descriptor;
@@ -56,6 +56,9 @@ const HIDPP10_ERR_RESOURCE_ERROR: u8 = 0x09;
 // --- HID++ 2.0 Feature IDs (`libratbag/src/hidpp20.h` & `Solaar/hidpp20_constants.py`) ---
 pub const FEATURE_ROOT: u16 = 0x0000;
 pub const FEATURE_DEVICE_NAME: u16 = 0x0005;
+pub const FEATURE_BATTERY_STATUS: u16 = 0x1000;
+pub const FEATURE_BATTERY_VOLTAGE: u16 = 0x1001;
+pub const FEATURE_UNIFIED_BATTERY: u16 = 0x1004;
 pub const FEATURE_ADJUSTABLE_DPI: u16 = 0x2201;
 pub const FEATURE_EXTENDED_ADJUSTABLE_DPI: u16 = 0x2202;
 pub const FEATURE_REPORT_RATE: u16 = 0x8060;
@@ -319,6 +322,44 @@ enum ReportRateFeature {
     Extended8061 { feature_idx: u8 },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum BatteryFeature {
+    Unified1004 { feature_idx: u8 },
+    Status1000 { feature_idx: u8 },
+    Voltage1001 { feature_idx: u8 },
+}
+
+/// Estimates Li-ion battery percentage from Logitech `0x1001` millivolt reading.
+pub fn estimate_logitech_battery_pct(mv: u16) -> u8 {
+    const CURVE: &[(u16, u8)] = &[
+        (4186, 100),
+        (4067, 90),
+        (3989, 80),
+        (3922, 70),
+        (3859, 60),
+        (3811, 50),
+        (3778, 40),
+        (3751, 30),
+        (3717, 20),
+        (3671, 10),
+        (3646, 5),
+        (3500, 0),
+    ];
+    if mv >= CURVE[0].0 {
+        return 100;
+    }
+    for win in CURVE.windows(2) {
+        let (hi_v, hi_p) = win[0];
+        let (lo_v, lo_p) = win[1];
+        if mv >= lo_v {
+            let num = u32::from(mv - lo_v) * u32::from(hi_p - lo_p);
+            let den = u32::from(hi_v - lo_v).max(1);
+            return (u32::from(lo_p) + (num + den / 2) / den).min(100) as u8;
+        }
+    }
+    0
+}
+
 fn slugify_id(name: &str, vid: u16, pid: u16, device_idx: u8) -> String {
     let mut slug = String::from("logitech_");
     let mut prev_us = true;
@@ -349,6 +390,7 @@ pub struct Hidpp20Device {
     connection: String,
     dpi_feature: DpiFeature,
     rate_feature: Option<ReportRateFeature>,
+    battery_feature: Option<BatteryFeature>,
     onboard_profiles_idx: Option<u8>,
     dpi_range: ParsedDpiRange,
     polling_rates_hz: Vec<u16>,
@@ -515,8 +557,55 @@ impl MouseDevice for Hidpp20Device {
             supports_debounce: false,
             debounce_min_ms: 0,
             debounce_max_ms: 0,
+            supports_motion_sync: false,
+            supports_angle_snapping: false,
+            supports_ripple_control: false,
             supports_volatile_writes: true,
             flash_write_warning: None,
+        }
+    }
+
+    fn read_battery(&mut self) -> Option<BatteryStatus> {
+        match self.battery_feature? {
+            BatteryFeature::Unified1004 { feature_idx } => {
+                let reply = self.request(feature_idx, 0x10, &[]).ok()?;
+                let pct = reply[4];
+                if pct > 100 {
+                    return None;
+                }
+                let charging = matches!(reply[6], 1..=3);
+                Some(BatteryStatus {
+                    percent: pct,
+                    charging,
+                    voltage_mv: None,
+                })
+            }
+            BatteryFeature::Status1000 { feature_idx } => {
+                let reply = self.request(feature_idx, 0x00, &[]).ok()?;
+                let pct = reply[4];
+                if pct > 100 {
+                    return None;
+                }
+                let charging = matches!(reply[6], 1..=4);
+                Some(BatteryStatus {
+                    percent: pct,
+                    charging,
+                    voltage_mv: None,
+                })
+            }
+            BatteryFeature::Voltage1001 { feature_idx } => {
+                let reply = self.request(feature_idx, 0x00, &[]).ok()?;
+                let mv = u16::from_be_bytes([reply[4], reply[5]]);
+                if mv == 0 {
+                    return None;
+                }
+                let flags = reply[6];
+                Some(BatteryStatus {
+                    percent: estimate_logitech_battery_pct(mv),
+                    charging: (flags & 0x80) != 0,
+                    voltage_mv: Some(mv),
+                })
+            }
         }
     }
 
@@ -527,7 +616,7 @@ impl MouseDevice for Hidpp20Device {
             dpi: Some(dpi),
             polling_rate_hz,
             lod,
-            debounce_ms: None,
+            ..Default::default()
         })
     }
 
@@ -825,6 +914,16 @@ fn probe_slot_device(
         (None, Vec::new())
     };
 
+    let battery_feature =
+        if let Some(idx) = root_get_feature_idx(&hid, device_idx, FEATURE_UNIFIED_BATTERY) {
+            Some(BatteryFeature::Unified1004 { feature_idx: idx })
+        } else if let Some(idx) = root_get_feature_idx(&hid, device_idx, FEATURE_BATTERY_STATUS) {
+            Some(BatteryFeature::Status1000 { feature_idx: idx })
+        } else {
+            root_get_feature_idx(&hid, device_idx, FEATURE_BATTERY_VOLTAGE)
+                .map(|idx| BatteryFeature::Voltage1001 { feature_idx: idx })
+        };
+
     let onboard_profiles_idx = root_get_feature_idx(&hid, device_idx, FEATURE_ONBOARD_PROFILES);
 
     let name = read_device_name(&hid, device_idx)
@@ -850,6 +949,7 @@ fn probe_slot_device(
         connection,
         dpi_feature,
         rate_feature,
+        battery_feature,
         onboard_profiles_idx,
         dpi_range,
         polling_rates_hz,

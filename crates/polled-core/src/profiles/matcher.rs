@@ -59,6 +59,7 @@ mod tests {
             },
             device_overrides: BTreeMap::new(),
             windows_pointer_speed: None,
+            windows_power_plan: None,
             author: None,
             notes: None,
         });
@@ -73,6 +74,7 @@ mod tests {
             },
             device_overrides: BTreeMap::new(),
             windows_pointer_speed: None,
+            windows_power_plan: None,
             author: None,
             notes: None,
         });

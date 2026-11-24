@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use hidapi::{HidApi, HidDevice};
 
 use crate::devices::{
-    DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice, MouseSettings,
-    SupportTier, WriteMode,
+    BatteryStatus, DeviceCapabilities, DeviceDriver, DeviceInfo, LiftOffDistance, MouseDevice,
+    MouseSettings, SupportTier, WriteMode,
 };
 use crate::error::{PolledError, Result};
 
@@ -36,11 +36,37 @@ const OUTPUT_PAYLOAD_LEN: usize = 63;
 
 const CMD_DPI: u8 = 16;
 const CMD_POLLING_RATE: u8 = 17;
+const CMD_MOTION_SYNC: u8 = 18;
 const CMD_LOD_ULX: u8 = 21;
 const CMD_LOD_SLX_PAW: u8 = 25;
 const CMD_WAKE_ALL: u8 = 96;
 
 const ULX_POLLING_RATES: &[u16] = &[500, 1000, 2000, 4000, 8000];
+
+/// Finalmouse ULX battery-voltage calibration curve (from OpenMouse / xpanel).
+pub fn finalmouse_battery_percent(millivolts: u16) -> u8 {
+    if millivolts == 0 {
+        return 0;
+    }
+    let v = f64::from(millivolts) / 1000.0;
+    const VOLTAGES: [f64; 7] = [3.0, 3.62, 3.66, 3.74, 3.88, 4.17, 4.38];
+    const PCTS: [f64; 7] = [0.2, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0];
+    if v >= VOLTAGES[6] {
+        return 100;
+    }
+    if v <= VOLTAGES[0] {
+        return 0;
+    }
+    for i in 0..6 {
+        if v >= VOLTAGES[i] && v <= VOLTAGES[i + 1] {
+            let frac = (v - VOLTAGES[i]) / (VOLTAGES[i + 1] - VOLTAGES[i]);
+            return (PCTS[i] + (PCTS[i + 1] - PCTS[i]) * frac)
+                .round()
+                .clamp(0.0, 100.0) as u8;
+        }
+    }
+    0
+}
 
 /// Builds a 64-byte Finalmouse HID output report (`[report_id, 2 + len, 0x80 | cmd, len, payload...]`).
 pub fn build_finalmouse_packet(
@@ -64,6 +90,11 @@ pub struct FinalmouseTelemetry {
     pub polling_rate_hz: Option<u16>,
     pub ulx_lod_mm: Option<u8>,
     pub slx_paw_lod: Option<LiftOffDistance>,
+    pub motion_sync: Option<bool>,
+    pub battery_soc: Option<u8>,
+    pub battery_percent: Option<u8>,
+    pub battery_voltage_mv: Option<u16>,
+    pub charging_state: Option<u8>,
 }
 
 /// Decodes one Finalmouse input report (with leading `report_id` at byte 0).
@@ -94,12 +125,34 @@ pub fn decode_finalmouse_packet(raw: &[u8], out: &mut FinalmouseTelemetry) -> bo
             out.polling_rate_hz = Some(u16::from_le_bytes([payload[0], payload[1]]));
             true
         }
+        5 if payload.len() >= 2 => {
+            let mv = u16::from_le_bytes([payload[0], payload[1]]);
+            out.battery_voltage_mv = Some(mv);
+            out.battery_percent = Some(finalmouse_battery_percent(mv));
+            true
+        }
+        CMD_MOTION_SYNC if !payload.is_empty() => {
+            out.motion_sync = Some(payload[0] == 1);
+            true
+        }
         CMD_LOD_ULX if !payload.is_empty() => {
             out.ulx_lod_mm = Some(payload[0]);
             true
         }
         CMD_LOD_SLX_PAW if !payload.is_empty() => {
             out.slx_paw_lod = decode_slx_paw_lod(payload[0]);
+            true
+        }
+        37 if !payload.is_empty() => {
+            out.charging_state = Some(payload[0]);
+            true
+        }
+        38 if payload.len() >= 3 => {
+            out.battery_soc = Some(payload[0].min(100));
+            let mv = u16::from_le_bytes([payload[1], payload[2]]);
+            if mv > 0 {
+                out.battery_voltage_mv = Some(mv);
+            }
             true
         }
         _ => false,
@@ -227,12 +280,26 @@ impl MouseDevice for FinalmouseDevice {
             supports_debounce: false,
             debounce_min_ms: 0,
             debounce_max_ms: 0,
+            supports_motion_sync: true,
+            supports_angle_snapping: false,
+            supports_ripple_control: false,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
                 self.display_name
             )),
         }
+    }
+
+    fn read_battery(&mut self) -> Option<BatteryStatus> {
+        let t = self.query_telemetry().ok()?;
+        let percent = t.battery_soc.or(t.battery_percent)?;
+        let charging = matches!(t.charging_state, Some(1 | 2));
+        Some(BatteryStatus {
+            percent: percent.min(100),
+            charging,
+            voltage_mv: t.battery_voltage_mv.filter(|&mv| mv > 0),
+        })
     }
 
     fn read_settings(&mut self) -> Result<MouseSettings> {
@@ -251,6 +318,9 @@ impl MouseDevice for FinalmouseDevice {
             polling_rate_hz: t.polling_rate_hz,
             lod,
             debounce_ms: None,
+            motion_sync: t.motion_sync,
+            angle_snapping: None,
+            ripple_control: None,
         })
     }
 
@@ -285,6 +355,11 @@ impl MouseDevice for FinalmouseDevice {
                     };
                     self.send_cmd(CMD_LOD_ULX, &[mm])?;
                 }
+            }
+        }
+        if let Some(target_ms) = settings.motion_sync {
+            if current.motion_sync != Some(target_ms) {
+                self.send_cmd(CMD_MOTION_SYNC, &[u8::from(target_ms)])?;
             }
         }
 

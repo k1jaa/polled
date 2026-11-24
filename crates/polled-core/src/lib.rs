@@ -18,26 +18,29 @@ pub use checks::{
     UndoSummary,
 };
 pub use devices::{
-    detect_hardware_devices, hid_topology_fingerprint, ApplyOutcome, Compx64Device,
+    detect_hardware_devices, hid_topology_fingerprint, ApplyOutcome, BatteryStatus, Compx64Device,
     Compx64ProtocolDriver, CompxDevice, CompxProtocolDriver, DeviceCapabilities, DeviceDriver,
     DeviceInfo, DryRunDevice, EndgameGearOp1Device, EndgameGearOp1ProtocolDriver, FinalmouseDevice,
-    FinalmouseProtocolDriver, Hidpp20Device, Hidpp20ProtocolDriver, LiftOffDistance, MouseDevice,
-    MouseSettings, NinjutsoDevice, NinjutsoProtocolDriver, RazerDevice, RazerProtocolDriver,
-    SafeDeviceController, SupportTier, VaxeeDevice, VaxeeProtocolDriver, WriteMode,
+    FinalmouseProtocolDriver, Hidpp20Device, Hidpp20ProtocolDriver, IncottDevice,
+    IncottProtocolDriver, KeychronDevice, KeychronProtocolDriver, LiftOffDistance, MchoseDevice,
+    MchoseProtocolDriver, MouseDevice, MouseSettings, NinjutsoDevice, NinjutsoProtocolDriver,
+    RazerDevice, RazerProtocolDriver, SafeDeviceController, SupportTier, VaxeeDevice,
+    VaxeeProtocolDriver, WriteMode,
 };
 pub use diagnostics::{
-    format_diagnostic_report, run_timer_jitter_benchmark, ButtonBounceStats, ClickBounceAnalyzer,
-    ClickBounceSnapshot, ClickEventRecord, DiagnosticsSnapshot, DpiCalibrationResult,
-    DpiCalibrator, DpiMeasurementSnapshot, HistogramBin, IntervalSample, MouseButtonKind,
-    PollingAnalyzer, PollingStats, PollingTarget, RawInputCaptureSession, TimerJitterBenchmark,
-    TrackingStats, XyTracePoint, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, STANDARD_RATES_HZ,
+    format_diagnostic_report, format_intervals_csv, render_report_png, run_timer_jitter_benchmark,
+    ButtonBounceStats, ClickBounceAnalyzer, ClickBounceSnapshot, ClickEventRecord,
+    DiagnosticsSnapshot, DpiCalibrationResult, DpiCalibrator, DpiMeasurementSnapshot, HistogramBin,
+    IntervalSample, MouseButtonKind, PollingAnalyzer, PollingStats, PollingTarget,
+    RawInputCaptureSession, TimerJitterBenchmark, TrackingStats, XyTracePoint, BOUNCE_THRESHOLD_MS,
+    HISTOGRAM_BASE_BINS, STANDARD_RATES_HZ,
 };
 pub use error::{PolledError, Result};
 pub use hid::{dump_hid_devices, HidDeviceDump, HidDumpReport};
 pub use paths::AppPaths;
 pub use profiles::{
     export_profile_json, import_profile_json, match_profile, normalize_exe_name, FocusDebouncer,
-    FocusEvent, ForegroundWatcher, GameProfile, ProfileCardExport, ProfileStore,
+    FocusEvent, ForegroundWatcher, GameProfile, PowerPlanPreset, ProfileCardExport, ProfileStore,
 };
 pub use settings::{
     format_autostart_command, is_autostart_enabled, set_autostart_enabled, AppSettings,

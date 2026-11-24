@@ -13,9 +13,11 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::checks::power_plan::{GUID_BALANCED, GUID_HIGH_PERFORMANCE, GUID_ULTIMATE_PERFORMANCE};
 use crate::checks::snapshot::write_json_atomic;
 use crate::devices::{LiftOffDistance, MouseSettings};
 use crate::error::{PolledError, Result};
+use crate::win::PowerSchemeInfo;
 
 pub use debouncer::FocusDebouncer;
 pub use matcher::{match_profile, normalize_exe_name};
@@ -24,6 +26,52 @@ pub use watcher::{FocusEvent, ForegroundWatcher};
 pub const PROFILES_SCHEMA_VERSION: u32 = 1;
 pub const PROFILE_EXPORT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_DEBOUNCE_MS: u64 = 1500;
+
+/// Optional Windows power plan preset tied to a game or desktop profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerPlanPreset {
+    Balanced,
+    HighPerformance,
+    UltimatePerformance,
+}
+
+impl PowerPlanPreset {
+    pub const ALL: [PowerPlanPreset; 3] = [
+        PowerPlanPreset::Balanced,
+        PowerPlanPreset::HighPerformance,
+        PowerPlanPreset::UltimatePerformance,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PowerPlanPreset::Balanced => "Balanced",
+            PowerPlanPreset::HighPerformance => "High Performance",
+            PowerPlanPreset::UltimatePerformance => "Ultimate Performance",
+        }
+    }
+
+    /// Resolves this preset to an installed Windows power scheme on the current host.
+    /// Returns `None` gracefully if the scheme does not exist (e.g., Modern Standby laptops
+    /// that only expose Balanced).
+    pub fn resolve_scheme(self, schemes: &[PowerSchemeInfo]) -> Option<&PowerSchemeInfo> {
+        let (target_guid, name_match) = match self {
+            PowerPlanPreset::Balanced => (GUID_BALANCED, "balanced"),
+            PowerPlanPreset::HighPerformance => (GUID_HIGH_PERFORMANCE, "high performance"),
+            PowerPlanPreset::UltimatePerformance => {
+                (GUID_ULTIMATE_PERFORMANCE, "ultimate performance")
+            }
+        };
+        schemes
+            .iter()
+            .find(|s| s.guid.eq_ignore_ascii_case(target_guid))
+            .or_else(|| {
+                schemes
+                    .iter()
+                    .find(|s| s.name.to_ascii_lowercase().contains(name_match))
+            })
+    }
+}
 
 /// Single peripheral profile targeting either specific game executables or the default desktop.
 ///
@@ -44,11 +92,14 @@ pub struct GameProfile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub device_overrides: BTreeMap<String, MouseSettings>,
     /// Optional Windows pointer speed override (`1..=20`, where `10` = 6/11 1.0x).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows_pointer_speed: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional Windows power plan preset switched automatically when this profile activates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_power_plan: Option<PowerPlanPreset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
 
@@ -64,9 +115,11 @@ impl GameProfile {
                 polling_rate_hz: Some(1000),
                 lod: Some(LiftOffDistance::Mm10),
                 debounce_ms: Some(4),
+                ..Default::default()
             },
             device_overrides: BTreeMap::new(),
             windows_pointer_speed: Some(10),
+            windows_power_plan: None,
             author: None,
             notes: Some("Fallback profile used whenever no game profile matches.".to_string()),
         }
@@ -233,6 +286,9 @@ mod tests {
                 polling_rate_hz: Some(4000),
                 lod: Some(LiftOffDistance::Mm07),
                 debounce_ms: Some(1),
+                motion_sync: Some(false),
+                angle_snapping: Some(false),
+                ripple_control: Some(false),
             },
             device_overrides: BTreeMap::from([(
                 "lamzu_compx_4k".to_string(),
@@ -241,9 +297,11 @@ mod tests {
                     polling_rate_hz: Some(4000),
                     lod: Some(LiftOffDistance::Mm10),
                     debounce_ms: Some(2),
+                    ..Default::default()
                 },
             )]),
             windows_pointer_speed: Some(10),
+            windows_power_plan: Some(PowerPlanPreset::HighPerformance),
             author: Some("k1jaa".to_string()),
             notes: Some("Tournament config".to_string()),
         });
@@ -252,6 +310,10 @@ mod tests {
         let loaded = ProfileStore::load_or_default(&path).unwrap();
         assert_eq!(loaded.profiles.len(), 2);
         assert_eq!(loaded.profiles[1].executables, vec!["cs2.exe"]);
+        assert_eq!(
+            loaded.profiles[1].windows_power_plan,
+            Some(PowerPlanPreset::HighPerformance)
+        );
         let (lamzu, is_override) = loaded.profiles[1].settings_for_device("lamzu_compx_4k");
         assert!(is_override);
         assert_eq!(lamzu.lod, Some(LiftOffDistance::Mm10));
@@ -260,6 +322,7 @@ mod tests {
             loaded.profiles[1].settings_for_device("pulsar_x2_crazylight_wireless");
         assert!(!is_override_pulsar);
         assert_eq!(pulsar.lod, Some(LiftOffDistance::Mm07));
+        assert_eq!(pulsar.motion_sync, Some(false));
     }
 
     #[test]
@@ -274,9 +337,11 @@ mod tests {
                 polling_rate_hz: Some(4000),
                 lod: Some(LiftOffDistance::Mm07),
                 debounce_ms: Some(0),
+                ..Default::default()
             },
             device_overrides: BTreeMap::new(),
             windows_pointer_speed: None,
+            windows_power_plan: None,
             author: Some("k1jaa".to_string()),
             notes: Some("Low LOD + 4K".to_string()),
         };

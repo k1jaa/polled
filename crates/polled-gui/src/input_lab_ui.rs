@@ -5,17 +5,21 @@
 //! Plain monochrome Black & White UI for the live Input Lab diagnostics tab.
 //! Only the four semantic statuses (`OK`, `INFO`, `WARN`, `BAD`) carry chroma.
 
+use std::fs;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 
+use chrono::Local;
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Stroke, TextFormat,
     Vec2,
 };
 use polled_core::{
-    format_diagnostic_report, run_timer_jitter_benchmark, DiagnosticsSnapshot, PollingStats,
-    PollingTarget, RawInputCaptureSession, Severity, TimerJitterBenchmark, TrackingStats,
-    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, STANDARD_RATES_HZ,
+    format_diagnostic_report, format_intervals_csv, render_report_png, run_timer_jitter_benchmark,
+    AppPaths, DiagnosticsSnapshot, PollingStats, PollingTarget, RawInputCaptureSession, Severity,
+    TimerJitterBenchmark, TrackingStats, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS,
+    STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
@@ -261,7 +265,7 @@ impl InputLabUiState {
                 ui.set_max_width(scroll_w);
 
                 // --- 1. CONTROL & LIVE SUMMARY CARD ---
-                self.render_controls_card(ctx, ui, p, scroll_w, detected_dpi);
+                self.render_controls_card(ctx, ui, p, mode, scroll_w, detected_dpi);
 
                 if let Some((sev, msg)) = self.notice.clone() {
                     ui.add_space(8.0);
@@ -316,6 +320,7 @@ impl InputLabUiState {
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         p: Palette,
+        mode: ThemeMode,
         card_w: f32,
         detected_dpi: Option<u16>,
     ) {
@@ -324,16 +329,20 @@ impl InputLabUiState {
         let mut toggle_capture = false;
         let mut do_reset = false;
         let mut do_copy = false;
+        let mut do_save_png = false;
+        let mut do_save_csv = false;
+        let mut do_open_exports = false;
         let mut next_target = self.target;
         let mut dpi_val = self.configured_dpi;
         let mut dpi_changed = false;
 
         card_frame(ui, p, card_w, |ui| {
-            let split = inner_w < 740.0;
+            let split = inner_w < 960.0;
             let has_data = self.last_snapshot.polling.total_motion_packets > 0
                 || self.last_snapshot.clicks.total_presses > 0
                 || self.last_snapshot.dpi_measurement.packet_count > 0
                 || self.timer_benchmark.is_some();
+            let has_samples = !self.last_snapshot.polling.recent_samples.is_empty();
 
             let draw_primary_actions =
                 |ui: &mut egui::Ui, toggle_capture: &mut bool, do_reset: &mut bool| {
@@ -355,7 +364,10 @@ impl InputLabUiState {
                  next_target: &mut PollingTarget,
                  dpi_val: &mut u32,
                  dpi_changed: &mut bool,
-                 do_copy: &mut bool| {
+                 do_copy: &mut bool,
+                 do_save_png: &mut bool,
+                 do_save_csv: &mut bool,
+                 do_open_exports: &mut bool| {
                     ui.label(RichText::new("Target:").color(p.text_muted).size(12.0));
                     egui::ComboBox::from_id_salt("input_lab_target_hz")
                         .selected_text(next_target.label())
@@ -396,6 +408,27 @@ impl InputLabUiState {
                     {
                         *do_copy = true;
                     }
+                    if ui
+                        .add_enabled(has_data, secondary_btn("Save PNG", p))
+                        .on_hover_text("Export a shareable 960x560 monochrome benchmark card PNG")
+                        .clicked()
+                    {
+                        *do_save_png = true;
+                    }
+                    if ui
+                        .add_enabled(has_samples, secondary_btn("Save CSV", p))
+                        .on_hover_text("Export raw per-packet polling intervals and speeds as CSV")
+                        .clicked()
+                    {
+                        *do_save_csv = true;
+                    }
+                    if ui
+                        .add(secondary_btn("Exports", p))
+                        .on_hover_text("Open %LOCALAPPDATA%\\Polled\\exports in File Explorer")
+                        .clicked()
+                    {
+                        *do_open_exports = true;
+                    }
                 };
 
             if split {
@@ -424,6 +457,9 @@ impl InputLabUiState {
                         &mut dpi_val,
                         &mut dpi_changed,
                         &mut do_copy,
+                        &mut do_save_png,
+                        &mut do_save_csv,
+                        &mut do_open_exports,
                     );
                 });
             } else {
@@ -436,6 +472,9 @@ impl InputLabUiState {
                         &mut dpi_val,
                         &mut dpi_changed,
                         &mut do_copy,
+                        &mut do_save_png,
+                        &mut do_save_csv,
+                        &mut do_open_exports,
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (status_text, status_col) = if capturing {
@@ -541,6 +580,71 @@ impl InputLabUiState {
                 Severity::Ok,
                 "Copied Input Lab diagnostic report to clipboard.".to_string(),
             ));
+        }
+        if do_save_png {
+            let dir = AppPaths::default_user_dir().exports_dir();
+            let ruler_in = (self.last_snapshot.dpi_measurement.packet_count > 0)
+                .then(|| self.ruler_unit.to_inches(self.ruler_distance));
+            let png = render_report_png(
+                &self.last_snapshot,
+                self.configured_dpi,
+                ruler_in,
+                self.timer_benchmark.as_ref(),
+                matches!(mode, ThemeMode::Dark),
+            );
+            let filename = format!("polled_lab_{}.png", Local::now().format("%Y%m%d_%H%M%S"));
+            let path = dir.join(filename);
+            match fs::create_dir_all(&dir).and_then(|()| fs::write(&path, &png)) {
+                Ok(()) => {
+                    self.notice = Some((
+                        Severity::Ok,
+                        format!("Saved PNG benchmark card to {}", path.display()),
+                    ));
+                }
+                Err(err) => {
+                    self.notice = Some((Severity::Bad, format!("Failed to save PNG: {err}")));
+                }
+            }
+        }
+        if do_save_csv {
+            let dir = AppPaths::default_user_dir().exports_dir();
+            let csv = format_intervals_csv(&self.last_snapshot, self.configured_dpi);
+            let filename = format!("polled_lab_{}.csv", Local::now().format("%Y%m%d_%H%M%S"));
+            let path = dir.join(filename);
+            match fs::create_dir_all(&dir).and_then(|()| fs::write(&path, csv)) {
+                Ok(()) => {
+                    self.notice = Some((
+                        Severity::Ok,
+                        format!(
+                            "Saved {} interval samples to {}",
+                            self.last_snapshot.polling.recent_samples.len(),
+                            path.display()
+                        ),
+                    ));
+                }
+                Err(err) => {
+                    self.notice = Some((Severity::Bad, format!("Failed to save CSV: {err}")));
+                }
+            }
+        }
+        if do_open_exports {
+            let dir = AppPaths::default_user_dir().exports_dir();
+            if let Err(err) = fs::create_dir_all(&dir) {
+                self.notice = Some((
+                    Severity::Bad,
+                    format!("Failed to create exports directory: {err}"),
+                ));
+            } else {
+                #[cfg(windows)]
+                {
+                    if let Err(err) = Command::new("explorer.exe").arg(&dir).spawn() {
+                        self.notice = Some((
+                            Severity::Bad,
+                            format!("Could not open File Explorer: {err}"),
+                        ));
+                    }
+                }
+            }
         }
     }
 
