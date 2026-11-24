@@ -4,6 +4,7 @@
 
 pub mod checks;
 pub mod devices;
+pub mod diagnostics;
 pub mod error;
 pub mod hid;
 pub mod paths;
@@ -20,6 +21,12 @@ pub use devices::{
     CompxProtocolDriver, DeviceCapabilities, DeviceDriver, DeviceInfo, DryRunDevice, Hidpp20Device,
     Hidpp20ProtocolDriver, LiftOffDistance, MouseDevice, MouseSettings, SafeDeviceController,
     SupportTier, WriteMode,
+};
+pub use diagnostics::{
+    format_diagnostic_report, run_timer_jitter_benchmark, ButtonBounceStats, ClickBounceAnalyzer,
+    ClickBounceSnapshot, ClickEventRecord, DiagnosticsSnapshot, MouseButtonKind, PollingAnalyzer,
+    PollingStats, PollingTarget, RawInputCaptureSession, TimerJitterBenchmark, BOUNCE_THRESHOLD_MS,
+    STANDARD_RATES_HZ,
 };
 pub use error::{PolledError, Result};
 pub use hid::{dump_hid_devices, HidDeviceDump, HidDumpReport};

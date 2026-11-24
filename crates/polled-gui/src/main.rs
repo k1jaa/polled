@@ -8,6 +8,7 @@
 mod app;
 mod elevation;
 mod icon;
+mod input_lab_ui;
 mod notifications;
 mod profile_runtime;
 mod profiles_ui;

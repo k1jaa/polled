@@ -1,9 +1,10 @@
 # Polled
 
-A small, fast Windows 10/11 tray utility that does two things:
+A small, fast Windows 10/11 tray utility that does three things:
 
-1. **Input Health Check** — audits Windows settings that affect mouse input and responsiveness (pointer acceleration, pointer speed, USB selective suspend & hub power saving, PCIe ASPM, timer wake jitter, monitor refresh rate, Game Bar capture, accessibility shortcuts, power plan, etc.) with one-click fixes and full undo.
+1. **Input Health Check** — audits 17 Windows settings that affect mouse input and responsiveness (pointer acceleration, pointer speed, USB selective suspend & hub power saving, PCIe ASPM, timer wake jitter, monitor refresh rate, Game Bar capture, accessibility shortcuts, power plan, etc.) with one-click fixes and full undo.
 2. **Per-Game Mouse Profiles** — automatically switches DPI, polling rate, lift-off distance, and debounce when a game takes focus, then restores your desktop settings when you tab out.
+3. **Input Lab** — measures real-time raw-input polling consistency up to 8,000 Hz (wireless gaps, bunched bursts, interval jitter graph), tests mouse switch double-click bounce, and runs an on-demand 1-second OS timer jitter benchmark.
 
 - **Lightweight & local:** Pure Rust tray app (~6 MB, no WebView2/Electron, no account, no telemetry, no cloud).
 - **Safe & reversible:** Original Windows settings are saved before any change. Click **Undo All** anytime to restore everything. Never touches device firmware.

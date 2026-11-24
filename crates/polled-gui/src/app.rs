@@ -15,6 +15,7 @@ use polled_core::{
 };
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
+use crate::input_lab_ui::InputLabUiState;
 use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
 use crate::profile_runtime::{ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::profiles_ui::ProfilesUiState;
@@ -26,6 +27,7 @@ use crate::tray::{find_own_main_hwnd, TrayController};
 enum ActiveView {
     HealthCheck,
     Profiles,
+    InputLab,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +85,7 @@ pub struct PolledApp {
 
     profiles_ui: ProfilesUiState,
     profile_runtime: ProfileRuntimeHandle,
+    input_lab_ui: InputLabUiState,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -147,6 +150,7 @@ impl PolledApp {
             pending_elevation: None,
             profiles_ui,
             profile_runtime,
+            input_lab_ui: InputLabUiState::new(),
             tx,
             rx,
             main_hwnd,
@@ -546,6 +550,7 @@ impl eframe::App for PolledApp {
         if ctx.input(|i| i.viewport().close_requested())
             && !self.quit_requested.load(Ordering::SeqCst)
         {
+            self.input_lab_ui.stop_capture();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -663,6 +668,20 @@ impl eframe::App for PolledApp {
                         self.active_view = ActiveView::Profiles;
                     }
 
+                    let lab_label = if self.input_lab_ui.is_capturing() {
+                        "Input Lab ●"
+                    } else {
+                        "Input Lab"
+                    };
+                    let lab_btn = if self.active_view == ActiveView::InputLab {
+                        primary_button(lab_label, p)
+                    } else {
+                        secondary_button(lab_label, p)
+                    };
+                    if ui.add(lab_btn).clicked() {
+                        self.active_view = ActiveView::InputLab;
+                    }
+
                     if self.active_view == ActiveView::HealthCheck {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let undo_count = undoable_set.len();
@@ -743,6 +762,10 @@ impl eframe::App for PolledApp {
                 if self.active_view == ActiveView::Profiles {
                     self.profiles_ui
                         .render(ctx, ui, p, mode, &self.profile_runtime);
+                    return;
+                }
+                if self.active_view == ActiveView::InputLab {
+                    self.input_lab_ui.render(ctx, ui, p, mode);
                     return;
                 }
 
@@ -1121,20 +1144,30 @@ impl eframe::App for PolledApp {
                     } else {
                         "Disabled Start with Windows (removed HKCU\\...\\Run entry).".to_string()
                     };
-                    if self.active_view == ActiveView::Profiles {
-                        self.profiles_ui.notice = Some((Severity::Ok, msg));
-                    } else {
-                        self.status_message = Some(msg);
-                        self.error_message = None;
+                    match self.active_view {
+                        ActiveView::Profiles => {
+                            self.profiles_ui.notice = Some((Severity::Ok, msg));
+                        }
+                        ActiveView::InputLab => {
+                            self.input_lab_ui.notice = Some((Severity::Ok, msg));
+                        }
+                        ActiveView::HealthCheck => {
+                            self.status_message = Some(msg);
+                            self.error_message = None;
+                        }
                     }
                 }
-                Err(err) => {
-                    if self.active_view == ActiveView::Profiles {
+                Err(err) => match self.active_view {
+                    ActiveView::Profiles => {
                         self.profiles_ui.notice = Some((Severity::Bad, err));
-                    } else {
+                    }
+                    ActiveView::InputLab => {
+                        self.input_lab_ui.notice = Some((Severity::Bad, err));
+                    }
+                    ActiveView::HealthCheck => {
                         self.error_message = Some(err);
                     }
-                }
+                },
             }
         }
 
