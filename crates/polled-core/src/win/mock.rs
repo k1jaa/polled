@@ -8,8 +8,9 @@ use std::sync::Mutex;
 use crate::error::{PolledError, Result};
 use crate::win::{
     AccessibilityKind, AudioEndpointInfo, AudioFlow, DisplayModeInfo, MouseAccelParams,
-    PowerSchemeInfo, PowerValueIndex, ProcessSample, RegHive, SystemEnv, TimerResolutionSample,
-    UsbControllerInfo, UsbMouseTopology, UsbPowerDevice, WindowsVersion,
+    NetworkAdapterInfo, NetworkAdapterKind, PowerSchemeInfo, PowerValueIndex, ProcessSample,
+    RegHive, SystemEnv, TimerResolutionSample, UsbControllerInfo, UsbMouseTopology, UsbPowerDevice,
+    WindowsVersion,
 };
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ struct MockState {
     usb_controllers: Vec<UsbControllerInfo>,
     usb_topology: Vec<UsbMouseTopology>,
     audio_endpoints: Vec<AudioEndpointInfo>,
+    network_adapters: Vec<NetworkAdapterInfo>,
     require_elevation_for_power_writes: bool,
 }
 
@@ -132,6 +134,19 @@ impl Default for MockState {
                     is_bluetooth_hands_free: false,
                 },
             ],
+            network_adapters: vec![NetworkAdapterInfo {
+                name: "Ethernet".to_string(),
+                description: "Realtek PCIe 2.5GbE Family Controller".to_string(),
+                adapter_guid: "{mock-nic-1}".to_string(),
+                kind: NetworkAdapterKind::Ethernet,
+                is_primary: true,
+                link_speed_mbps: 1000,
+                ipv4_address: Some("192.168.1.42".to_string()),
+                gateway_ipv4: Some("192.168.1.1".to_string()),
+                dns_servers: vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()],
+                latency_flags: Vec::new(),
+                nagle_disabled: false,
+            }],
             require_elevation_for_power_writes: false,
         }
     }
@@ -192,6 +207,10 @@ impl MockEnv {
 
     pub fn set_audio_endpoints(&self, endpoints: Vec<AudioEndpointInfo>) {
         self.state.lock().unwrap().audio_endpoints = endpoints;
+    }
+
+    pub fn set_network_adapters(&self, adapters: Vec<NetworkAdapterInfo>) {
+        self.state.lock().unwrap().network_adapters = adapters;
     }
 
     pub fn set_require_elevation_for_power_writes(&self, required: bool) {
@@ -498,5 +517,9 @@ impl SystemEnv for MockEnv {
             ep.volume_percent = Some(percent.min(100));
         }
         Ok(())
+    }
+
+    fn list_network_adapters(&self) -> Result<Vec<NetworkAdapterInfo>> {
+        Ok(self.state.lock().unwrap().network_adapters.clone())
     }
 }

@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 use crate::checks::{CheckReport, Severity};
-use crate::win::{AudioLatencyBenchmark, UsbMouseTopology};
+use crate::win::{AudioLatencyBenchmark, NetworkJitterBenchmark, UsbMouseTopology};
 
 /// Maximum interval (in microseconds) treated as continuous mouse motion rather than a user pause.
 /// Any gap longer than 40 ms resets the continuous streak instead of counting as a dropout.
@@ -447,13 +447,14 @@ pub struct DiagnosticAdvice {
     pub action_target: Option<String>,
 }
 
-/// Builds prioritized, actionable fix suggestions whenever Input Lab detects degraded polling,
-/// switch bounce, keyboard chatter, USB hub contention, timer spikes, or WASAPI audio glitches.
+/// Builds prioritized, actionable fix suggestions whenever Bench detects degraded polling,
+/// switch bounce, keyboard chatter, USB hub contention, timer spikes, WASAPI glitches, or network jitter.
 pub fn build_diagnostic_advice(
     snap: &DiagnosticsSnapshot,
     configured_dpi: u32,
     timer: Option<&TimerJitterBenchmark>,
     audio: Option<&AudioLatencyBenchmark>,
+    network: Option<&NetworkJitterBenchmark>,
     usb_topology: &[UsbMouseTopology],
     health_checks: &[CheckReport],
 ) -> Vec<DiagnosticAdvice> {
@@ -462,7 +463,8 @@ pub fn build_diagnostic_advice(
     let polling_bad = matches!(p.health_severity, Some(Severity::Warn | Severity::Bad));
     let timer_bad = timer.is_some_and(|t| t.severity >= Severity::Warn);
     let audio_bad = audio.is_some_and(|a| a.severity >= Severity::Warn);
-    let any_latency_issue = polling_bad || timer_bad || audio_bad;
+    let network_bad = network.is_some_and(|n| n.severity >= Severity::Warn);
+    let any_latency_issue = polling_bad || timer_bad || audio_bad || network_bad;
 
     // 1. Live USB Port & Hub Topology cross-check (highest impact for 2K/4K/8K mice).
     if p.total_motion_packets > 0 || any_latency_issue {
@@ -522,6 +524,8 @@ pub fn build_diagnostic_advice(
             "vendor_software",
             "audio_enhancements",
             "audio_format",
+            "network_connection",
+            "network_nic_power",
         ];
         let mut fixable_names: Vec<&str> = Vec::new();
         let mut manual_names: Vec<&str> = Vec::new();
@@ -708,6 +712,23 @@ pub fn build_diagnostic_advice(
                     a.glitch_count, a.max_ms
                 ),
                 detail: "Disable Windows Audio Enhancements (APO), set both playback and microphone to 48000 Hz, avoid Bluetooth Hands-Free (HFP), and keep USB audio DACs on a separate USB root hub from 4K/8K mice or webcams.".to_string(),
+                action_target: Some("health_check".to_string()),
+            });
+        }
+    }
+
+    // 8. Dual-Hop Network Jitter / Packet Loss.
+    if let Some(net) = network {
+        if net.severity >= Severity::Warn {
+            advice.push(DiagnosticAdvice {
+                severity: net.severity,
+                category: "Network".to_string(),
+                title: format!(
+                    "Fix network ping jitter / loss ({:.1} ms jitter, {:.0}% loss)",
+                    net.internet.jitter_ms.unwrap_or(0.0),
+                    net.internet.loss_pct
+                ),
+                detail: net.diagnosis.clone(),
                 action_target: Some("health_check".to_string()),
             });
         }
@@ -1953,7 +1974,7 @@ mod tests {
             requires_reboot: false,
         }];
 
-        let advice = build_diagnostic_advice(&snap, 800, None, None, &topo, &checks);
+        let advice = build_diagnostic_advice(&snap, 800, None, None, None, &topo, &checks);
         assert!(advice
             .iter()
             .any(|a| a.detail.contains("Focusrite USB Audio")));

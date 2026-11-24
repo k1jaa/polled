@@ -25,7 +25,7 @@ pub use export::{format_intervals_csv, render_ab_comparison_png, render_report_p
 pub use raw_capture::RawInputCaptureSession;
 
 use crate::error::Result;
-use crate::win::AudioLatencyBenchmark;
+use crate::win::{AudioLatencyBenchmark, NetworkJitterBenchmark};
 
 /// Runs an on-demand 1-second Windows 1 ms timer jitter benchmark (non-elevated, RAII cleanup).
 pub fn run_timer_jitter_benchmark(duration_ms: u64) -> Result<TimerJitterBenchmark> {
@@ -98,5 +98,76 @@ pub fn format_audio_benchmark_summary(bench: &AudioLatencyBenchmark) -> String {
         bench.max_ms,
         bench.glitch_count,
         bench.severity.as_str().to_uppercase(),
+    )
+}
+
+/// Runs an on-demand dual-hop ICMP ping jitter & packet-loss probe (local gateway + target IPv4).
+pub fn run_network_jitter_benchmark(
+    target_ip: &str,
+    count: usize,
+    interval_ms: u64,
+) -> Result<NetworkJitterBenchmark> {
+    #[cfg(windows)]
+    {
+        crate::win::network::measure_network_jitter_benchmark(target_ip, count, interval_ms)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (target_ip, count, interval_ms);
+        Ok(NetworkJitterBenchmark {
+            adapter_name: "Unavailable (non-Windows)".to_string(),
+            adapter_kind: crate::win::NetworkAdapterKind::Other,
+            elapsed_ms: 0.0,
+            gateway: None,
+            internet: crate::win::PingHopStats {
+                label: "Internet Target".to_string(),
+                target_ip: target_ip.to_string(),
+                sent: 0,
+                received: 0,
+                lost: 0,
+                loss_pct: 0.0,
+                samples_ms: Vec::new(),
+                min_ms: None,
+                median_ms: None,
+                p95_ms: None,
+                max_ms: None,
+                jitter_ms: None,
+                severity: crate::checks::Severity::Info,
+            },
+            diagnosis: "ICMP probe is only available on Windows.".to_string(),
+            severity: crate::checks::Severity::Info,
+        })
+    }
+}
+
+/// Formats a compact plain-text summary block for a dual-hop ICMP network jitter benchmark.
+pub fn format_network_benchmark_summary(bench: &NetworkJitterBenchmark) -> String {
+    let gw_line = match &bench.gateway {
+        Some(g) => format!(
+            "\n- Local Gateway ({}): median {:.2} ms | p95 {:.2} ms | max {:.2} ms | jitter {:.2} ms | loss {:.0}%",
+            g.target_ip,
+            g.median_ms.unwrap_or(0.0),
+            g.p95_ms.unwrap_or(0.0),
+            g.max_ms.unwrap_or(0.0),
+            g.jitter_ms.unwrap_or(0.0),
+            g.loss_pct
+        ),
+        None => String::new(),
+    };
+    let net = &bench.internet;
+    format!(
+        "Dual-Hop Network Ping Benchmark ({}): {}{gw_line}\n\
+         - Internet ({}): median {:.1} ms | p95 {:.1} ms | max {:.1} ms | jitter {:.1} ms | loss {:.0}% [{}]\n\
+         - Diagnosis: {}",
+        bench.adapter_kind.label(),
+        bench.adapter_name,
+        net.target_ip,
+        net.median_ms.unwrap_or(0.0),
+        net.p95_ms.unwrap_or(0.0),
+        net.max_ms.unwrap_or(0.0),
+        net.jitter_ms.unwrap_or(0.0),
+        net.loss_pct,
+        bench.severity.as_str().to_uppercase(),
+        bench.diagnosis,
     )
 }

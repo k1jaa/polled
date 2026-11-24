@@ -19,11 +19,13 @@ use eframe::egui::{
 use polled_core::win::{SystemEnv, UsbMouseTopology, WindowsEnv};
 use polled_core::{
     build_diagnostic_advice, format_advice_summary, format_audio_benchmark_summary,
-    format_diagnostic_report, format_intervals_csv, render_ab_comparison_png, render_report_png,
-    run_audio_latency_benchmark, run_timer_jitter_benchmark, AppPaths, AudioLatencyBenchmark,
-    CheckReport, DiagnosticAdvice, DiagnosticsSnapshot, PinnedBenchmark, PollingStats,
-    PollingTarget, RawInputCaptureSession, Severity, TimerJitterBenchmark, TrackingStats,
-    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, STANDARD_RATES_HZ,
+    format_diagnostic_report, format_intervals_csv, format_network_benchmark_summary,
+    render_ab_comparison_png, render_report_png, run_audio_latency_benchmark,
+    run_network_jitter_benchmark, run_timer_jitter_benchmark, AppPaths, AudioLatencyBenchmark,
+    CheckReport, DiagnosticAdvice, DiagnosticsSnapshot, NetworkJitterBenchmark, PinnedBenchmark,
+    PollingStats, PollingTarget, RawInputCaptureSession, Severity, TimerJitterBenchmark,
+    TrackingStats, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS,
+    STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
@@ -133,6 +135,10 @@ pub struct InputLabUiState {
     audio_benchmark: Option<AudioLatencyBenchmark>,
     audio_running: bool,
     audio_rx: Option<Receiver<Result<AudioLatencyBenchmark, String>>>,
+    network_target_ip: String,
+    network_benchmark: Option<NetworkJitterBenchmark>,
+    network_running: bool,
+    network_rx: Option<Receiver<Result<NetworkJitterBenchmark, String>>>,
     pinned_baseline: Option<PinnedBenchmark>,
     baseline_label: String,
     current_label: String,
@@ -170,6 +176,10 @@ impl InputLabUiState {
             audio_benchmark: None,
             audio_running: false,
             audio_rx: None,
+            network_target_ip: "1.1.1.1".to_string(),
+            network_benchmark: None,
+            network_running: false,
+            network_rx: None,
             pinned_baseline: None,
             baseline_label: "Baseline (A)".to_string(),
             current_label: "Current (B)".to_string(),
@@ -335,6 +345,22 @@ impl InputLabUiState {
         });
     }
 
+    fn start_network_benchmark(&mut self, ctx: &egui::Context) {
+        if self.network_running {
+            return;
+        }
+        self.network_running = true;
+        let target = self.network_target_ip.trim().to_string();
+        let (tx, rx) = mpsc::channel();
+        self.network_rx = Some(rx);
+        let ctx_bg = ctx.clone();
+        std::thread::spawn(move || {
+            let res = run_network_jitter_benchmark(&target, 20, 250).map_err(|e| e.to_string());
+            let _ = tx.send(res);
+            ctx_bg.request_repaint();
+        });
+    }
+
     fn poll_background(&mut self) {
         if let Some(session) = &self.session {
             self.last_snapshot = session.snapshot();
@@ -364,6 +390,20 @@ impl InputLabUiState {
                 match result {
                     Ok(bench) => {
                         self.audio_benchmark = Some(bench);
+                    }
+                    Err(err) => {
+                        self.notice = Some((Severity::Bad, err));
+                    }
+                }
+            }
+        }
+        if let Some(rx) = &self.network_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.network_running = false;
+                self.network_rx = None;
+                match result {
+                    Ok(bench) => {
+                        self.network_benchmark = Some(bench);
                     }
                     Err(err) => {
                         self.notice = Some((Severity::Bad, err));
@@ -463,6 +503,7 @@ impl InputLabUiState {
             self.configured_dpi,
             self.timer_benchmark.as_ref(),
             self.audio_benchmark.as_ref(),
+            self.network_benchmark.as_ref(),
             self.usb_topology.as_deref().unwrap_or(&[]),
             health_checks,
         );
@@ -572,8 +613,32 @@ impl InputLabUiState {
 
                 ui.add_space(10.0);
 
-                // --- 6. WASAPI AUDIO ENGINE LATENCY & WAKE-JITTER BENCHMARK ---
-                self.render_audio_benchmark_card(ctx, ui, p, mode, scroll_w);
+                // --- 6. WASAPI AUDIO & DUAL-HOP NETWORK PING BENCHMARKS ---
+                if scroll_w < 760.0 {
+                    self.render_audio_benchmark_card(ctx, ui, p, mode, scroll_w);
+                    ui.add_space(10.0);
+                    self.render_network_benchmark_card(ctx, ui, p, mode, scroll_w);
+                } else {
+                    let gap = 10.0;
+                    let half_w = ((scroll_w - gap) * 0.5).max(260.0);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(half_w, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                self.render_audio_benchmark_card(ctx, ui, p, mode, half_w);
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(half_w, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                self.render_network_benchmark_card(ctx, ui, p, mode, half_w);
+                            },
+                        );
+                    });
+                }
 
                 ui.add_space(4.0);
             });
@@ -623,7 +688,8 @@ impl InputLabUiState {
                 || self.last_snapshot.clicks.total_presses > 0
                 || self.last_snapshot.dpi_measurement.packet_count > 0
                 || self.timer_benchmark.is_some()
-                || self.audio_benchmark.is_some();
+                || self.audio_benchmark.is_some()
+                || self.network_benchmark.is_some();
             let has_samples = !self.last_snapshot.polling.recent_samples.is_empty();
 
             let draw_primary_actions =
@@ -951,6 +1017,10 @@ impl InputLabUiState {
             if let Some(ab) = &self.audio_benchmark {
                 report.push_str("\n\n");
                 report.push_str(&format_audio_benchmark_summary(ab));
+            }
+            if let Some(nb) = &self.network_benchmark {
+                report.push_str("\n\n");
+                report.push_str(&format_network_benchmark_summary(nb));
             }
             if !advice.is_empty() {
                 report.push_str("\n\n");
@@ -2175,6 +2245,134 @@ impl InputLabUiState {
             self.start_audio_benchmark(ctx);
         }
     }
+
+    fn render_network_benchmark_card(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(160.0);
+        let mut trigger_bench = false;
+
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Dual-Hop Network Jitter (5s Ping)")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.network_running {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Probing 5s...")
+                                .size(11.5)
+                                .color(p.text_muted),
+                        );
+                    } else if ui.add(primary_btn("Run 5s Ping", p)).clicked() {
+                        trigger_bench = true;
+                    }
+                });
+            });
+
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Pings your local router gateway and internet target simultaneously (20 rounds via Win32 ICMP, zero admin) to separate local LAN/Wi-Fi spikes from ISP routing jitter.",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
+
+            ui.add_enabled_ui(!self.network_running, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Target IP:").size(11.5).color(p.text_muted));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.network_target_ip)
+                            .desired_width(105.0)
+                            .hint_text("1.1.1.1"),
+                    );
+                    for (ip, label) in [
+                        ("1.1.1.1", "Cloudflare"),
+                        ("8.8.8.8", "Google"),
+                        ("9.9.9.9", "Quad9"),
+                    ] {
+                        let btn = if self.network_target_ip.trim() == ip {
+                            primary_btn(label, p)
+                        } else {
+                            secondary_btn(label, p)
+                        };
+                        if ui.add(btn).clicked() {
+                            self.network_target_ip = ip.to_string();
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(8.0);
+
+            if let Some(bench) = &self.network_benchmark {
+                let mut pills = vec![("LINK".to_string(), bench.adapter_kind.label().to_string())];
+                if let Some(gw) = &bench.gateway {
+                    pills.push((
+                        "GATEWAY".to_string(),
+                        match (gw.median_ms, gw.jitter_ms) {
+                            (Some(m), Some(j)) => format!("{m:.2} ms (jit {j:.2})"),
+                            _ => format!("{:.0}% loss", gw.loss_pct),
+                        },
+                    ));
+                }
+                pills.push((
+                    format!("NET ({})", bench.internet.target_ip),
+                    match (bench.internet.median_ms, bench.internet.p95_ms) {
+                        (Some(m), Some(p95)) => format!("{m:.1} / {p95:.1} ms"),
+                        _ => "Timeout".to_string(),
+                    },
+                ));
+                pills.push((
+                    "JITTER".to_string(),
+                    bench
+                        .internet
+                        .jitter_ms
+                        .map(|j| format!("{j:.1} ms"))
+                        .unwrap_or_else(|| "—".to_string()),
+                ));
+                pills.push((
+                    "LOSS".to_string(),
+                    format!(
+                        "{:.0}% ({}/{})",
+                        bench.internet.loss_pct, bench.internet.lost, bench.internet.sent
+                    ),
+                ));
+
+                render_status_pill_rows(ui, p, inner_w, &pills);
+                ui.add_space(6.0);
+                paint_network_sparkline(ui, p, inner_w, 124.0, bench);
+                ui.add_space(8.0);
+                semantic_banner(ui, p, mode, inner_w, bench.severity, &bench.diagnosis);
+            } else {
+                paint_empty_chart_box(
+                    ui,
+                    p,
+                    inner_w,
+                    130.0,
+                    "Click Run 5s Ping to plot local gateway vs. internet RTT and pinpoint whether lag spikes happen on your router/Wi-Fi or your ISP.",
+                );
+            }
+        });
+
+        if trigger_bench {
+            self.start_network_benchmark(ctx);
+        }
+    }
 }
 
 fn health_badge_label(sev: Severity) -> &'static str {
@@ -3075,6 +3273,128 @@ fn paint_audio_sparkline(
         Pos2::new(plot.right(), rect.bottom() - 3.0),
         Align2::RIGHT_BOTTOM,
         format!("{n} silent WASAPI callbacks ({:.2} ms nominal)", target_ms),
+        FontId::monospace(9.5),
+        p.text_muted,
+    );
+}
+
+fn paint_network_sparkline(
+    ui: &mut egui::Ui,
+    p: Palette,
+    width: f32,
+    height: f32,
+    bench: &NetworkJitterBenchmark,
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect(
+        rect,
+        CornerRadius::same(6),
+        p.bg,
+        Stroke::new(1.0_f32, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    let n = bench.internet.samples_ms.len();
+    if n == 0 {
+        return;
+    }
+
+    let plot = Rect::from_min_max(
+        Pos2::new(rect.left() + 48.0, rect.top() + 10.0),
+        Pos2::new(rect.right() - 10.0, rect.bottom() - 16.0),
+    );
+    if plot.width() <= 10.0 || plot.height() <= 10.0 {
+        return;
+    }
+
+    let max_inet = bench.internet.max_ms.unwrap_or(10.0);
+    let max_gw = bench.gateway.as_ref().and_then(|g| g.max_ms).unwrap_or(0.0);
+    let y_max = max_inet.max(max_gw).max(10.0) * 1.18;
+    let y_to_px = |ms: f64| -> f32 {
+        let clamped = (ms / y_max).clamp(0.0, 1.0) as f32;
+        plot.bottom() - clamped * plot.height()
+    };
+
+    for frac in [0.0_f64, 0.5, 1.0] {
+        let ms = y_max * frac;
+        let y = y_to_px(ms);
+        painter.line_segment(
+            [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+            Stroke::new(1.0_f32, p.border),
+        );
+        painter.text(
+            Pos2::new(plot.left() - 4.0, y),
+            Align2::RIGHT_CENTER,
+            format!("{ms:.0}ms"),
+            FontId::monospace(9.5),
+            p.text_muted,
+        );
+    }
+
+    let step_x = if n > 1 {
+        plot.width() / ((n - 1) as f32)
+    } else {
+        0.0
+    };
+
+    // Plot Local Gateway series first in subtle info blue.
+    if let Some(gw) = &bench.gateway {
+        let mut prev_gw: Option<Pos2> = None;
+        for (i, sample) in gw.samples_ms.iter().enumerate() {
+            let x = plot.left() + (i as f32) * step_x;
+            match sample {
+                Some(ms) => {
+                    let pt = Pos2::new(x, y_to_px(*ms));
+                    if let Some(p0) = prev_gw {
+                        painter.line_segment([p0, pt], Stroke::new(1.2_f32, p.info));
+                    }
+                    painter.circle_filled(pt, 1.8, p.info);
+                    prev_gw = Some(pt);
+                }
+                None => {
+                    painter.circle_filled(Pos2::new(x, plot.top() + 3.0), 2.8, p.bad);
+                    prev_gw = None;
+                }
+            }
+        }
+    }
+
+    // Plot Internet series in primary crisp monochrome (highlighting spikes / drops).
+    let med = bench.internet.median_ms.unwrap_or(20.0);
+    let mut prev_net: Option<Pos2> = None;
+    for (i, sample) in bench.internet.samples_ms.iter().enumerate() {
+        let x = plot.left() + (i as f32) * step_x;
+        match sample {
+            Some(ms) => {
+                let pt = Pos2::new(x, y_to_px(*ms));
+                let spike = *ms > med + 20.0;
+                let col = if spike { p.warn } else { p.text };
+                if let Some(p0) = prev_net {
+                    painter.line_segment([p0, pt], Stroke::new(1.5_f32, col));
+                }
+                painter.circle_filled(pt, if spike { 2.5 } else { 1.8 }, col);
+                prev_net = Some(pt);
+            }
+            None => {
+                painter.line_segment(
+                    [Pos2::new(x, plot.bottom()), Pos2::new(x, plot.top())],
+                    Stroke::new(1.2_f32, p.bad),
+                );
+                painter.circle_filled(Pos2::new(x, plot.top() + 3.0), 3.0, p.bad);
+                prev_net = None;
+            }
+        }
+    }
+
+    painter.text(
+        Pos2::new(plot.right(), rect.bottom() - 3.0),
+        Align2::RIGHT_BOTTOM,
+        format!("{n} rounds · white = Internet · blue = Local Gateway · red = Loss"),
         FontId::monospace(9.5),
         p.text_muted,
     );

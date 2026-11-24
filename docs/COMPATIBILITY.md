@@ -9,7 +9,7 @@
 
 | OS | Status | Notes |
 | --- | --- | --- |
-| **Windows 11 (22H2 / 23H2 / 24H2+)** | Supported (Primary) | All 29 health checks, Bench (up to 8,000 Hz + WASAPI audio benchmark), and Per-Game Profiles supported. |
+| **Windows 11 (22H2 / 23H2 / 24H2+)** | Supported (Primary) | All 32 health checks, Bench (up to 8,000 Hz + WASAPI audio & dual-hop ICMP ping benchmarks), and Per-Game Profiles supported. |
 | **Windows 10 (1903+)** | Supported | `windowed_optimizations` and `global_timer_requests` are Windows 11-specific features and are safe to leave untouched on Windows 10. |
 | **Windows 7 / 8 / 8.1** | Unsupported | Not tested; Win32 / power / Raw Input behavior is unsupported. |
 | **Linux / macOS** | Unsupported | Polled targets Windows APIs directly. |

@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/k1jaa/polled"
@@ -27,11 +27,16 @@ tempfile = "3"
 thiserror = "2"
 tray-icon = "0.25"
 windows = { version = "0.61", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Media",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",

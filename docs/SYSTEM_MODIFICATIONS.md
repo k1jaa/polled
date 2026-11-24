@@ -7,7 +7,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 
 ---
 
-## 1. Built-In Health Checks & Optional Tweaks (29 Total)
+## 1. Built-In Health Checks & Optional Tweaks (32 Total)
 
 ### 1.1 Core Mouse & Cursor Input
 
@@ -26,7 +26,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 | `usb_selective_suspend` | Fixable | `powrprof.dll` active scheme → Subgroup `2a737441-1930-4402-8d77-b2bebba308a3` → Setting `48e6b7a6-50f5-4782-a5d4-53bb8f07e226` | AC index = `0` (Disabled); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
 | `usb_power_management` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_...` & `ROOT_HUB20/30` (`EnhancedPowerManagementEnabled`, `SelectiveSuspendEnabled`, `AllowIdleIrpInD3`, `WDF\IdleInWorkingState`) | *None (never modifies)* | No admin | N/A |
 | `usb_xhci_msi` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\...\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties\MSISupported` where `Service == USBXHCI` | *None (never modifies)* | No admin | N/A |
-| `usb_topology` | **Report-Only** | Reads active `HKLM\SYSTEM\CurrentControlSet\Services\{USBHUB3,usbhub,usbccgp,hidusb,usbvideo,usbaudio,usbaudio2,USBSTOR,UASPStor}\Enum` + `Enum\USB\*\LocationInformation` & `ParentIdPrefix` to map connected mice to hubs & sibling heavy devices | *None (never modifies)* | No admin | N/A |
+| `usb_topology` | **Report-Only** | Walks live Windows PnP USB device tree via `cfgmgr32.dll` (`CM_Get_Device_ID_ListW`, `CM_Get_Parent`, `CM_Get_Child`, `CM_Get_Sibling`) + `hidapi` to map connected mice/dongles to their exact USB port, hub, PCI xHCI controller, and sibling cameras/USB audio DACs/storage | *None (never modifies)* | No admin | N/A |
 | `pcie_aspm` | Fixable | `powrprof.dll` active scheme → Subgroup `501a4d13-42af-4429-9fd1-a8218c268e20` → Setting `ee12f906-d277-404b-b6da-e5fa1a576df5` | AC index = `0` (Off); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
 | `power_plan` | Fixable | `powrprof.dll` `PowerSetActiveScheme` | Switches active scheme to High Performance (`8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c`) / Ultimate Performance / Balanced (if on Power Saver) | No admin / Immediate | Calls `PowerSetActiveScheme` with original scheme GUID |
 | `cpu_processor_state` | Fixable | `powrprof.dll` active scheme → Subgroup `54533251-82be-4824-96c1-47b60b740d00` → Setting `bc5038f7-23e0-4960-96da-33abaf5935ec` (`PROCTHROTTLEMAX`) | AC index = `100` (%); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
@@ -39,7 +39,15 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 | `audio_enhancements` | **Report-Only** | Reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\{guid}\FxProperties` (`{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},5` and APO CLSID entries) | *None (never modifies `TrustedInstaller`-owned registry ACLs)* | No admin | N/A |
 | `audio_format` | **Report-Only** | Queries active playback & capture endpoints via Win32 MMDevice + WASAPI `IAudioClient`/`IAudioClient3` (`GetMixFormat`, `GetDevicePeriod`, `GetSharedModeEnginePeriod`) | *None (read-only inspection)* | No admin | N/A |
 
-### 1.4 Timing, Display & Presentation
+### 1.4 Network & Ping Stability
+
+| Check ID | Mode | Exact Windows Target | Value Written on Fix | Admin / Restart | Rollback Behavior |
+| --- | --- | --- | --- | --- | --- |
+| `network_connection` | **Report-Only** | Queries active adapters via `iphlpapi.dll` `GetAdaptersAddresses` (Ethernet vs Wi-Fi, negotiated link speed, IPv4 gateway) | *None (read-only inspection)* | No admin | N/A |
+| `network_nic_power` | **Report-Only** | Reads active NIC driver class registry under `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\00xx` for `*EEE`, `EEELinkAdvertisement`, `EnableGreenEthernet`, `GigaLite`, `PowerSavingMode`, `*SelectiveSuspend`, `*InterruptModeration` | *None (Polled never drops/restarts active NICs)* | No admin | N/A |
+| `network_dns` | **Report-Only** | Reads configured IPv4 DNS servers via `GetAdaptersAddresses` | *None (read-only inspection)* | No admin | N/A |
+
+### 1.5 Timing, Display & Presentation
 
 | Check ID | Mode | Exact Windows Target | Value Written on Fix | Admin / Restart | Rollback Behavior |
 | --- | --- | --- | --- | --- | --- |
@@ -51,7 +59,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 | `hags` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\HwSchMode` | *None (never modifies)* | No admin | N/A |
 | `vbs_memory_integrity` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\EnableVirtualizationBasedSecurity` & `...\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled` | *None (Polled never weakens OS security)* | No admin | N/A |
 
-### 1.5 Optional Reversible Low-Latency Tweaks (Opt-In Only)
+### 1.6 Optional Reversible Low-Latency Tweaks (Opt-In Only)
 
 Optional tweaks are **never** applied by **Fix Safe Issues** and always show an explicit confirmation warning before applying.
 
@@ -61,7 +69,7 @@ Optional tweaks are **never** applied by **Fix Safe Issues** and always show an 
 | `win32_priority_separation` | Optional Tweak | `HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl\Win32PrioritySeparation` (`REG_DWORD`) | `0x26` (38 decimal — Short, Variable, 3:1 High foreground boost) | **UAC (Admin)** / Immediate | Restores captured `REG_DWORD` (or deletes value if absent) |
 | `global_timer_requests` | Optional Tweak | `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel\GlobalTimerResolutionRequests` (`REG_DWORD`) | `1` | **UAC (Admin)** / **Reboot** | Restores captured `REG_DWORD` (or deletes value if absent) |
 
-### 1.6 Accessibility & Background Vendor Suites
+### 1.7 Accessibility & Background Vendor Suites
 
 | Check ID | Mode | Exact Windows Target | Value Written on Fix | Admin / Restart | Rollback Behavior |
 | --- | --- | --- | --- | --- | --- |
@@ -183,4 +191,4 @@ Get-Content "$env:LOCALAPPDATA\Polled\baseline_snapshot.json"
 - Never flashes or updates mouse firmware, and never issues HID factory-reset commands.
 - Never disables Windows Defender, VBS, HVCI (Memory Integrity), Firewall, or Windows Update.
 - Never takes ownership of or modifies `TrustedInstaller`-protected registry ACLs (such as `MMDevices\...\FxProperties`).
-- Never makes outbound network connections or collects telemetry.
+- Never sends telemetry or contacts external servers automatically (the Bench **Dual-Hop Ping** / CLI `--ping` only sends ICMP echo packets on demand when explicitly triggered by you).

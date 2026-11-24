@@ -16,6 +16,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.0] - 2026-11-24
+
+### Added
+- **True Win32 PnP Device-Tree USB Topology (`win/usb_topology.rs`):**
+  - Replaced registry `ParentIdPrefix` guessing with real Win32 `cfgmgr32.dll` PnP device-tree traversal (`CM_Get_Device_ID_ListW`, `CM_Locate_DevNodeW`, `CM_Get_Parent`, `CM_Get_Child`, `CM_Get_Sibling`) paired with `hidapi` product strings.
+  - Accurately maps composite `usbccgp` 4K/8K wireless receivers and wired mice to their exact USB port, hub, PCI xHCI host controller, and shared high-bandwidth sibling devices — including vendor ASIO/USB audio interfaces (e.g. Focusrite USB Audio) detected via PnP `MEDIA` / `Camera` / `DiskDrive` classes.
+- **Network Latency & Ping Stability Suite (`win/network.rs` + 3 Health Checks + Bench + CLI):**
+  - **3 new read-only Network Health Checks (Total Built-In Checks: 29 → 32):**
+    - `network_connection`: audits Ethernet vs Wi-Fi and negotiated link speed (flags Wi-Fi or `< 1000 Mbps` Ethernet).
+    - `network_nic_power`: inspects active NIC driver flags (`*EEE`, `EEELinkAdvertisement`, `EnableGreenEthernet`, `GigaLite`, `PowerSavingMode`, `*SelectiveSuspend`, `*InterruptModeration`) without ever restarting your network adapter.
+    - `network_dns`: audits configured IPv4 DNS resolvers (anycast Cloudflare/Google/Quad9 vs router/ISP DNS).
+  - **Bench Dual-Hop Network Jitter & Packet-Loss Probe (5s):** on-demand pure Win32 `iphlpapi.dll` `IcmpSendEcho` benchmark (zero admin) that pings your **local router gateway** and **internet IP (`1.1.1.1` / `8.8.8.8` / `9.9.9.9` / custom IPv4)** simultaneously with sub-millisecond gateway timing, dual-series sparkline plot, automatic local-vs-ISP root-cause diagnosis, **Recommended Fixes** integration, and **Copy Report** export.
+  - **CLI `--network` & `--ping <IPV4>`** (both supporting `--json`).
+
+---
+
 ## [0.6.0] - 2026-11-24
 
 ### Added

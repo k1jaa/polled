@@ -18,6 +18,9 @@ pub mod hags;
 pub mod mmcss_gaming;
 pub mod monitor_refresh;
 pub mod mouse_queue_size;
+pub mod network_connection;
+pub mod network_dns;
+pub mod network_nic_power;
 pub mod pcie_aspm;
 pub mod pointer_speed;
 pub mod power_plan;
@@ -142,7 +145,7 @@ pub trait HealthCheck: Send + Sync {
     }
 }
 
-/// Returns all 29 registered built-in input & audio health checks and optional tweaks in display order.
+/// Returns all 32 registered built-in input, audio & network health checks and optional tweaks in display order.
 pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
     vec![
         // --- Core Mouse & Cursor Input ---
@@ -163,6 +166,10 @@ pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
         Box::new(audio_comms_ducking::AudioCommsDuckingCheck),
         Box::new(audio_enhancements::AudioEnhancementsCheck),
         Box::new(audio_format::AudioFormatCheck),
+        // --- Network & Ping Stability ---
+        Box::new(network_connection::NetworkConnectionCheck),
+        Box::new(network_nic_power::NetworkNicPowerCheck),
+        Box::new(network_dns::NetworkDnsCheck),
         // --- Timing, Display & Presentation ---
         Box::new(timer_resolution::TimerResolutionCheck),
         Box::new(monitor_refresh::MonitorRefreshCheck),

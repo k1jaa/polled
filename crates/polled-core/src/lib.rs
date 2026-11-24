@@ -29,8 +29,9 @@ pub use devices::{
 };
 pub use diagnostics::{
     build_diagnostic_advice, format_advice_summary, format_audio_benchmark_summary,
-    format_diagnostic_report, format_intervals_csv, render_ab_comparison_png, render_report_png,
-    run_audio_latency_benchmark, run_timer_jitter_benchmark, ButtonBounceStats,
+    format_diagnostic_report, format_intervals_csv, format_network_benchmark_summary,
+    render_ab_comparison_png, render_report_png, run_audio_latency_benchmark,
+    run_network_jitter_benchmark, run_timer_jitter_benchmark, ButtonBounceStats,
     ClickBounceAnalyzer, ClickBounceSnapshot, ClickEventRecord, DiagnosticAdvice,
     DiagnosticsSnapshot, DpiCalibrationResult, DpiCalibrator, DpiMeasurementSnapshot, HistogramBin,
     IntervalSample, KeyboardPollingAnalyzer, KeyboardPollingStats, MouseButtonKind,
@@ -50,4 +51,7 @@ pub use settings::{
     format_autostart_command, is_autostart_enabled, set_autostart_enabled, AppSettings,
     HotkeyBinding, HotkeyConfig, ThemePreference,
 };
-pub use win::{AudioEndpointInfo, AudioFlow, AudioLatencyBenchmark};
+pub use win::{
+    AudioEndpointInfo, AudioFlow, AudioLatencyBenchmark, NetworkAdapterInfo, NetworkAdapterKind,
+    NetworkJitterBenchmark, PingHopStats,
+};

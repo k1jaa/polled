@@ -8,6 +8,8 @@ pub mod audio;
 pub mod display;
 pub mod mock;
 #[cfg(windows)]
+pub mod network;
+#[cfg(windows)]
 pub mod os_info;
 #[cfg(windows)]
 pub mod power;
@@ -227,6 +229,71 @@ pub struct AudioLatencyBenchmark {
     pub severity: Severity,
 }
 
+/// Physical link medium of an active Windows network adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkAdapterKind {
+    Ethernet,
+    Wifi,
+    Other,
+}
+
+impl NetworkAdapterKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            NetworkAdapterKind::Ethernet => "Ethernet",
+            NetworkAdapterKind::Wifi => "Wi-Fi",
+            NetworkAdapterKind::Other => "Other",
+        }
+    }
+}
+
+/// Read-only snapshot of an active Windows network adapter, gateway, DNS, and NIC latency flags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkAdapterInfo {
+    pub name: String,
+    pub description: String,
+    pub adapter_guid: String,
+    pub kind: NetworkAdapterKind,
+    pub is_primary: bool,
+    pub link_speed_mbps: u64,
+    pub ipv4_address: Option<String>,
+    pub gateway_ipv4: Option<String>,
+    pub dns_servers: Vec<String>,
+    pub latency_flags: Vec<String>,
+    pub nagle_disabled: bool,
+}
+
+/// Single-hop ICMP ping latency, jitter, and packet-loss metrics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PingHopStats {
+    pub label: String,
+    pub target_ip: String,
+    pub sent: usize,
+    pub received: usize,
+    pub lost: usize,
+    pub loss_pct: f64,
+    pub samples_ms: Vec<Option<f64>>,
+    pub min_ms: Option<f64>,
+    pub median_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+    pub severity: Severity,
+}
+
+/// Result of an on-demand dual-hop ICMP ping benchmark separating local LAN/Wi-Fi vs ISP jitter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetworkJitterBenchmark {
+    pub adapter_name: String,
+    pub adapter_kind: NetworkAdapterKind,
+    pub elapsed_ms: f64,
+    pub gateway: Option<PingHopStats>,
+    pub internet: PingHopStats,
+    pub diagnosis: String,
+    pub severity: Severity,
+}
+
 /// Abstraction over all Windows system APIs used by Polled.
 ///
 /// Production code passes `WindowsEnv` (real `windows-rs` + `sysinfo` calls);
@@ -291,6 +358,7 @@ pub trait SystemEnv: Send + Sync {
         endpoint_id: Option<&str>,
         percent: u8,
     ) -> Result<()>;
+    fn list_network_adapters(&self) -> Result<Vec<NetworkAdapterInfo>>;
 }
 
 /// Real Windows implementation backed by `windows-rs` and `sysinfo`.
@@ -430,5 +498,9 @@ impl SystemEnv for WindowsEnv {
         percent: u8,
     ) -> Result<()> {
         audio::set_audio_endpoint_volume(flow, endpoint_id, percent)
+    }
+
+    fn list_network_adapters(&self) -> Result<Vec<NetworkAdapterInfo>> {
+        network::list_network_adapters()
     }
 }

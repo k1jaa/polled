@@ -8,8 +8,9 @@ use std::process::ExitCode;
 use clap::Parser;
 use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
-    detect_hardware_devices, dump_hid_devices, AppPaths, AudioEndpointInfo, AudioFlow, CheckReport,
-    HealthEngine, PolledError, Severity,
+    detect_hardware_devices, dump_hid_devices, format_network_benchmark_summary,
+    run_network_jitter_benchmark, AppPaths, AudioEndpointInfo, AudioFlow, CheckReport,
+    HealthEngine, NetworkAdapterInfo, PolledError, Severity,
 };
 
 #[derive(Debug, Parser)]
@@ -35,6 +36,14 @@ struct Cli {
     #[arg(long)]
     audio: bool,
 
+    /// List active network adapters, link speeds, gateways, DNS, and NIC power-saving flags
+    #[arg(long)]
+    network: bool,
+
+    /// Run a 5-second dual-hop ICMP ping jitter & packet-loss probe (gateway + target IPv4, e.g. 1.1.1.1)
+    #[arg(long, value_name = "IPV4")]
+    ping: Option<String>,
+
     /// Optional hex Vendor ID filter for --dump (e.g. 3710 or 0x3710 for Pulsar)
     #[arg(long, value_name = "HEX_VID")]
     vid: Option<String>,
@@ -43,7 +52,7 @@ struct Cli {
     #[arg(long)]
     include_serials: bool,
 
-    /// Output results as machine-readable JSON (use with --scan, --audio, --detect, --dump, --fix, or --undo-all)
+    /// Output results as machine-readable JSON (use with --scan, --audio, --network, --ping, --detect, --dump, --fix, or --undo-all)
     #[arg(long)]
     json: bool,
 
@@ -97,6 +106,34 @@ fn parse_hex_vid(input: &str) -> polled_core::Result<u16> {
 }
 
 fn run(cli: Cli) -> polled_core::Result<ExitCode> {
+    if let Some(target_ip) = cli.ping {
+        let bench = run_network_jitter_benchmark(&target_ip, 20, 250)?;
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&bench)?);
+        } else {
+            println!("{}", format_network_benchmark_summary(&bench));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if cli.network {
+        let env = WindowsEnv;
+        let adapters = env.list_network_adapters()?;
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&adapters)?);
+        } else {
+            println!("Active Network Adapters:");
+            if adapters.is_empty() {
+                println!("  (none)");
+            } else {
+                for nic in &adapters {
+                    print_network_adapter(nic);
+                }
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     if cli.audio {
         let env = WindowsEnv;
         let playback = env.list_audio_endpoints(AudioFlow::Render)?;
@@ -399,4 +436,35 @@ fn print_audio_endpoint(ep: &AudioEndpointInfo) {
         None => "None/Unknown",
     };
     println!("      Volume: {vol} | Format: {fmt} | Period: {period} | APO: {apo}");
+}
+
+fn print_network_adapter(nic: &NetworkAdapterInfo) {
+    let marker = if nic.is_primary { "[*]" } else { "[ ]" };
+    let speed = if nic.link_speed_mbps > 0 {
+        format!("{} Mbps", nic.link_speed_mbps)
+    } else {
+        "n/a".to_string()
+    };
+    println!(
+        "  {} {} — {} [{} · {}]",
+        marker,
+        nic.name,
+        nic.description,
+        nic.kind.label(),
+        speed
+    );
+    let ip = nic.ipv4_address.as_deref().unwrap_or("n/a");
+    let gw = nic.gateway_ipv4.as_deref().unwrap_or("n/a");
+    let dns = if nic.dns_servers.is_empty() {
+        "none".to_string()
+    } else {
+        nic.dns_servers.join(", ")
+    };
+    let flags = if nic.latency_flags.is_empty() {
+        "Clean".to_string()
+    } else {
+        nic.latency_flags.join(", ")
+    };
+    println!("      IPv4: {ip} | Gateway: {gw} | DNS: {dns}");
+    println!("      NIC Latency Flags: {flags}");
 }
