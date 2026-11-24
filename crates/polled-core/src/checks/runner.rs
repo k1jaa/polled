@@ -7,6 +7,7 @@ use std::fs;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::checks::custom_tweaks::CustomTweakStore;
 use crate::checks::snapshot::BaselineSnapshot;
 use crate::checks::state::{detect_regressions, PolledState, ScanSummary};
 use crate::checks::{default_checks, CheckReport, HealthCheck, Severity};
@@ -39,6 +40,14 @@ impl HealthEngine {
         Self {
             checks: default_checks(),
         }
+    }
+
+    /// Loads all built-in checks plus any user-defined reversible tweaks from `custom_tweaks.json`.
+    pub fn with_default_and_custom_checks(paths: &AppPaths) -> Self {
+        let mut checks = default_checks();
+        let store = CustomTweakStore::load_or_default(&paths.custom_tweaks_path());
+        checks.extend(store.into_checks());
+        Self { checks }
     }
 
     pub fn with_checks(checks: Vec<Box<dyn HealthCheck>>) -> Self {
@@ -84,9 +93,11 @@ impl HealthEngine {
                         .to_string(),
                     severity: Severity::Info,
                     can_fix: false,
+                    is_optional_tweak: check.is_optional_tweak(),
                     requires_elevation: matches!(err, PolledError::ElevationRequired { .. }),
                     elevation_reason: check.elevation_reason().map(str::to_string),
                     requires_relogin: false,
+                    requires_reboot: check.requires_reboot(),
                 },
             };
             reports.push(report);
@@ -176,11 +187,12 @@ impl HealthEngine {
         Ok(updated)
     }
 
-    /// Fixes all currently unhealthy (`Warn` or `Bad`) checks that do not require elevation.
+    /// Fixes all currently unhealthy (`Warn` or `Bad`) core checks that do not require elevation.
+    /// Optional latency tweaks are intentionally excluded so the user opts into each explicitly.
     pub fn fix_all_safe(&self, env: &dyn SystemEnv, paths: &AppPaths) -> Result<Vec<CheckReport>> {
         let mut fixed = Vec::new();
         for check in &self.checks {
-            if !check.can_fix() || check.requires_elevation() {
+            if !check.can_fix() || check.requires_elevation() || check.is_optional_tweak() {
                 continue;
             }
             let report = check.scan(env)?;
@@ -306,11 +318,11 @@ mod tests {
     struct DummySpeedCheck;
 
     impl HealthCheck for DummySpeedCheck {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "dummy_speed"
         }
 
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "Dummy Pointer Speed"
         }
 
@@ -328,9 +340,11 @@ mod tests {
                     Severity::Warn
                 },
                 can_fix: true,
+                is_optional_tweak: false,
                 requires_elevation: false,
                 elevation_reason: None,
                 requires_relogin: false,
+                requires_reboot: false,
             })
         }
 
@@ -410,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn default_engine_registers_all_17_checks_and_roundtrips_safe_fixes() {
+    fn default_engine_registers_all_25_checks_and_roundtrips_safe_fixes() {
         let dir = TempDir::new().unwrap();
         let paths = AppPaths::from_root(dir.path());
         let env = MockEnv::new();
@@ -424,14 +438,18 @@ mod tests {
         .unwrap();
 
         let engine = HealthEngine::with_default_checks();
-        assert_eq!(engine.checks().len(), 17);
+        assert_eq!(engine.checks().len(), 25);
 
         let initial = engine.scan_all(&env, &paths, true).unwrap();
-        assert_eq!(initial.checks.len(), 17);
+        assert_eq!(initial.checks.len(), 25);
 
+        // `fix_all_safe` fixes safe core issues (pointer_speed, game_bar_capture, windowed_optimizations)
+        // and intentionally skips optional tweaks (mmcss_gaming, win32_priority_separation, etc.).
         let fixed = engine.fix_all_safe(&env, &paths).unwrap();
         assert!(fixed.iter().any(|r| r.id == "pointer_speed"));
         assert!(fixed.iter().any(|r| r.id == "game_bar_capture"));
+        assert!(fixed.iter().any(|r| r.id == "windowed_optimizations"));
+        assert!(!fixed.iter().any(|r| r.is_optional_tweak));
         assert_eq!(env.get_mouse_speed().unwrap(), 10);
 
         let undo = engine.undo_all(&env, &paths).unwrap();
@@ -445,6 +463,108 @@ mod tests {
             )
             .unwrap(),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn loads_applies_and_reverts_user_custom_tweaks_from_disk() {
+        let dir = TempDir::new().unwrap();
+        let paths = AppPaths::from_root(dir.path());
+        let env = MockEnv::new();
+
+        let mut store = CustomTweakStore::default();
+        store
+            .upsert(crate::checks::CustomTweakDef {
+                id: "custom_hover_fast".to_string(),
+                name: "Fast Hover".to_string(),
+                hive: crate::win::RegHive::Hkcu,
+                subkey: r"Control Panel\Mouse".to_string(),
+                value_name: "MouseHoverTime".to_string(),
+                target: crate::checks::CustomValueKind::String("10".to_string()),
+                requires_reboot: false,
+                notes: "Snappy hover".to_string(),
+            })
+            .unwrap();
+        store.save_atomic(&paths.custom_tweaks_path()).unwrap();
+
+        let engine = HealthEngine::with_default_and_custom_checks(&paths);
+        assert_eq!(engine.checks().len(), 26);
+
+        let fixed = engine.fix_check("custom_hover_fast", &env, &paths).unwrap();
+        assert_eq!(fixed.severity, Severity::Ok);
+        assert_eq!(
+            env.reg_get_string(
+                crate::win::RegHive::Hkcu,
+                r"Control Panel\Mouse",
+                "MouseHoverTime"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("10")
+        );
+
+        let undone = engine
+            .undo_check("custom_hover_fast", &env, &paths)
+            .unwrap();
+        assert_eq!(undone.severity, Severity::Info);
+        assert_eq!(
+            env.reg_get_string(
+                crate::win::RegHive::Hkcu,
+                r"Control Panel\Mouse",
+                "MouseHoverTime"
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn loads_applies_and_reverts_user_custom_tweaks_from_disk() {
+        let dir = TempDir::new().unwrap();
+        let paths = AppPaths::from_root(dir.path());
+        let env = MockEnv::new();
+
+        let mut store = CustomTweakStore::default();
+        store
+            .upsert(crate::checks::CustomTweakDef {
+                id: "custom_hover_fast".to_string(),
+                name: "Fast Hover".to_string(),
+                hive: crate::win::RegHive::Hkcu,
+                subkey: r"Control Panel\Mouse".to_string(),
+                value_name: "MouseHoverTime".to_string(),
+                target: crate::checks::CustomValueKind::String("10".to_string()),
+                requires_reboot: false,
+                notes: "Snappy hover".to_string(),
+            })
+            .unwrap();
+        store.save_atomic(&paths.custom_tweaks_path()).unwrap();
+
+        let engine = HealthEngine::with_default_and_custom_checks(&paths);
+        assert_eq!(engine.checks().len(), 26);
+
+        let fixed = engine.fix_check("custom_hover_fast", &env, &paths).unwrap();
+        assert_eq!(fixed.severity, Severity::Ok);
+        assert_eq!(
+            env.reg_get_string(
+                crate::win::RegHive::Hkcu,
+                r"Control Panel\Mouse",
+                "MouseHoverTime"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("10")
+        );
+
+        let undone = engine.undo_check("custom_hover_fast", &env, &paths).unwrap();
+        assert_eq!(undone.severity, Severity::Info);
+        assert_eq!(
+            env.reg_get_string(
+                crate::win::RegHive::Hkcu,
+                r"Control Panel\Mouse",
+                "MouseHoverTime"
+            )
+            .unwrap(),
+            None
         );
     }
 }

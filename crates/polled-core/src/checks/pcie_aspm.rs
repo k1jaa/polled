@@ -28,11 +28,11 @@ fn aspm_label(val: u32) -> &'static str {
 pub struct PcieAspmCheck;
 
 impl HealthCheck for PcieAspmCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "pcie_aspm"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "PCIe Link State Power Management (ASPM)"
     }
 
@@ -40,7 +40,7 @@ impl HealthCheck for PcieAspmCheck {
         true
     }
 
-    fn elevation_reason(&self) -> Option<&'static str> {
+    fn elevation_reason(&self) -> Option<&str> {
         Some("Updating PCIe Link State Power Management writes to the active Windows power policy under HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power.")
     }
 
@@ -97,9 +97,13 @@ impl HealthCheck for PcieAspmCheck {
                 .to_string(),
             severity,
             can_fix: true,
+
+            is_optional_tweak: false,
             requires_elevation: self.requires_elevation(),
             elevation_reason: self.elevation_reason().map(str::to_string),
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 

@@ -13,7 +13,8 @@ pub mod settings;
 pub mod win;
 
 pub use checks::{
-    CheckReport, HealthCheck, HealthEngine, Regression, SavedValue, ScanSummary, Severity,
+    curated_custom_tweak_presets, CheckReport, CustomTweakCheck, CustomTweakDef, CustomTweakStore,
+    CustomValueKind, HealthCheck, HealthEngine, Regression, SavedValue, ScanSummary, Severity,
     UndoSummary,
 };
 pub use devices::{

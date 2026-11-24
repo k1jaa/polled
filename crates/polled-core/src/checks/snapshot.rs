@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PolledError, Result};
-use crate::win::{AccessibilityKind, MouseAccelParams};
+use crate::win::{AccessibilityKind, MouseAccelParams, RegHive};
 
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
@@ -43,6 +43,31 @@ pub enum SavedValue {
     GameDvr {
         app_capture_enabled: Option<u32>,
         game_dvr_enabled: Option<u32>,
+    },
+    UserGpuPreferences(Option<String>),
+    CursorSanity {
+        mouse_trails: Option<String>,
+        snap_to_default: Option<String>,
+    },
+    MmcssGames {
+        system_responsiveness: Option<u32>,
+        network_throttling_index: Option<u32>,
+        gpu_priority: Option<u32>,
+        priority: Option<u32>,
+        scheduling_category: Option<String>,
+        sfio_priority: Option<String>,
+    },
+    RegistryDword {
+        hive: RegHive,
+        subkey: String,
+        name: String,
+        value: Option<u32>,
+    },
+    RegistryString {
+        hive: RegHive,
+        subkey: String,
+        name: String,
+        value: Option<String>,
     },
     AccessibilityFlags {
         kind: AccessibilityKind,

@@ -15,11 +15,11 @@ const HZ_TOLERANCE: u32 = 2;
 pub struct MonitorRefreshCheck;
 
 impl HealthCheck for MonitorRefreshCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "monitor_refresh"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Monitor Refresh Rate"
     }
 
@@ -39,9 +39,13 @@ impl HealthCheck for MonitorRefreshCheck {
                     .to_string(),
                 severity: Severity::Info,
                 can_fix: false,
+
+                is_optional_tweak: false,
                 requires_elevation: false,
                 elevation_reason: None,
                 requires_relogin: false,
+
+                requires_reboot: false,
             });
         }
 
@@ -97,9 +101,13 @@ impl HealthCheck for MonitorRefreshCheck {
             reason: reason.to_string(),
             severity,
             can_fix: false,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 }

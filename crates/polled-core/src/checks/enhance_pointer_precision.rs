@@ -12,11 +12,11 @@ const MOUSE_SUBKEY: &str = r"Control Panel\Mouse";
 pub struct EnhancePointerPrecisionCheck;
 
 impl HealthCheck for EnhancePointerPrecisionCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "enhance_pointer_precision"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Enhance Pointer Precision"
     }
 
@@ -68,9 +68,13 @@ impl HealthCheck for EnhancePointerPrecisionCheck {
                 .to_string(),
             severity,
             can_fix: true,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 

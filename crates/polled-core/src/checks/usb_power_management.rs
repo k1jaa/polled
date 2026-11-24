@@ -11,11 +11,11 @@ use crate::win::{SystemEnv, UsbPowerDeviceKind};
 pub struct UsbPowerManagementCheck;
 
 impl HealthCheck for UsbPowerManagementCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "usb_power_management"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "USB Mouse & Root Hub Power Saving"
     }
 
@@ -99,9 +99,13 @@ impl HealthCheck for UsbPowerManagementCheck {
             reason: reason.to_string(),
             severity,
             can_fix: false,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 }

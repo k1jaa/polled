@@ -42,11 +42,11 @@ fn is_default_or_absent(bytes: Option<&[u8]>, expected: &[u8; 40]) -> bool {
 }
 
 impl HealthCheck for AccelCurvesCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "custom_accel_curves"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Custom Acceleration Curves"
     }
 
@@ -87,9 +87,13 @@ impl HealthCheck for AccelCurvesCheck {
                 .to_string(),
             severity,
             can_fix: true,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: true,
+
+            requires_reboot: false,
         })
     }
 

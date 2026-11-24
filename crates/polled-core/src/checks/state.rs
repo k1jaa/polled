@@ -118,9 +118,11 @@ mod tests {
             reason: "reason".to_string(),
             severity,
             can_fix: true,
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+            requires_reboot: false,
         }
     }
 

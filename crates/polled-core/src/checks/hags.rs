@@ -13,11 +13,11 @@ const HW_SCH_MODE: &str = "HwSchMode";
 pub struct HagsCheck;
 
 impl HealthCheck for HagsCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "hags"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Hardware-Accelerated GPU Scheduling (HAGS)"
     }
 
@@ -43,9 +43,13 @@ impl HealthCheck for HagsCheck {
                 .to_string(),
             severity: Severity::Info,
             can_fix: false,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 }

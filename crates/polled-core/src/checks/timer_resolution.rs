@@ -13,11 +13,11 @@ use crate::win::SystemEnv;
 pub struct TimerResolutionCheck;
 
 impl HealthCheck for TimerResolutionCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "timer_resolution"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Windows Timer Resolution & Wake Jitter"
     }
 
@@ -64,9 +64,13 @@ impl HealthCheck for TimerResolutionCheck {
             reason: reason.to_string(),
             severity,
             can_fix: false,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 }

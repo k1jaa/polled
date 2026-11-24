@@ -17,11 +17,11 @@ const GAMEDVR_ENABLED: &str = "GameDVR_Enabled";
 pub struct GameBarCaptureCheck;
 
 impl HealthCheck for GameBarCaptureCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "game_bar_capture"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Game Bar Background Capture (GameDVR)"
     }
 
@@ -64,9 +64,13 @@ impl HealthCheck for GameBarCaptureCheck {
                 .to_string(),
             severity,
             can_fix: true,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 

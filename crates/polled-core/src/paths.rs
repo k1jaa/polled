@@ -60,6 +60,11 @@ impl AppPaths {
     pub fn settings_path(&self) -> PathBuf {
         self.root.join("settings.json")
     }
+
+    /// Stores user-defined reversible registry tweaks.
+    pub fn custom_tweaks_path(&self) -> PathBuf {
+        self.root.join("custom_tweaks.json")
+    }
 }
 
 #[cfg(test)]

@@ -54,11 +54,11 @@ fn pick_recommended_scheme(schemes: &[PowerSchemeInfo]) -> Option<&PowerSchemeIn
 }
 
 impl HealthCheck for PowerPlanCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "power_plan"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Active Power Plan"
     }
 
@@ -118,9 +118,13 @@ impl HealthCheck for PowerPlanCheck {
             reason,
             severity,
             can_fix,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 

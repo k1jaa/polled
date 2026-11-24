@@ -14,11 +14,11 @@ const ALLOW_AUTO_GAME_MODE: &str = "AllowAutoGameMode";
 pub struct GameModeCheck;
 
 impl HealthCheck for GameModeCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "game_mode"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Windows Game Mode"
     }
 
@@ -46,9 +46,13 @@ impl HealthCheck for GameModeCheck {
                 .to_string(),
             severity,
             can_fix: true,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 

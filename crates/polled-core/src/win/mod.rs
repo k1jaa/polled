@@ -17,6 +17,8 @@ pub mod spi;
 #[cfg(windows)]
 pub mod timer;
 #[cfg(windows)]
+pub mod usb_msi;
+#[cfg(windows)]
 pub mod usb_power;
 
 use serde::{Deserialize, Serialize};
@@ -127,6 +129,14 @@ pub struct UsbPowerDevice {
     pub detail: String,
 }
 
+/// PCI xHCI USB 3.x host controller interrupt delivery state (MSI vs legacy line IRQ).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbControllerInfo {
+    pub name: String,
+    /// `Some(true)` = MSI enabled (`MSISupported=1`), `Some(false)` = legacy IRQ, `None` = unset.
+    pub msi_supported: Option<bool>,
+}
+
 /// Abstraction over all Windows system APIs used by Polled.
 ///
 /// Production code passes `WindowsEnv` (real `windows-rs` + `sysinfo` calls);
@@ -180,6 +190,7 @@ pub trait SystemEnv: Send + Sync {
     fn list_display_modes(&self) -> Result<Vec<DisplayModeInfo>>;
     fn measure_timer_resolution(&self) -> Result<TimerResolutionSample>;
     fn list_usb_power_devices(&self) -> Result<Vec<UsbPowerDevice>>;
+    fn list_usb_controllers(&self) -> Result<Vec<UsbControllerInfo>>;
 }
 
 /// Real Windows implementation backed by `windows-rs` and `sysinfo`.
@@ -290,5 +301,9 @@ impl SystemEnv for WindowsEnv {
 
     fn list_usb_power_devices(&self) -> Result<Vec<UsbPowerDevice>> {
         usb_power::list_usb_power_devices()
+    }
+
+    fn list_usb_controllers(&self) -> Result<Vec<UsbControllerInfo>> {
+        usb_msi::list_usb_controllers()
     }
 }

@@ -115,11 +115,11 @@ pub fn summarize_vendor_suites(processes: &[ProcessSample]) -> Vec<DetectedVendo
 }
 
 impl HealthCheck for VendorSoftwareCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "vendor_software"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Vendor Peripheral Software"
     }
 
@@ -142,9 +142,13 @@ impl HealthCheck for VendorSoftwareCheck {
                     .to_string(),
                 severity: Severity::Ok,
                 can_fix: false,
+
+                is_optional_tweak: false,
                 requires_elevation: false,
                 elevation_reason: None,
                 requires_relogin: false,
+
+                requires_reboot: false,
             });
         }
 
@@ -185,9 +189,13 @@ impl HealthCheck for VendorSoftwareCheck {
                 .to_string(),
             severity,
             can_fix: false,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 }

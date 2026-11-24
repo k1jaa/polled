@@ -33,11 +33,11 @@ fn format_speed(speed: u32) -> String {
 }
 
 impl HealthCheck for PointerSpeedCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "pointer_speed"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Windows Pointer Speed"
     }
 
@@ -58,9 +58,13 @@ impl HealthCheck for PointerSpeedCheck {
                 .to_string(),
             severity,
             can_fix: true,
+
+            is_optional_tweak: false,
             requires_elevation: false,
             elevation_reason: None,
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 

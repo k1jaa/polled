@@ -8,9 +8,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
-use polled_core::win::WindowsEnv;
+use polled_core::win::{RegHive, WindowsEnv};
 use polled_core::{
-    is_autostart_enabled, set_autostart_enabled, AppPaths, AppSettings, CheckReport, HealthEngine,
+    curated_custom_tweak_presets, is_autostart_enabled, set_autostart_enabled, AppPaths,
+    AppSettings, CheckReport, CustomTweakDef, CustomTweakStore, CustomValueKind, HealthEngine,
     PolledError, ScanSummary, Severity, ThemePreference,
 };
 
@@ -34,8 +35,108 @@ enum ActiveView {
 enum FilterMode {
     All,
     Issues,
+    Tweaks,
     ReportOnly,
     Undoable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustomDraftType {
+    Dword,
+    String,
+}
+
+#[derive(Debug, Clone)]
+struct CustomTweakDraft {
+    open: bool,
+    preset_id: Option<String>,
+    name: String,
+    hive: RegHive,
+    subkey: String,
+    value_name: String,
+    val_type: CustomDraftType,
+    value_text: String,
+    requires_reboot: bool,
+    notes: String,
+    error: Option<String>,
+}
+
+impl Default for CustomTweakDraft {
+    fn default() -> Self {
+        Self {
+            open: false,
+            preset_id: None,
+            name: String::new(),
+            hive: RegHive::Hkcu,
+            subkey: String::new(),
+            value_name: String::new(),
+            val_type: CustomDraftType::Dword,
+            value_text: "1".to_string(),
+            requires_reboot: false,
+            notes: String::new(),
+            error: None,
+        }
+    }
+}
+
+impl CustomTweakDraft {
+    fn fill_from_preset(&mut self, def: &CustomTweakDef) {
+        self.preset_id = Some(def.id.clone());
+        self.name = def.name.clone();
+        self.hive = def.hive;
+        self.subkey = def.subkey.clone();
+        self.value_name = def.value_name.clone();
+        match &def.target {
+            CustomValueKind::Dword(v) => {
+                self.val_type = CustomDraftType::Dword;
+                self.value_text = format!("0x{v:X}");
+            }
+            CustomValueKind::String(s) => {
+                self.val_type = CustomDraftType::String;
+                self.value_text = s.clone();
+            }
+        }
+        self.requires_reboot = def.requires_reboot;
+        self.notes = def.notes.clone();
+        self.error = None;
+    }
+
+    fn build_def(&self) -> Result<CustomTweakDef, String> {
+        let target = match self.val_type {
+            CustomDraftType::Dword => {
+                let raw = self.value_text.trim();
+                let parsed = if let Some(hex) =
+                    raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"))
+                {
+                    u32::from_str_radix(hex, 16)
+                } else {
+                    raw.parse::<u32>()
+                }
+                .map_err(|_| {
+                    format!("Invalid DWORD value '{raw}' (use decimal like 64 or hex like 0x2A).")
+                })?;
+                CustomValueKind::Dword(parsed)
+            }
+            CustomDraftType::String => CustomValueKind::String(self.value_text.clone()),
+        };
+
+        let id = self
+            .preset_id
+            .clone()
+            .unwrap_or_else(|| CustomTweakDef::make_id(&self.name));
+        let def = CustomTweakDef {
+            id,
+            name: self.name.trim().to_string(),
+            hive: self.hive,
+            subkey: self.subkey.trim().trim_matches('\\').to_string(),
+            value_name: self.value_name.trim().to_string(),
+            target,
+            requires_reboot: self.requires_reboot,
+            notes: self.notes.trim().to_string(),
+        };
+        def.validate()?;
+        Ok(def)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +183,8 @@ pub struct PolledApp {
     status_message: Option<String>,
     error_message: Option<String>,
     pending_elevation: Option<PendingElevation>,
+    show_latency_tips: bool,
+    custom_tweak_draft: CustomTweakDraft,
 
     profiles_ui: ProfilesUiState,
     profile_runtime: ProfileRuntimeHandle,
@@ -148,6 +251,8 @@ impl PolledApp {
             status_message: None,
             error_message: None,
             pending_elevation: None,
+            show_latency_tips: false,
+            custom_tweak_draft: CustomTweakDraft::default(),
             profiles_ui,
             profile_runtime,
             input_lab_ui: InputLabUiState::new(),
@@ -175,9 +280,10 @@ impl PolledApp {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let engine = HealthEngine::with_default_checks();
+            let paths = AppPaths::default_user_dir();
+            let engine = HealthEngine::with_default_and_custom_checks(&paths);
             let result = engine
-                .scan_all(&WindowsEnv, &AppPaths::default_user_dir(), true)
+                .scan_all(&WindowsEnv, &paths, true)
                 .map_err(|e| e.to_string());
             let _ = tx.send(WorkerMsg::ScanFinished {
                 result,
@@ -204,7 +310,7 @@ impl PolledApp {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let paths = AppPaths::default_user_dir();
-            let engine = HealthEngine::with_default_checks();
+            let engine = HealthEngine::with_default_and_custom_checks(&paths);
 
             let msg = if elevated {
                 match run_elevated_cli(ElevatedAction::Fix(&check.id), &paths) {
@@ -281,7 +387,7 @@ impl PolledApp {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let paths = AppPaths::default_user_dir();
-            let engine = HealthEngine::with_default_checks();
+            let engine = HealthEngine::with_default_and_custom_checks(&paths);
             let msg = match engine.fix_all_safe(&WindowsEnv, &paths) {
                 Ok(fixed) => {
                     let scan = engine.scan_all(&WindowsEnv, &paths, true).ok();
@@ -320,7 +426,7 @@ impl PolledApp {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let paths = AppPaths::default_user_dir();
-            let engine = HealthEngine::with_default_checks();
+            let engine = HealthEngine::with_default_and_custom_checks(&paths);
 
             let msg = if elevated {
                 match run_elevated_cli(ElevatedAction::Undo(&check.id), &paths) {
@@ -401,7 +507,7 @@ impl PolledApp {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let paths = AppPaths::default_user_dir();
-            let engine = HealthEngine::with_default_checks();
+            let engine = HealthEngine::with_default_and_custom_checks(&paths);
 
             let msg = if elevated {
                 match run_elevated_cli(ElevatedAction::UndoAll, &paths) {
@@ -570,7 +676,11 @@ impl eframe::App for PolledApp {
                         Severity::Warn => counts.2 += 1,
                         Severity::Bad => counts.3 += 1,
                     }
-                    if c.can_fix && !c.requires_elevation && c.severity >= Severity::Warn {
+                    if c.can_fix
+                        && !c.is_optional_tweak
+                        && !c.requires_elevation
+                        && c.severity >= Severity::Warn
+                    {
                         counts.4 += 1;
                     }
                 }
@@ -592,6 +702,7 @@ impl eframe::App for PolledApp {
         let mut trigger_undo_all = false;
         let mut clicked_fix: Option<CheckReport> = None;
         let mut clicked_undo: Option<CheckReport> = None;
+        let mut clicked_delete_custom: Option<String> = None;
 
         // --- TOP HEADER BAR ---
         egui::TopBottomPanel::top("topbar")
@@ -869,44 +980,67 @@ impl eframe::App for PolledApp {
                     ui.add_space(8.0);
                 }
 
-                // Filter tabs + severity summary counters (reflows cleanly on narrow windows)
+                // Filter tabs + Custom Tweak / Tips buttons + severity counters
                 let total_count = self.summary.as_ref().map_or(0, |s| s.checks.len());
                 let issues_count = warn_count + bad_count;
+                let tweaks_count = self.summary.as_ref().map_or(0, |s| {
+                    s.checks.iter().filter(|c| c.is_optional_tweak).count()
+                });
                 let undo_count = undoable_set.len();
 
-                if content_w < 680.0 {
+                let draw_filter_tabs = |ui: &mut egui::Ui, filter: &mut FilterMode| {
+                    filter_tab(
+                        ui,
+                        p,
+                        filter,
+                        FilterMode::All,
+                        &format!("All ({total_count})"),
+                    );
+                    filter_tab(
+                        ui,
+                        p,
+                        filter,
+                        FilterMode::Issues,
+                        &format!("Issues ({issues_count})"),
+                    );
+                    filter_tab(
+                        ui,
+                        p,
+                        filter,
+                        FilterMode::Tweaks,
+                        &format!("Tweaks ({tweaks_count})"),
+                    );
+                    filter_tab(ui, p, filter, FilterMode::ReportOnly, "Report Only");
+                    filter_tab(
+                        ui,
+                        p,
+                        filter,
+                        FilterMode::Undoable,
+                        &format!("Undoable ({undo_count})"),
+                    );
+                };
+
+                if content_w < 900.0 {
                     ui.horizontal_wrapped(|ui| {
-                        filter_tab(
-                            ui,
-                            p,
-                            &mut self.filter,
-                            FilterMode::All,
-                            &format!("All ({total_count})"),
-                        );
-                        filter_tab(
-                            ui,
-                            p,
-                            &mut self.filter,
-                            FilterMode::Issues,
-                            &format!("Issues ({issues_count})"),
-                        );
-                        filter_tab(
-                            ui,
-                            p,
-                            &mut self.filter,
-                            FilterMode::ReportOnly,
-                            "Report Only",
-                        );
-                        filter_tab(
-                            ui,
-                            p,
-                            &mut self.filter,
-                            FilterMode::Undoable,
-                            &format!("Undoable ({undo_count})"),
-                        );
+                        draw_filter_tabs(ui, &mut self.filter);
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(5.0);
                     ui.horizontal_wrapped(|ui| {
+                        let tips_btn = if self.show_latency_tips {
+                            primary_button("Latency Tips", p)
+                        } else {
+                            secondary_button("Latency Tips", p)
+                        };
+                        if ui.add(tips_btn).clicked() {
+                            self.show_latency_tips = !self.show_latency_tips;
+                        }
+                        if ui.add(secondary_button("+ Custom Tweak", p)).clicked() {
+                            self.custom_tweak_draft = CustomTweakDraft {
+                                open: true,
+                                ..Default::default()
+                            };
+                        }
+                        ui.add_space(4.0);
                         if self.busy {
                             ui.spinner();
                             ui.label(
@@ -935,34 +1069,22 @@ impl eframe::App for PolledApp {
                     });
                 } else {
                     ui.horizontal(|ui| {
-                        filter_tab(
-                            ui,
-                            p,
-                            &mut self.filter,
-                            FilterMode::All,
-                            &format!("All ({total_count})"),
-                        );
-                        filter_tab(
-                            ui,
-                            p,
-                            &mut self.filter,
-                            FilterMode::Issues,
-                            &format!("Issues ({issues_count})"),
-                        );
-                        filter_tab(
-                            ui,
-                            p,
-                            &mut self.filter,
-                            FilterMode::ReportOnly,
-                            "Report Only",
-                        );
-                        filter_tab(
-                            ui,
-                            p,
-                            &mut self.filter,
-                            FilterMode::Undoable,
-                            &format!("Undoable ({undo_count})"),
-                        );
+                        draw_filter_tabs(ui, &mut self.filter);
+                        ui.add_space(4.0);
+                        let tips_btn = if self.show_latency_tips {
+                            primary_button("Latency Tips", p)
+                        } else {
+                            secondary_button("Latency Tips", p)
+                        };
+                        if ui.add(tips_btn).clicked() {
+                            self.show_latency_tips = !self.show_latency_tips;
+                        }
+                        if ui.add(secondary_button("+ Custom Tweak", p)).clicked() {
+                            self.custom_tweak_draft = CustomTweakDraft {
+                                open: true,
+                                ..Default::default()
+                            };
+                        }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.busy {
@@ -994,6 +1116,11 @@ impl eframe::App for PolledApp {
                     });
                 }
 
+                if self.show_latency_tips {
+                    ui.add_space(8.0);
+                    render_latency_tips_card(ui, p, content_w);
+                }
+
                 ui.add_space(10.0);
 
                 let card_w = (content_w - 14.0).max(240.0);
@@ -1016,6 +1143,7 @@ impl eframe::App for PolledApp {
                             .filter(|c| match self.filter {
                                 FilterMode::All => true,
                                 FilterMode::Issues => c.severity >= Severity::Warn,
+                                FilterMode::Tweaks => c.is_optional_tweak,
                                 FilterMode::ReportOnly => !c.can_fix,
                                 FilterMode::Undoable => undoable_set.contains(&c.id),
                             })
@@ -1050,11 +1178,220 @@ impl eframe::App for PolledApp {
                                 self.busy,
                                 &mut clicked_fix,
                                 &mut clicked_undo,
+                                &mut clicked_delete_custom,
                             );
                             ui.add_space(8.0);
                         }
                     });
             });
+
+        // --- CUSTOM TWEAK BUILDER MODAL ---
+        let mut save_custom_tweak = false;
+        let mut close_custom_modal = false;
+        if self.custom_tweak_draft.open {
+            let modal_w = (ctx.screen_rect().width() - 48.0).clamp(340.0, 560.0);
+            egui::Window::new("Add Custom Reversible Tweak")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .default_width(modal_w)
+                .max_width(modal_w)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.5_f32, p.text))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(16)),
+                )
+                .show(ctx, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Every custom tweak automatically snapshots its original Windows value into baseline_snapshot.json before applying, so you can revert it cleanly anytime.",
+                            )
+                            .size(12.0)
+                            .color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(8.0);
+
+                    ui.label(
+                        RichText::new("Quick-fill curated presets:")
+                            .size(11.0)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for preset in curated_custom_tweak_presets() {
+                            if ui.add(secondary_button(&preset.name, p)).clicked() {
+                                self.custom_tweak_draft.fill_from_preset(&preset);
+                            }
+                        }
+                    });
+                    ui.add_space(10.0);
+
+                    let field_w = (modal_w - 150.0).clamp(180.0, 380.0);
+                    egui::Grid::new("custom_tweak_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 7.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Name").color(p.text_muted));
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.custom_tweak_draft.name)
+                                        .desired_width(field_w)
+                                        .hint_text("e.g. Disable Power Throttling"),
+                                )
+                                .changed()
+                            {
+                                self.custom_tweak_draft.preset_id = None;
+                            }
+                            ui.end_row();
+
+                            ui.label(RichText::new("Registry Hive").color(p.text_muted));
+                            ui.horizontal(|ui| {
+                                for (hive, lbl) in [
+                                    (RegHive::Hkcu, "HKCU (User, no admin)"),
+                                    (RegHive::Hklm, "HKLM (System, UAC)"),
+                                ] {
+                                    let btn = if self.custom_tweak_draft.hive == hive {
+                                        primary_button(lbl, p)
+                                    } else {
+                                        secondary_button(lbl, p)
+                                    };
+                                    if ui.add(btn).clicked() {
+                                        self.custom_tweak_draft.hive = hive;
+                                    }
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label(RichText::new("Subkey Path").color(p.text_muted));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom_tweak_draft.subkey)
+                                    .desired_width(field_w)
+                                    .hint_text(r"SYSTEM\CurrentControlSet\Control\Power\PowerThrottling"),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("Value Name").color(p.text_muted));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom_tweak_draft.value_name)
+                                    .desired_width(field_w)
+                                    .hint_text("PowerThrottlingOff"),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("Value Type").color(p.text_muted));
+                            ui.horizontal(|ui| {
+                                for (vt, lbl) in [
+                                    (CustomDraftType::Dword, "DWORD (dec or 0x hex)"),
+                                    (CustomDraftType::String, "String (REG_SZ)"),
+                                ] {
+                                    let btn = if self.custom_tweak_draft.val_type == vt {
+                                        primary_button(lbl, p)
+                                    } else {
+                                        secondary_button(lbl, p)
+                                    };
+                                    if ui.add(btn).clicked() {
+                                        self.custom_tweak_draft.val_type = vt;
+                                    }
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label(RichText::new("Target Value").color(p.text_muted));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom_tweak_draft.value_text)
+                                    .desired_width(field_w)
+                                    .hint_text("1 or 0x2A"),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("Notes").color(p.text_muted));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom_tweak_draft.notes)
+                                    .desired_width(field_w)
+                                    .hint_text("Why you use this tweak"),
+                            );
+                            ui.end_row();
+
+                            ui.label("");
+                            ui.checkbox(
+                                &mut self.custom_tweak_draft.requires_reboot,
+                                "Requires reboot to take effect",
+                            );
+                            ui.end_row();
+                        });
+
+                    if let Some(err) = &self.custom_tweak_draft.error {
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(RichText::new(err).size(12.0).color(p.bad)).wrap(),
+                        );
+                    }
+
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(primary_button("Save Tweak", p)).clicked() {
+                            save_custom_tweak = true;
+                        }
+                        if ui.add(secondary_button("Cancel", p)).clicked() {
+                            close_custom_modal = true;
+                        }
+                    });
+                });
+        }
+        if close_custom_modal {
+            self.custom_tweak_draft.open = false;
+        } else if save_custom_tweak {
+            match self.custom_tweak_draft.build_def() {
+                Ok(def) => {
+                    let paths = AppPaths::default_user_dir();
+                    let mut store = CustomTweakStore::load_or_default(&paths.custom_tweaks_path());
+                    let name = def.name.clone();
+                    match store.upsert(def).and_then(|_| {
+                        store
+                            .save_atomic(&paths.custom_tweaks_path())
+                            .map_err(|e| e.to_string())
+                    }) {
+                        Ok(()) => {
+                            self.custom_tweak_draft.open = false;
+                            self.filter = FilterMode::Tweaks;
+                            self.status_message = Some(format!(
+                                "Saved custom tweak \"{name}\". Click Apply on its card to test it (full undo is saved automatically)."
+                            ));
+                            self.error_message = None;
+                            self.start_scan(ctx, false);
+                        }
+                        Err(err) => self.custom_tweak_draft.error = Some(err),
+                    }
+                }
+                Err(err) => self.custom_tweak_draft.error = Some(err),
+            }
+        }
+
+        if let Some(del_id) = clicked_delete_custom {
+            if undoable_set.contains(&del_id) {
+                self.error_message = Some(
+                    "Undo this custom tweak first before deleting it, so its baseline snapshot stays cleanly restorable."
+                        .to_string(),
+                );
+            } else {
+                let paths = AppPaths::default_user_dir();
+                let mut store = CustomTweakStore::load_or_default(&paths.custom_tweaks_path());
+                if store.remove(&del_id) {
+                    if let Err(err) = store.save_atomic(&paths.custom_tweaks_path()) {
+                        self.error_message = Some(err.to_string());
+                    } else {
+                        self.status_message = Some(format!("Deleted custom tweak '{del_id}'."));
+                        self.start_scan(ctx, false);
+                    }
+                }
+            }
+        }
 
         // --- UAC CONFIRMATION MODAL (plain monochrome) ---
         let mut confirm_elevation = false;
@@ -1254,12 +1591,15 @@ fn render_check_card(
     busy: bool,
     clicked_fix: &mut Option<CheckReport>,
     clicked_undo: &mut Option<CheckReport>,
+    clicked_delete_custom: &mut Option<String>,
 ) {
     let sev_fg = p.severity_fg(check.severity);
     let sev_bg = p.severity_bg(check.severity, mode);
+    let is_custom = check.id.starts_with("custom_");
     let show_fix = check.can_fix
         && (check.severity >= Severity::Warn
-            || (check.id == "power_plan" && check.severity == Severity::Info));
+            || ((check.is_optional_tweak || check.id == "power_plan")
+                && check.severity == Severity::Info));
 
     let inner_w = (outer_w - 26.0).max(160.0);
     let frame = egui::Frame::NONE
@@ -1275,12 +1615,17 @@ fn render_check_card(
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if show_fix {
-                    let label = if check.requires_elevation {
-                        "Fix [Admin]"
+                    let verb = if check.is_optional_tweak {
+                        "Apply"
                     } else {
                         "Fix"
                     };
-                    if ui.add_enabled(!busy, primary_button(label, p)).clicked() {
+                    let label = if check.requires_elevation {
+                        format!("{verb} [Admin]")
+                    } else {
+                        verb.to_string()
+                    };
+                    if ui.add_enabled(!busy, primary_button(&label, p)).clicked() {
                         *clicked_fix = Some(check.clone());
                     }
                 }
@@ -1289,10 +1634,36 @@ fn render_check_card(
                     *clicked_undo = Some(check.clone());
                 }
 
+                if is_custom
+                    && ui
+                        .add_enabled(!busy, secondary_button("Delete", p))
+                        .clicked()
+                {
+                    *clicked_delete_custom = Some(check.id.clone());
+                }
+
+                if check.requires_reboot && check.can_fix {
+                    pill(ui, "Reboot", p.surface_alt, p.text_muted, p.border);
+                }
+
                 if check.requires_relogin && check.severity >= Severity::Warn {
                     pill(
                         ui,
                         "Sign-out required",
+                        p.surface_alt,
+                        p.text_muted,
+                        p.border,
+                    );
+                }
+
+                if check.is_optional_tweak {
+                    pill(
+                        ui,
+                        if is_custom {
+                            "Custom tweak"
+                        } else {
+                            "Optional tweak"
+                        },
                         p.surface_alt,
                         p.text_muted,
                         p.border,
@@ -1375,6 +1746,68 @@ fn render_check_card(
     );
     ui.painter()
         .rect_filled(stripe, CornerRadius::same(2), sev_fg);
+}
+
+fn render_latency_tips_card(ui: &mut egui::Ui, p: Palette, outer_w: f32) {
+    let inner_w = (outer_w - 24.0).max(160.0);
+    egui::Frame::NONE
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0_f32, p.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_min_width(inner_w);
+            ui.set_max_width(inner_w);
+            ui.label(
+                RichText::new("Minimum Mouse Input Delay Checklist (Hardware, USB, GPU & In-Game)")
+                    .size(13.5)
+                    .strong()
+                    .color(p.text),
+            );
+            ui.add_space(6.0);
+            let tips = [
+                (
+                    "USB & Wireless:",
+                    "Plug your 4K/8K receiver directly into a rear motherboard CPU-lane USB port (avoid front-panel or unpowered hubs). Keep the dongle extender < 20 cm from your mousepad and away from 2.4 GHz Wi-Fi routers.",
+                ),
+                (
+                    "Sensor & DPI:",
+                    "1600–3200 DPI cuts motion-initiation latency by ~1–2 ms vs. 400 DPI on micro-adjustments (adjust in-game sensitivity to keep the same cm/360°). Verify 4K/8K saturation & switch debounce in Input Lab.",
+                ),
+                (
+                    "GPU & Frame Pacing:",
+                    "Avoid 99% GPU saturation (render queue buildup adds 10–30 ms of mouse delay). Enable NVIDIA Reflex (On+Boost) or AMD Anti-Lag, cap FPS slightly below your GPU/monitor limit, and disable V-Sync unless paired with G-Sync/FreeSync + Reflex.",
+                ),
+                (
+                    "Display & OS:",
+                    "Use Exclusive Fullscreen or Windows 11 Borderless with Flip-Model Windowed Optimizations enabled. Keep USB Selective Suspend and PCIe ASPM off on AC, and close heavy vendor RGB/peripheral suites after saving to onboard memory.",
+                ),
+            ];
+            for (heading, body) in tips {
+                let mut job = egui::text::LayoutJob::default();
+                job.wrap.max_width = inner_w;
+                job.append(
+                    &format!("• {heading} "),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(12.0),
+                        color: p.text,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    body,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(12.0),
+                        color: p.text_muted,
+                        ..Default::default()
+                    },
+                );
+                ui.add(egui::Label::new(job).wrap());
+                ui.add_space(3.0);
+            }
+        });
 }
 
 fn primary_button(label: &str, p: Palette) -> egui::Button<'_> {

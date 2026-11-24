@@ -24,8 +24,8 @@ pub struct MouseKeysShortcutCheck;
 fn scan_accessibility_shortcut(
     env: &dyn SystemEnv,
     kind: AccessibilityKind,
-    id: &'static str,
-    name: &'static str,
+    id: &str,
+    name: &str,
     shortcut_desc: &str,
     reason: &str,
 ) -> Result<CheckReport> {
@@ -60,9 +60,13 @@ fn scan_accessibility_shortcut(
         reason: reason.to_string(),
         severity,
         can_fix: true,
+
+        is_optional_tweak: false,
         requires_elevation: false,
         elevation_reason: None,
         requires_relogin: false,
+
+        requires_reboot: false,
     })
 }
 
@@ -89,11 +93,11 @@ fn undo_accessibility_flags(
 }
 
 impl HealthCheck for StickyKeysShortcutCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "sticky_keys_shortcut"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Sticky Keys Shortcut"
     }
 
@@ -125,11 +129,11 @@ impl HealthCheck for StickyKeysShortcutCheck {
 }
 
 impl HealthCheck for FilterKeysShortcutCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "filter_keys_shortcut"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Filter Keys Shortcut"
     }
 
@@ -161,11 +165,11 @@ impl HealthCheck for FilterKeysShortcutCheck {
 }
 
 impl HealthCheck for MouseKeysShortcutCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "mouse_keys_shortcut"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Mouse Keys Shortcut"
     }
 

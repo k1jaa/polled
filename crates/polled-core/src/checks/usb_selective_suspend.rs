@@ -18,11 +18,11 @@ const SUSPENDED_ENABLED: u32 = 1;
 pub struct UsbSelectiveSuspendCheck;
 
 impl HealthCheck for UsbSelectiveSuspendCheck {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "usb_selective_suspend"
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "USB Selective Suspend"
     }
 
@@ -30,7 +30,7 @@ impl HealthCheck for UsbSelectiveSuspendCheck {
         true
     }
 
-    fn elevation_reason(&self) -> Option<&'static str> {
+    fn elevation_reason(&self) -> Option<&str> {
         Some("Updating USB selective suspend writes to the active Windows power policy under HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power.")
     }
 
@@ -89,9 +89,13 @@ impl HealthCheck for UsbSelectiveSuspendCheck {
                 .to_string(),
             severity,
             can_fix: true,
+
+            is_optional_tweak: false,
             requires_elevation: self.requires_elevation(),
             elevation_reason: self.elevation_reason().map(str::to_string),
             requires_relogin: false,
+
+            requires_reboot: false,
         })
     }
 

@@ -170,7 +170,8 @@ impl TrayController {
                                 let ctx_scan = ctx.clone();
                                 std::thread::spawn(move || {
                                     let paths = AppPaths::default_user_dir();
-                                    let engine = HealthEngine::with_default_checks();
+                                    let engine =
+                                        HealthEngine::with_default_and_custom_checks(&paths);
                                     let result = engine
                                         .scan_all(&WindowsEnv, &paths, true)
                                         .map_err(|e| e.to_string());

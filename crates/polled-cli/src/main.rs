@@ -197,7 +197,7 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
         None => AppPaths::default_user_dir(),
     };
     let env = WindowsEnv;
-    let engine = HealthEngine::with_default_checks();
+    let engine = HealthEngine::with_default_and_custom_checks(&paths);
 
     if let Some(id) = cli.fix {
         let report = engine.fix_check(&id, &env, &paths)?;
@@ -303,6 +303,12 @@ fn print_report(r: &CheckReport) {
     };
     let action_hint = if !r.can_fix {
         " (report only)"
+    } else if r.is_optional_tweak && r.severity != Severity::Ok {
+        if r.requires_elevation {
+            " (optional tweak, admin)"
+        } else {
+            " (optional tweak)"
+        }
     } else if r.severity >= Severity::Warn && r.requires_elevation {
         " (fixable, admin)"
     } else if r.severity >= Severity::Warn {
@@ -316,6 +322,9 @@ fn print_report(r: &CheckReport) {
     println!("       Reason:      {}", r.reason);
     if r.requires_relogin && r.severity >= Severity::Warn {
         println!("       Note:        Requires sign-out/sign-in to take effect.");
+    }
+    if r.requires_reboot && r.can_fix {
+        println!("       Note:        Requires reboot to take effect.");
     }
     println!();
 }
