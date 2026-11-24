@@ -18,12 +18,13 @@ use eframe::egui::{
 };
 use polled_core::win::{SystemEnv, UsbMouseTopology, WindowsEnv};
 use polled_core::{
-    build_diagnostic_advice, format_advice_summary, format_audio_benchmark_summary,
-    format_diagnostic_report, format_intervals_csv, format_network_benchmark_summary,
-    render_ab_comparison_png, render_report_png, run_audio_latency_benchmark,
-    run_network_jitter_benchmark, run_timer_jitter_benchmark, AppPaths, AudioLatencyBenchmark,
-    CheckReport, DiagnosticAdvice, DiagnosticsSnapshot, NetworkJitterBenchmark, PinnedBenchmark,
-    PollingStats, PollingTarget, RawInputCaptureSession, Severity, TimerJitterBenchmark,
+    build_diagnostic_advice, compute_sensitivity, format_advice_summary,
+    format_audio_benchmark_summary, format_diagnostic_report, format_intervals_csv,
+    format_network_benchmark_summary, render_ab_comparison_png, render_report_png,
+    render_rig_scorecard_png, run_audio_latency_benchmark, run_network_jitter_benchmark,
+    run_timer_jitter_benchmark, AppPaths, AudioLatencyBenchmark, CheckReport, DiagnosticAdvice,
+    DiagnosticsSnapshot, NetworkJitterBenchmark, PinnedBenchmark, PollingStats, PollingTarget,
+    RawInputCaptureSession, RigScorecardInput, SensitivityGame, Severity, TimerJitterBenchmark,
     TrackingStats, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS,
     STANDARD_RATES_HZ,
 };
@@ -35,6 +36,15 @@ use crate::theme::{Palette, ThemeMode};
 pub enum InputLabNavAction {
     OpenHealthCheck,
     OpenProfiles,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum BenchSubTab {
+    #[default]
+    Polling,
+    AimSwitches,
+    SystemUsb,
+    AudioNet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -114,6 +124,7 @@ impl CaptureMode {
 }
 
 pub struct InputLabUiState {
+    active_tab: BenchSubTab,
     session: Option<RawInputCaptureSession>,
     capture_mode: CaptureMode,
     countdown_ends_at: Option<Instant>,
@@ -128,6 +139,10 @@ pub struct InputLabUiState {
     ruler_distance: f64,
     ruler_unit: RulerUnit,
     dpi_measuring: bool,
+    sens_source_game: SensitivityGame,
+    sens_target_game: SensitivityGame,
+    sens_source_sens: f64,
+    sens_target_dpi: u32,
     last_snapshot: DiagnosticsSnapshot,
     timer_benchmark: Option<TimerJitterBenchmark>,
     timer_running: bool,
@@ -155,6 +170,7 @@ impl Default for InputLabUiState {
 impl InputLabUiState {
     pub fn new() -> Self {
         Self {
+            active_tab: BenchSubTab::Polling,
             session: None,
             capture_mode: CaptureMode::default(),
             countdown_ends_at: None,
@@ -169,6 +185,10 @@ impl InputLabUiState {
             ruler_distance: 10.0,
             ruler_unit: RulerUnit::Cm,
             dpi_measuring: false,
+            sens_source_game: SensitivityGame::Cs2,
+            sens_target_game: SensitivityGame::Valorant,
+            sens_source_sens: 1.0,
+            sens_target_dpi: 1600,
             last_snapshot: DiagnosticsSnapshot::default(),
             timer_benchmark: None,
             timer_running: false,
@@ -447,6 +467,7 @@ impl InputLabUiState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         ctx: &egui::Context,
@@ -455,6 +476,7 @@ impl InputLabUiState {
         mode: ThemeMode,
         detected_dpi: Option<u16>,
         health_checks: &[CheckReport],
+        windows_version: Option<&str>,
     ) -> Option<InputLabNavAction> {
         self.poll_background();
         self.tick_timers(ctx);
@@ -509,155 +531,278 @@ impl InputLabUiState {
         );
         let mut nav_action: Option<InputLabNavAction> = None;
 
-        // Live viewport-driven width so resizing smaller/larger immediately reflows every chart and card.
-        let content_w = (ctx.screen_rect().width() - 36.0).max(320.0);
+        let content_w = ui.available_width().max(320.0);
         ui.set_max_width(content_w);
+
+        // --- BENCH SINGLE-ROW HEADER + CAPTURE / EXPORT MENU ---
+        self.render_bench_header(
+            ctx,
+            ui,
+            p,
+            mode,
+            content_w,
+            &advice,
+            health_checks,
+            windows_version,
+        );
+
+        ui.add_space(10.0);
+
+        // --- 4 CLEAN SUB-TABS (`Polling` | `Aim & Switches` | `System & USB` | `Audio & Net`) ---
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label) in [
+                (BenchSubTab::Polling, "Polling"),
+                (BenchSubTab::AimSwitches, "Aim & Switches"),
+                (BenchSubTab::SystemUsb, "System & USB"),
+                (BenchSubTab::AudioNet, "Audio & Net"),
+            ] {
+                let selected = self.active_tab == tab;
+                let btn = egui::Button::new(
+                    RichText::new(label)
+                        .size(12.5)
+                        .color(if selected { p.text } else { p.text_muted })
+                        .strong(),
+                )
+                .fill(if selected {
+                    p.surface_alt
+                } else {
+                    Color32::TRANSPARENT
+                })
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if selected {
+                        p.border
+                    } else {
+                        Color32::TRANSPARENT
+                    },
+                ))
+                .corner_radius(CornerRadius::same(6));
+                if ui.add(btn).clicked() {
+                    self.active_tab = tab;
+                }
+            }
+        });
+
+        ui.add_space(10.0);
 
         egui::ScrollArea::vertical()
             .id_salt("input_lab_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let scroll_w = (content_w - 14.0).max(280.0);
+                let scroll_w = (content_w - 8.0).max(280.0);
                 ui.set_max_width(scroll_w);
 
-                // --- 1. CONTROL & LIVE SUMMARY CARD ---
-                self.render_controls_card(ctx, ui, p, mode, scroll_w, detected_dpi, &advice);
-
                 if let Some((sev, msg)) = self.notice.clone() {
-                    ui.add_space(8.0);
                     semantic_banner(ui, p, mode, scroll_w, sev, &msg);
+                    ui.add_space(10.0);
                 }
 
-                if self.pinned_baseline.is_some() {
-                    ui.add_space(10.0);
-                    self.render_ab_comparison_card(ui, p, mode, scroll_w);
-                }
+                match self.active_tab {
+                    BenchSubTab::Polling => {
+                        self.render_polling_hero_strip(ui, p, mode, scroll_w, detected_dpi);
 
-                ui.add_space(10.0);
+                        if self.pinned_baseline.is_some() {
+                            ui.add_space(12.0);
+                            self.render_ab_comparison_card(ui, p, mode, scroll_w);
+                        }
 
-                // --- 2. POLLING CONSISTENCY, HISTOGRAM, VELOCITY & XY TRACE CARD ---
-                self.render_polling_chart_card(ui, p, mode, scroll_w);
+                        ui.add_space(12.0);
+                        self.render_polling_chart_card(ui, p, mode, scroll_w);
 
-                if !advice.is_empty() {
-                    ui.add_space(10.0);
-                    if let Some(act) = render_advice_card(ui, p, mode, scroll_w, &advice) {
-                        nav_action = Some(act);
+                        if !advice.is_empty() {
+                            ui.add_space(12.0);
+                            if let Some(act) = render_advice_card(ui, p, mode, scroll_w, &advice) {
+                                nav_action = Some(act);
+                            }
+                        }
+                    }
+                    BenchSubTab::AimSwitches => {
+                        self.render_sensitivity_converter_card(ctx, ui, p, scroll_w);
+                        ui.add_space(12.0);
+                        self.render_dpi_calibrator_card(ctx, ui, p, mode, scroll_w);
+                        ui.add_space(12.0);
+                        if scroll_w < 720.0 {
+                            self.render_click_bounce_card(ui, p, mode, scroll_w);
+                            ui.add_space(12.0);
+                            self.render_keyboard_scan_card(ui, p, mode, scroll_w);
+                        } else {
+                            let gap = 12.0;
+                            let half_w = ((scroll_w - gap) * 0.5).max(260.0);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(half_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        self.render_click_bounce_card(ui, p, mode, half_w);
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(half_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        self.render_keyboard_scan_card(ui, p, mode, half_w);
+                                    },
+                                );
+                            });
+                        }
+                    }
+                    BenchSubTab::SystemUsb => {
+                        self.render_system_stall_card(ui, p, mode, scroll_w);
+                        ui.add_space(12.0);
+                        if scroll_w < 720.0 {
+                            self.render_usb_topology_card(ui, p, mode, scroll_w);
+                            ui.add_space(12.0);
+                            self.render_timer_benchmark_card(ctx, ui, p, mode, scroll_w);
+                        } else {
+                            let gap = 12.0;
+                            let half_w = ((scroll_w - gap) * 0.5).max(260.0);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(half_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        self.render_usb_topology_card(ui, p, mode, half_w);
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(half_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        self.render_timer_benchmark_card(
+                                            ctx, ui, p, mode, half_w,
+                                        );
+                                    },
+                                );
+                            });
+                        }
+                    }
+                    BenchSubTab::AudioNet => {
+                        if scroll_w < 720.0 {
+                            self.render_audio_benchmark_card(ctx, ui, p, mode, scroll_w);
+                            ui.add_space(12.0);
+                            self.render_network_benchmark_card(ctx, ui, p, mode, scroll_w);
+                        } else {
+                            let gap = 12.0;
+                            let half_w = ((scroll_w - gap) * 0.5).max(260.0);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(half_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        self.render_audio_benchmark_card(
+                                            ctx, ui, p, mode, half_w,
+                                        );
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(half_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        self.render_network_benchmark_card(
+                                            ctx, ui, p, mode, half_w,
+                                        );
+                                    },
+                                );
+                            });
+                        }
+                        ui.add_space(12.0);
+                        card_frame(ui, p, scroll_w, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("All-in-One Rig Scorecard")
+                                            .size(13.5)
+                                            .strong()
+                                            .color(p.text),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "Export a single 1040×620 monochrome PNG combining Health Check, 4K/8K Polling + OS Stalls, USB Topology, WASAPI Audio, and Dual-Hop Ping.",
+                                        )
+                                        .size(11.5)
+                                        .color(p.text_muted),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(primary_btn("Save Rig Scorecard PNG", p))
+                                            .clicked()
+                                        {
+                                            self.save_rig_scorecard_png(
+                                                mode,
+                                                health_checks,
+                                                windows_version,
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+                        });
                     }
                 }
 
-                ui.add_space(10.0);
-
-                // --- 3. MEASURED DPI / CPI CALIBRATOR CARD ---
-                self.render_dpi_calibrator_card(ctx, ui, p, mode, scroll_w);
-
-                ui.add_space(10.0);
-
-                // --- 4. BOTTOM TWO-COLUMN: CLICK DEBOUNCE + 1S TIMER BENCHMARK ---
-                if scroll_w < 720.0 {
-                    self.render_click_bounce_card(ui, p, mode, scroll_w);
-                    ui.add_space(10.0);
-                    self.render_timer_benchmark_card(ctx, ui, p, mode, scroll_w);
-                } else {
-                    let gap = 10.0;
-                    let half_w = ((scroll_w - gap) * 0.5).max(260.0);
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(half_w, 0.0),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                self.render_click_bounce_card(ui, p, mode, half_w);
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(half_w, 0.0),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                self.render_timer_benchmark_card(ctx, ui, p, mode, half_w);
-                            },
-                        );
-                    });
-                }
-
-                ui.add_space(10.0);
-
-                // --- 5. KEYBOARD SCAN-RATE & USB PORT/HUB TOPOLOGY ---
-                if self.usb_topology.is_none() {
-                    self.usb_topology = Some(WindowsEnv.list_usb_topology().unwrap_or_default());
-                }
-                if scroll_w < 720.0 {
-                    self.render_keyboard_scan_card(ui, p, mode, scroll_w);
-                    ui.add_space(10.0);
-                    self.render_usb_topology_card(ui, p, mode, scroll_w);
-                } else {
-                    let gap = 10.0;
-                    let half_w = ((scroll_w - gap) * 0.5).max(260.0);
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(half_w, 0.0),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                self.render_keyboard_scan_card(ui, p, mode, half_w);
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(half_w, 0.0),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                self.render_usb_topology_card(ui, p, mode, half_w);
-                            },
-                        );
-                    });
-                }
-
-                ui.add_space(10.0);
-
-                // --- 6. WASAPI AUDIO & DUAL-HOP NETWORK PING BENCHMARKS ---
-                if scroll_w < 760.0 {
-                    self.render_audio_benchmark_card(ctx, ui, p, mode, scroll_w);
-                    ui.add_space(10.0);
-                    self.render_network_benchmark_card(ctx, ui, p, mode, scroll_w);
-                } else {
-                    let gap = 10.0;
-                    let half_w = ((scroll_w - gap) * 0.5).max(260.0);
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(half_w, 0.0),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                self.render_audio_benchmark_card(ctx, ui, p, mode, half_w);
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(half_w, 0.0),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                self.render_network_benchmark_card(ctx, ui, p, mode, half_w);
-                            },
-                        );
-                    });
-                }
-
-                ui.add_space(4.0);
+                ui.add_space(6.0);
             });
 
         nav_action
     }
 
+    fn save_rig_scorecard_png(
+        &mut self,
+        mode: ThemeMode,
+        health_checks: &[CheckReport],
+        windows_version: Option<&str>,
+    ) {
+        let dir = AppPaths::default_user_dir().exports_dir();
+        let input = RigScorecardInput {
+            windows_version,
+            health_checks,
+            diagnostics: &self.last_snapshot,
+            configured_dpi: self.configured_dpi,
+            usb_topology: self.usb_topology.as_deref().unwrap_or(&[]),
+            timer: self.timer_benchmark.as_ref(),
+            audio: self.audio_benchmark.as_ref(),
+            network: self.network_benchmark.as_ref(),
+        };
+        let png = render_rig_scorecard_png(&input, matches!(mode, ThemeMode::Dark));
+        let filename = format!(
+            "polled_rig_scorecard_{}.png",
+            Local::now().format("%Y%m%d_%H%M%S")
+        );
+        let path = dir.join(filename);
+        match fs::create_dir_all(&dir).and_then(|()| fs::write(&path, &png)) {
+            Ok(()) => {
+                self.notice = Some((
+                    Severity::Ok,
+                    format!("Saved All-in-One Rig Scorecard PNG to {}", path.display()),
+                ));
+            }
+            Err(err) => {
+                self.notice = Some((
+                    Severity::Bad,
+                    format!("Failed to save Rig Scorecard PNG: {err}"),
+                ));
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn render_controls_card(
+    fn render_bench_header(
         &mut self,
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         p: Palette,
         mode: ThemeMode,
-        card_w: f32,
-        detected_dpi: Option<u16>,
+        outer_w: f32,
         advice: &[DiagnosticAdvice],
+        health_checks: &[CheckReport],
+        windows_version: Option<&str>,
     ) {
-        let inner_w = (card_w - 24.0).max(120.0);
         let capturing = self.is_live_capturing();
         let counting_down = self.is_counting_down();
         let active_or_armed = capturing || counting_down;
@@ -667,334 +812,178 @@ impl InputLabUiState {
         let cap_remaining = self
             .capture_ends_at
             .map(|end| end.saturating_duration_since(Instant::now()).as_secs_f32());
+
+        let has_data = self.last_snapshot.polling.total_motion_packets > 0
+            || self.last_snapshot.clicks.total_presses > 0
+            || self.last_snapshot.dpi_measurement.packet_count > 0
+            || self.timer_benchmark.is_some()
+            || self.audio_benchmark.is_some()
+            || self.network_benchmark.is_some();
+        let has_samples = !self.last_snapshot.polling.recent_samples.is_empty();
+        let has_pinned = self.pinned_baseline.is_some();
+
         let mut toggle_capture = false;
         let mut do_reset = false;
         let mut do_copy = false;
         let mut do_save_png = false;
+        let mut do_save_scorecard = false;
         let mut do_save_csv = false;
         let mut do_open_exports = false;
         let mut do_pin_a = false;
         let mut do_clear_a = false;
         let mut do_save_ab_png = false;
-        let has_pinned = self.pinned_baseline.is_some();
         let mut next_mode = self.capture_mode;
-        let mut next_target = self.target;
-        let mut dpi_val = self.configured_dpi;
-        let mut dpi_changed = false;
 
-        card_frame(ui, p, card_w, |ui| {
-            let split = inner_w < 1040.0;
-            let has_data = self.last_snapshot.polling.total_motion_packets > 0
-                || self.last_snapshot.clicks.total_presses > 0
-                || self.last_snapshot.dpi_measurement.packet_count > 0
-                || self.timer_benchmark.is_some()
-                || self.audio_benchmark.is_some()
-                || self.network_benchmark.is_some();
-            let has_samples = !self.last_snapshot.polling.recent_samples.is_empty();
+        let (status_text, status_col) = if let Some(rem) = prep_remaining {
+            (format!("STARTING IN {rem:.1}s · ESC"), p.warn)
+        } else if let Some(rem) = cap_remaining {
+            (format!("LIVE · {rem:.1}s LEFT · ESC"), p.ok)
+        } else if capturing {
+            ("LIVE (QPC) · ESC".to_string(), p.ok)
+        } else {
+            ("IDLE · 0% CPU".to_string(), p.text_muted)
+        };
 
-            let draw_primary_actions =
-                |ui: &mut egui::Ui,
-                 next_mode: &mut CaptureMode,
-                 toggle_capture: &mut bool,
-                 do_reset: &mut bool| {
-                    let cap_label = if counting_down {
-                        "Cancel (Esc)"
-                    } else if capturing {
-                        "Stop (Esc)"
-                    } else {
-                        "Start Capture"
-                    };
-                    if ui
-                        .add(primary_btn(cap_label, p))
-                        .on_hover_text(
-                            "Press Esc anytime to stop or cancel capture hands-free without moving or clicking your mouse",
-                        )
-                        .clicked()
-                    {
-                        *toggle_capture = true;
-                    }
-                    ui.add_enabled_ui(!active_or_armed, |ui| {
-                        egui::ComboBox::from_id_salt("input_lab_capture_mode")
-                            .selected_text(next_mode.label())
-                            .width(86.0)
-                            .show_ui(ui, |ui| {
-                                for m in CaptureMode::ALL {
-                                    ui.selectable_value(next_mode, m, m.label());
-                                }
-                            })
-                            .response
-                            .on_hover_text(
-                                "Timed modes wait 3s after clicking Start so your hand can get ready, then auto-stop cleanly without clicking Stop",
-                            );
-                    });
-                    if ui.add(secondary_btn("Reset", p)).clicked() {
-                        *do_reset = true;
-                    }
-                };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Bench").size(20.0).strong().color(p.text));
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(&status_text)
+                    .size(11.0)
+                    .strong()
+                    .monospace()
+                    .color(status_col),
+            );
 
-            let draw_secondary_actions =
-                |ui: &mut egui::Ui,
-                 next_target: &mut PollingTarget,
-                 dpi_val: &mut u32,
-                 dpi_changed: &mut bool,
-                 do_copy: &mut bool,
-                 do_save_png: &mut bool,
-                 do_save_csv: &mut bool,
-                 do_open_exports: &mut bool,
-                 do_pin_a: &mut bool,
-                 do_clear_a: &mut bool,
-                 do_save_ab_png: &mut bool| {
-                    ui.label(RichText::new("Target:").color(p.text_muted).size(12.0));
-                    egui::ComboBox::from_id_salt("input_lab_target_hz")
-                        .selected_text(next_target.label())
-                        .width(108.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(next_target, PollingTarget::Auto, "Auto-detect");
-                            for hz in STANDARD_RATES_HZ {
-                                ui.selectable_value(
-                                    next_target,
-                                    PollingTarget::FixedHz(hz),
-                                    format!("{hz} Hz"),
-                                );
-                            }
-                        });
-
-                    ui.label(RichText::new("DPI:").color(p.text_muted).size(12.0));
-                    let dpi_resp = ui
-                    .add(
-                        egui::DragValue::new(dpi_val)
-                            .range(100..=32000)
-                            .speed(50)
-                            .suffix(" DPI"),
-                    )
-                    .on_hover_text(match detected_dpi {
-                        Some(d) => format!(
-                            "Used for IPS, G-force, and DPI accuracy (auto-detected {d} DPI from mouse)"
-                        ),
-                        None => "Configured mouse DPI used for IPS, G-force, and DPI accuracy"
-                            .to_string(),
-                    });
-                    if dpi_resp.changed() {
-                        *dpi_changed = true;
-                    }
-
-                    if ui
-                        .add_enabled(has_data, secondary_btn("Pin Baseline (A)", p))
-                        .on_hover_text(
-                            "Save this run as Baseline (A), then capture again to compare Before vs After",
-                        )
-                        .clicked()
-                    {
-                        *do_pin_a = true;
-                    }
-                    if has_pinned {
-                        if ui.add(secondary_btn("Clear A", p)).clicked() {
-                            *do_clear_a = true;
-                        }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button(
+                    RichText::new("Export ▾").size(12.5).color(p.text_muted),
+                    |ui| {
+                        ui.set_min_width(210.0);
                         if ui
-                            .add_enabled(has_data, secondary_btn("Save A/B PNG", p))
-                            .on_hover_text("Export a side-by-side Before (A) vs After (B) PNG card")
+                            .add_enabled(has_data, egui::Button::new("Copy Full Report"))
                             .clicked()
                         {
-                            *do_save_ab_png = true;
+                            do_copy = true;
+                            ui.close_menu();
                         }
-                    }
+                        if ui
+                            .add_enabled(has_data, egui::Button::new("Save Bench PNG (960×560)"))
+                            .clicked()
+                        {
+                            do_save_png = true;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("Save Rig Scorecard PNG (1040×620)")
+                            .clicked()
+                        {
+                            do_save_scorecard = true;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(has_samples, egui::Button::new("Save Raw Intervals CSV"))
+                            .clicked()
+                        {
+                            do_save_csv = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(has_data, egui::Button::new("Pin Baseline (A)"))
+                            .clicked()
+                        {
+                            do_pin_a = true;
+                            ui.close_menu();
+                        }
+                        if has_pinned {
+                            if ui
+                                .add_enabled(has_data, egui::Button::new("Save A/B Comparison PNG"))
+                                .clicked()
+                            {
+                                do_save_ab_png = true;
+                                ui.close_menu();
+                            }
+                            if ui.button("Clear Baseline (A)").clicked() {
+                                do_clear_a = true;
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Open Exports Folder").clicked() {
+                            do_open_exports = true;
+                            ui.close_menu();
+                        }
+                    },
+                );
 
-                    if ui
-                        .add_enabled(has_data, secondary_btn("Copy Report", p))
-                        .clicked()
-                    {
-                        *do_copy = true;
-                    }
-                    if ui
-                        .add_enabled(has_data, secondary_btn("Save PNG", p))
-                        .on_hover_text("Export a shareable 960x560 monochrome benchmark card PNG")
-                        .clicked()
-                    {
-                        *do_save_png = true;
-                    }
-                    if ui
-                        .add_enabled(has_samples, secondary_btn("Save CSV", p))
-                        .on_hover_text("Export raw per-packet polling intervals and speeds as CSV")
-                        .clicked()
-                    {
-                        *do_save_csv = true;
-                    }
-                    if ui
-                        .add(secondary_btn("Exports", p))
-                        .on_hover_text("Open %LOCALAPPDATA%\\Polled\\exports in File Explorer")
-                        .clicked()
-                    {
-                        *do_open_exports = true;
-                    }
+                if ui.add(secondary_btn("Reset", p)).clicked() {
+                    do_reset = true;
+                }
+
+                ui.add_enabled_ui(!active_or_armed, |ui| {
+                    egui::ComboBox::from_id_salt("input_lab_capture_mode")
+                        .selected_text(next_mode.label())
+                        .width(84.0)
+                        .show_ui(ui, |ui| {
+                            for m in CaptureMode::ALL {
+                                ui.selectable_value(&mut next_mode, m, m.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Timed modes wait 3s so your hand can get ready, then auto-stop cleanly",
+                        );
+                });
+
+                let cap_label = if counting_down {
+                    "Cancel (Esc)"
+                } else if capturing {
+                    "Stop (Esc)"
+                } else {
+                    "Start Capture"
                 };
-
-            let (status_text, status_col) = if let Some(rem) = prep_remaining {
-                (format!("STARTING IN {rem:.1}s · ESC"), p.warn)
-            } else if let Some(rem) = cap_remaining {
-                (format!("LIVE · {rem:.1}s LEFT · ESC"), p.ok)
-            } else if capturing {
-                ("LIVE (QPC) · ESC TO STOP".to_string(), p.ok)
-            } else {
-                ("IDLE · 0% CPU".to_string(), p.text_muted)
-            };
-
-            if split {
-                ui.horizontal(|ui| {
-                    draw_primary_actions(ui, &mut next_mode, &mut toggle_capture, &mut do_reset);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(&status_text)
-                                .size(11.0)
-                                .strong()
-                                .monospace()
-                                .color(status_col),
-                        );
-                    });
-                });
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    draw_secondary_actions(
-                        ui,
-                        &mut next_target,
-                        &mut dpi_val,
-                        &mut dpi_changed,
-                        &mut do_copy,
-                        &mut do_save_png,
-                        &mut do_save_csv,
-                        &mut do_open_exports,
-                        &mut do_pin_a,
-                        &mut do_clear_a,
-                        &mut do_save_ab_png,
-                    );
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    draw_primary_actions(ui, &mut next_mode, &mut toggle_capture, &mut do_reset);
-                    ui.add_space(6.0);
-                    draw_secondary_actions(
-                        ui,
-                        &mut next_target,
-                        &mut dpi_val,
-                        &mut dpi_changed,
-                        &mut do_copy,
-                        &mut do_save_png,
-                        &mut do_save_csv,
-                        &mut do_open_exports,
-                        &mut do_pin_a,
-                        &mut do_clear_a,
-                        &mut do_save_ab_png,
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(&status_text)
-                                .size(11.0)
-                                .strong()
-                                .monospace()
-                                .color(status_col),
-                        );
-                    });
-                });
-            }
-
-            if let Some(rem) = prep_remaining {
-                ui.add_space(6.0);
-                let frac = (1.0 - (rem / self.countdown_total_secs.max(0.1))).clamp(0.0, 1.0);
-                render_timed_progress_bar(
-                    ui,
-                    p,
-                    mode,
-                    inner_w,
-                    Severity::Warn,
-                    frac,
-                    &format!(
-                        "Get ready — starting {}s capture in {:.1}s (press Esc to cancel)...",
-                        self.capture_total_secs.round() as u64,
-                        rem
-                    ),
-                );
-            } else if let Some(rem) = cap_remaining {
-                ui.add_space(6.0);
-                let frac = (1.0 - (rem / self.capture_total_secs.max(0.1))).clamp(0.0, 1.0);
-                render_timed_progress_bar(
-                    ui,
-                    p,
-                    mode,
-                    inner_w,
-                    Severity::Ok,
-                    frac,
-                    &format!(
-                        "Recording {}s timed run — {:.1}s left (auto-stops cleanly, or press Esc anytime)",
-                        self.capture_total_secs.round() as u64,
-                        rem
-                    ),
-                );
-            }
-
-            ui.add_space(6.0);
-
-            let ps = &self.last_snapshot.polling;
-            let tr = &self.last_snapshot.tracking;
-            let dpi_f = f64::from(dpi_val.max(1));
-
-            let eff_str = if ps.effective_hz >= 1.0 {
-                format!("{:.0} Hz", ps.effective_hz)
-            } else {
-                "—".to_string()
-            };
-            let peak_str = if ps.peak_hz >= 1.0 {
-                format!("{:.0} Hz", ps.peak_hz)
-            } else {
-                "—".to_string()
-            };
-            let target_str = if ps.nominal_hz > 0 {
-                format!("{} Hz", ps.nominal_hz)
-            } else {
-                self.target.label()
-            };
-            let sat_str = if ps.active_intervals > 0 {
-                format!("{:.0}%", ps.saturated_pct)
-            } else {
-                "—".to_string()
-            };
-            let consistency_str = if ps.saturated_intervals > 0 {
-                format!("{:.1}%", ps.saturated_within_15_pct)
-            } else if ps.active_intervals > 0 {
-                format!("{:.1}%", ps.within_15_pct)
-            } else {
-                "—".to_string()
-            };
-            let peak_ips = tr.peak_ips(dpi_f);
-            let peak_g = tr.peak_accel_g(dpi_f);
-            let speed_str = if peak_ips >= 0.1 {
-                format!("{:.1} IPS · {:.1} G", peak_ips, peak_g)
-            } else {
-                "—".to_string()
-            };
-
-            let pills = vec![
-                ("EFFECTIVE".to_string(), eff_str),
-                ("PEAK".to_string(), peak_str),
-                ("TARGET".to_string(), target_str),
-                ("SATURATED".to_string(), sat_str),
-                ("SAT ±15%".to_string(), consistency_str),
-                ("DROPOUTS".to_string(), ps.true_dropout_count.to_string()),
-                ("SLOW SLOTS".to_string(), ps.slow_slot_count.to_string()),
-                ("BUNCHED".to_string(), ps.bunch_count.to_string()),
-                ("PEAK TRACKING".to_string(), speed_str),
-                ("PACKETS".to_string(), ps.total_motion_packets.to_string()),
-            ];
-            render_status_pill_rows(ui, p, inner_w, &pills);
+                if ui.add(primary_btn(cap_label, p)).clicked() {
+                    toggle_capture = true;
+                }
+            });
         });
 
+        if let Some(rem) = prep_remaining {
+            ui.add_space(8.0);
+            let frac = (1.0 - (rem / self.countdown_total_secs.max(0.1))).clamp(0.0, 1.0);
+            render_timed_progress_bar(
+                ui,
+                p,
+                mode,
+                outer_w,
+                Severity::Warn,
+                frac,
+                &format!(
+                    "Get ready — starting {}s capture in {:.1}s (press Esc to cancel)...",
+                    self.capture_total_secs.round() as u64,
+                    rem
+                ),
+            );
+        } else if let Some(rem) = cap_remaining {
+            ui.add_space(8.0);
+            let frac = (1.0 - (rem / self.capture_total_secs.max(0.1))).clamp(0.0, 1.0);
+            render_timed_progress_bar(
+                ui,
+                p,
+                mode,
+                outer_w,
+                Severity::Ok,
+                frac,
+                &format!(
+                    "Recording {}s timed run — {:.1}s left (auto-stops cleanly, or press Esc anytime)",
+                    self.capture_total_secs.round() as u64,
+                    rem
+                ),
+            );
+        }
+
         self.capture_mode = next_mode;
-        if dpi_changed {
-            self.configured_dpi = dpi_val;
-            self.dpi_manually_edited = true;
-        }
-        if next_target != self.target {
-            self.set_target(next_target);
-        }
         if toggle_capture {
             if active_or_armed {
                 self.stop_capture();
@@ -1056,6 +1045,9 @@ impl InputLabUiState {
                     self.notice = Some((Severity::Bad, format!("Failed to save PNG: {err}")));
                 }
             }
+        }
+        if do_save_scorecard {
+            self.save_rig_scorecard_png(mode, health_checks, windows_version);
         }
         if do_save_csv {
             let dir = AppPaths::default_user_dir().exports_dir();
@@ -1144,6 +1136,444 @@ impl InputLabUiState {
                 }
             }
         }
+    }
+
+    fn render_polling_hero_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+        detected_dpi: Option<u16>,
+    ) {
+        let mut next_target = self.target;
+        let mut dpi_val = self.configured_dpi;
+        let mut dpi_changed = false;
+
+        // Clean 1-line Target Hz + DPI selector bar
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Target").size(12.0).color(p.text_muted));
+            egui::ComboBox::from_id_salt("input_lab_target_hz")
+                .selected_text(next_target.label())
+                .width(106.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut next_target, PollingTarget::Auto, "Auto-detect");
+                    for hz in STANDARD_RATES_HZ {
+                        ui.selectable_value(
+                            &mut next_target,
+                            PollingTarget::FixedHz(hz),
+                            format!("{hz} Hz"),
+                        );
+                    }
+                });
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("DPI").size(12.0).color(p.text_muted));
+            if ui
+                .add(
+                    egui::DragValue::new(&mut dpi_val)
+                        .range(100..=32000)
+                        .speed(50)
+                        .suffix(" DPI"),
+                )
+                .on_hover_text(match detected_dpi {
+                    Some(d) => format!("Auto-detected {d} DPI from connected mouse"),
+                    None => {
+                        "Configured mouse DPI used for IPS, G-force & DPI calibration".to_string()
+                    }
+                })
+                .changed()
+            {
+                dpi_changed = true;
+            }
+        });
+
+        if dpi_changed {
+            self.configured_dpi = dpi_val;
+            self.dpi_manually_edited = true;
+        }
+        if next_target != self.target {
+            self.set_target(next_target);
+        }
+
+        ui.add_space(10.0);
+
+        // 4 Spacious Hero KPI Tiles
+        let ps = &self.last_snapshot.polling;
+        let tr = &self.last_snapshot.tracking;
+        let sys = &self.last_snapshot.system_load;
+        let dpi_f = f64::from(self.configured_dpi.max(1));
+
+        let eff_val = if ps.effective_hz >= 1.0 {
+            format!("{:.0} Hz", ps.effective_hz)
+        } else {
+            "—".to_string()
+        };
+        let eff_sub = if ps.nominal_hz > 0 {
+            format!("Target {} Hz · Peak {:.0}", ps.nominal_hz, ps.peak_hz)
+        } else {
+            "Start capture & move mouse".to_string()
+        };
+
+        let cons_val = if ps.saturated_intervals > 0 {
+            format!("{:.1}%", ps.saturated_within_15_pct)
+        } else if ps.active_intervals > 0 {
+            format!("{:.1}%", ps.within_15_pct)
+        } else {
+            "—".to_string()
+        };
+        let cons_sub = if ps.active_intervals > 0 {
+            format!(
+                "Sat {:.0}% · σ {:.3} ms",
+                ps.saturated_pct,
+                ps.std_dev_us / 1000.0
+            )
+        } else {
+            "Saturated ±15% cadence".to_string()
+        };
+        let cons_col = ps
+            .health_severity
+            .map(|s| p.severity_fg(s))
+            .unwrap_or(p.text);
+
+        let drop_val = ps.true_dropout_count.to_string();
+        let drop_col = if ps.true_dropout_count > 0 {
+            p.bad
+        } else if ps.bunch_count > 0 {
+            p.warn
+        } else {
+            p.text
+        };
+        let drop_sub = format!(
+            "{} OS · {} RF/USB · {} bunched",
+            sys.os_correlated_dropouts, sys.transport_only_dropouts, ps.bunch_count
+        );
+
+        let peak_ips = tr.peak_ips(dpi_f);
+        let peak_g = tr.peak_accel_g(dpi_f);
+        let speed_val = if peak_ips >= 0.1 {
+            format!("{peak_ips:.1} IPS")
+        } else {
+            "—".to_string()
+        };
+        let speed_sub = if peak_ips >= 0.1 {
+            format!("{peak_g:.1} G · {} pkts", ps.total_motion_packets)
+        } else {
+            format!("@ {} DPI", self.configured_dpi)
+        };
+
+        let tiles = [
+            ("EFFECTIVE RATE", eff_val, eff_sub, p.text),
+            ("CONSISTENCY", cons_val, cons_sub, cons_col),
+            ("DROPOUTS", drop_val, drop_sub, drop_col),
+            ("PEAK TRACKING", speed_val, speed_sub, p.text),
+        ];
+
+        let gap = 10.0;
+        if card_w < 680.0 {
+            let half = ((card_w - gap) * 0.5).max(140.0);
+            for pair in tiles.chunks(2) {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for (lbl, val, sub, col) in pair {
+                        render_hero_kpi_tile(ui, p, half, lbl, val, sub, *col);
+                    }
+                });
+                ui.add_space(8.0);
+            }
+        } else {
+            let tile_w = ((card_w - gap * 3.0) / 4.0).max(140.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (lbl, val, sub, col) in &tiles {
+                    render_hero_kpi_tile(ui, p, tile_w, lbl, val, sub, *col);
+                }
+            });
+        }
+
+        // OS / CPU Stall Correlation Banner (only once capture data exists)
+        if sys.sample_count > 0 && !sys.diagnosis.is_empty() {
+            ui.add_space(10.0);
+            let corr_sev = if sys.os_correlated_dropouts > 0 || sys.scheduler_stalls >= 2 {
+                Severity::Warn
+            } else if sys.transport_only_dropouts > 0 {
+                Severity::Info
+            } else {
+                Severity::Ok
+            };
+            semantic_banner(ui, p, mode, card_w, corr_sev, &sys.diagnosis);
+        }
+    }
+
+    fn render_sensitivity_converter_card(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        p: Palette,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(160.0);
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("eDPI & cm/360° Sensitivity Converter")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("Step to 1600 / 3200 DPI without changing muscle memory")
+                            .size(11.5)
+                            .color(p.text_muted),
+                    );
+                });
+            });
+            ui.add_space(10.0);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Game").size(12.0).color(p.text_muted));
+                egui::ComboBox::from_id_salt("sens_src_game")
+                    .selected_text(self.sens_source_game.label())
+                    .width(155.0)
+                    .show_ui(ui, |ui| {
+                        for g in SensitivityGame::ALL {
+                            ui.selectable_value(&mut self.sens_source_game, g, g.label());
+                        }
+                    });
+
+                ui.add_space(6.0);
+                ui.label(RichText::new("DPI").size(12.0).color(p.text_muted));
+                ui.add(
+                    egui::DragValue::new(&mut self.configured_dpi)
+                        .range(100..=32000)
+                        .speed(50),
+                );
+
+                ui.add_space(6.0);
+                ui.label(RichText::new("In-Game Sens").size(12.0).color(p.text_muted));
+                ui.add(
+                    egui::DragValue::new(&mut self.sens_source_sens)
+                        .range(0.001..=100.0)
+                        .speed(0.01)
+                        .fixed_decimals(3),
+                );
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Target DPI").size(12.0).color(p.text_muted));
+                ui.add(
+                    egui::DragValue::new(&mut self.sens_target_dpi)
+                        .range(100..=32000)
+                        .speed(50),
+                );
+                for preset in [800u32, 1600, 3200] {
+                    let preset_lbl = preset.to_string();
+                    let btn = if self.sens_target_dpi == preset {
+                        primary_btn(&preset_lbl, p)
+                    } else {
+                        secondary_btn(&preset_lbl, p)
+                    };
+                    if ui.add(btn).clicked() {
+                        self.sens_target_dpi = preset;
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Convert to Game")
+                        .size(12.0)
+                        .color(p.text_muted),
+                );
+                egui::ComboBox::from_id_salt("sens_dst_game")
+                    .selected_text(self.sens_target_game.label())
+                    .width(155.0)
+                    .show_ui(ui, |ui| {
+                        for g in SensitivityGame::ALL {
+                            ui.selectable_value(&mut self.sens_target_game, g, g.label());
+                        }
+                    });
+            });
+
+            if let Some(conv) = compute_sensitivity(
+                self.sens_source_game,
+                f64::from(self.configured_dpi),
+                self.sens_source_sens,
+                self.sens_target_game,
+                f64::from(self.sens_target_dpi),
+            ) {
+                ui.add_space(10.0);
+                let gap = 10.0;
+                let tile_w = if inner_w < 600.0 {
+                    ((inner_w - gap) * 0.5).max(120.0)
+                } else {
+                    ((inner_w - gap * 3.0) / 4.0).max(120.0)
+                };
+                let tiles = [
+                    (
+                        "eDPI",
+                        format!("{:.0}", conv.source_edpi),
+                        format!("{} × {:.3}", self.configured_dpi, self.sens_source_sens),
+                    ),
+                    (
+                        "CM / 360°",
+                        format!("{:.2} cm", conv.cm_per_360),
+                        format!("{:.2} in / 360°", conv.inches_per_360),
+                    ),
+                    (
+                        &format!("SAME GAME @ {}", self.sens_target_dpi),
+                        format!("{:.4}", conv.target_sens_same_game),
+                        self.sens_source_game.label().to_string(),
+                    ),
+                    (
+                        &format!(
+                            "{} @ {}",
+                            self.sens_target_game.label().to_uppercase(),
+                            self.sens_target_dpi
+                        ),
+                        format!("{:.4}", conv.target_sens_cross_game),
+                        "Exact cm/360° match".to_string(),
+                    ),
+                ];
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for (lbl, val, sub) in &tiles {
+                        render_hero_kpi_tile(ui, p, tile_w, lbl, val, sub, p.text);
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(secondary_btn(
+                            &format!(
+                                "Copy {:.4} ({})",
+                                conv.target_sens_same_game,
+                                self.sens_source_game.label()
+                            ),
+                            p,
+                        ))
+                        .clicked()
+                    {
+                        ctx.copy_text(format!("{:.4}", conv.target_sens_same_game));
+                        self.notice = Some((
+                            Severity::Ok,
+                            format!(
+                                "Copied sensitivity {:.4} for {} DPI.",
+                                conv.target_sens_same_game, self.sens_target_dpi
+                            ),
+                        ));
+                    }
+                    if self.sens_target_game != self.sens_source_game
+                        && ui
+                            .add(secondary_btn(
+                                &format!(
+                                    "Copy {:.4} ({})",
+                                    conv.target_sens_cross_game,
+                                    self.sens_target_game.label()
+                                ),
+                                p,
+                            ))
+                            .clicked()
+                    {
+                        ctx.copy_text(format!("{:.4}", conv.target_sens_cross_game));
+                        self.notice = Some((
+                            Severity::Ok,
+                            format!(
+                                "Copied {} sensitivity {:.4}.",
+                                self.sens_target_game.label(),
+                                conv.target_sens_cross_game
+                            ),
+                        ));
+                    }
+                });
+            }
+        });
+    }
+
+    fn render_system_stall_card(
+        &self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(160.0);
+        let sys = &self.last_snapshot.system_load;
+        card_frame(ui, p, card_w, |ui| {
+            ui.label(
+                RichText::new("CPU & Windows Scheduler Stall Correlation")
+                    .size(14.0)
+                    .strong()
+                    .color(p.text),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Samples Win32 GetSystemTimes (total + kernel/DPC CPU %) and scheduler wake overshoots alongside your capture to pinpoint whether dropouts came from Windows CPU stalls or wireless/USB transport.",
+                )
+                .size(11.5)
+                .color(p.text_muted),
+            );
+            ui.add_space(10.0);
+
+            let pills = vec![
+                (
+                    "AVG CPU".to_string(),
+                    if sys.sample_count > 0 {
+                        format!("{:.0}%", sys.avg_cpu_pct)
+                    } else {
+                        "—".to_string()
+                    },
+                ),
+                (
+                    "PEAK CPU".to_string(),
+                    if sys.sample_count > 0 {
+                        format!("{:.0}%", sys.peak_cpu_pct)
+                    } else {
+                        "—".to_string()
+                    },
+                ),
+                (
+                    "KERNEL PEAK".to_string(),
+                    if sys.sample_count > 0 {
+                        format!("{:.0}%", sys.peak_kernel_pct)
+                    } else {
+                        "—".to_string()
+                    },
+                ),
+                ("OS STALLS".to_string(), sys.scheduler_stalls.to_string()),
+                (
+                    "MAX WAKE LAG".to_string(),
+                    if sys.sample_count > 0 {
+                        format!("{:.1} ms", sys.max_wake_overshoot_ms)
+                    } else {
+                        "—".to_string()
+                    },
+                ),
+                (
+                    "OS-LINKED DROPS".to_string(),
+                    sys.os_correlated_dropouts.to_string(),
+                ),
+                (
+                    "RF / USB DROPS".to_string(),
+                    sys.transport_only_dropouts.to_string(),
+                ),
+            ];
+            render_status_pill_rows(ui, p, inner_w, &pills);
+
+            if !sys.diagnosis.is_empty() {
+                ui.add_space(8.0);
+                let sev = if sys.os_correlated_dropouts > 0 || sys.scheduler_stalls >= 2 {
+                    Severity::Warn
+                } else if sys.sample_count > 0 {
+                    Severity::Ok
+                } else {
+                    Severity::Info
+                };
+                semantic_banner(ui, p, mode, inner_w, sev, &sys.diagnosis);
+            }
+        });
     }
 
     fn render_ab_comparison_card(
@@ -2373,6 +2803,44 @@ impl InputLabUiState {
             self.start_network_benchmark(ctx);
         }
     }
+}
+
+fn render_hero_kpi_tile(
+    ui: &mut egui::Ui,
+    p: Palette,
+    outer_w: f32,
+    label: &str,
+    value: &str,
+    sub: &str,
+    value_color: Color32,
+) {
+    let inner_w = (outer_w - 24.0).max(80.0);
+    egui::Frame::NONE
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0_f32, p.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_min_width(inner_w);
+            ui.set_max_width(inner_w);
+            ui.add(
+                egui::Label::new(RichText::new(label).size(10.0).strong().color(p.text_muted))
+                    .truncate(),
+            );
+            ui.add_space(2.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(value)
+                        .size(19.0)
+                        .strong()
+                        .monospace()
+                        .color(value_color),
+                )
+                .truncate(),
+            );
+            ui.add_space(1.0);
+            ui.add(egui::Label::new(RichText::new(sub).size(11.0).color(p.text_muted)).truncate());
+        });
 }
 
 fn health_badge_label(sev: Severity) -> &'static str {

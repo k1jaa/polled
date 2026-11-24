@@ -41,10 +41,20 @@ enum GamePickerTab {
     Running,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ProfileEditorTab {
+    #[default]
+    Mouse,
+    AudioPower,
+    General,
+}
+
 pub struct ProfilesUiState {
     pub store: ProfileStore,
     pub selected_profile_id: String,
     pub editor: ProfileDraft,
+    editor_tab: ProfileEditorTab,
+    activity_log_open: bool,
     pub runtime_snapshot: Option<ProfileRuntimeSnapshot>,
     pub export_modal_json: Option<String>,
     pub import_modal_open: bool,
@@ -296,6 +306,8 @@ impl ProfilesUiState {
         Self {
             selected_profile_id: first.id.clone(),
             editor: ProfileDraft::from_profile(&first),
+            editor_tab: ProfileEditorTab::Mouse,
+            activity_log_open: false,
             store,
             runtime_snapshot: None,
             export_modal_json: None,
@@ -387,20 +399,49 @@ impl ProfilesUiState {
         runtime: &ProfileRuntimeHandle,
         low_battery_threshold: u8,
     ) {
-        // Compute authoritative width directly from the live viewport rect so resizing the window
-        // immediately reflows every card, banner, pill row, and log line with zero clipping.
-        let content_w = (ctx.screen_rect().width() - 36.0).max(320.0);
+        let content_w = ui.available_width().max(320.0);
         ui.set_max_width(content_w);
 
         let snap = self.runtime_snapshot.clone();
-        let stacked = content_w < 680.0;
+        let stacked = content_w < 640.0;
+
+        // Clean single-row Page Header
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Profiles").size(20.0).strong().color(p.text));
+            if let Some(s) = snap.as_ref() {
+                ui.add_space(8.0);
+                let active_lbl = if s.profile_locked {
+                    format!("{} · Locked", s.active_profile_name)
+                } else {
+                    s.active_profile_name.clone()
+                };
+                ui.label(
+                    RichText::new(active_lbl)
+                        .size(12.5)
+                        .color(if s.profile_locked {
+                            p.warn
+                        } else {
+                            p.text_muted
+                        }),
+                );
+                if let Some(exe) = &s.foreground_exe {
+                    ui.label(
+                        RichText::new(format!("· {exe}"))
+                            .size(11.5)
+                            .monospace()
+                            .color(p.text_muted),
+                    );
+                }
+            }
+        });
+        ui.add_space(10.0);
 
         if stacked {
             egui::ScrollArea::vertical()
                 .id_salt("profiles_stacked_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let stack_w = (content_w - 14.0).max(280.0);
+                    let stack_w = (content_w - 10.0).max(280.0);
                     ui.set_max_width(stack_w);
                     self.render_device_card(
                         ui,
@@ -418,12 +459,12 @@ impl ProfilesUiState {
                     ui.add_space(10.0);
                     self.render_profile_list_card(ui, p, stack_w, 190.0, snap.as_ref(), runtime);
                     ui.add_space(10.0);
-                    self.render_profile_editor_card(ui, p, stack_w, 310.0, snap.as_ref(), runtime);
+                    self.render_profile_editor_card(ui, p, stack_w, 340.0, snap.as_ref(), runtime);
                     ui.add_space(10.0);
                     self.render_activity_log_card(ctx, ui, p, stack_w, Some(150.0), snap.as_ref());
                 });
         } else {
-            // --- DEVICE & AUTO-SWITCH CONTROL CARD ---
+            // --- COMPACT DEVICE & AUTO-SWITCH BAR ---
             self.render_device_card(
                 ui,
                 p,
@@ -439,19 +480,16 @@ impl ProfilesUiState {
                 semantic_banner(ui, p, mode, content_w, sev, &msg);
             }
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
 
-            // --- TWO-COLUMN LAYOUT: PROFILE LIST + PROFILE EDITOR ---
-            let gap = 10.0;
-            let left_w = (content_w * 0.26).clamp(195.0, 260.0);
+            // --- TWO-COLUMN LAYOUT: PROFILE LIST + TABBED PROFILE EDITOR ---
+            let gap = 12.0;
+            let left_w = (content_w * 0.27).clamp(195.0, 250.0);
             let right_w = (content_w - left_w - gap).max(320.0);
             let rem_h = ui.available_height();
-            let mid_h = if rem_h >= 480.0 {
-                324.0
-            } else {
-                ((rem_h - 10.0) * 0.68).clamp(185.0, 324.0)
-            };
-            let inner_col_h = (mid_h - 24.0).max(160.0);
+            let log_reserve = if self.activity_log_open { 172.0 } else { 52.0 };
+            let mid_h = (rem_h - log_reserve - 12.0).clamp(220.0, 520.0);
+            let inner_col_h = (mid_h - 24.0).max(180.0);
 
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
@@ -489,7 +527,7 @@ impl ProfilesUiState {
 
             ui.add_space(10.0);
 
-            // --- LIVE ACTIVITY LOG (fills remaining window height down to footer) ---
+            // --- COLLAPSIBLE ACTIVITY LOG STRIP ---
             self.render_activity_log_card(ctx, ui, p, content_w, None, snap.as_ref());
         }
 
@@ -1131,59 +1169,39 @@ impl ProfilesUiState {
 
             if let Some(s) = snap {
                 ui.add_space(6.0);
-                let mut pills: Vec<(String, String)> = Vec::new();
-                pills.push((
-                    "FOREGROUND".to_string(),
-                    s.foreground_exe.as_deref().unwrap_or("(none)").to_string(),
-                ));
-                pills.push((
-                    "ACTIVE PROFILE".to_string(),
-                    if s.profile_locked {
-                        format!("{} [LOCKED]", s.active_profile_name)
-                    } else {
-                        s.active_profile_name.clone()
-                    },
-                ));
-                let multi_dev = s.active_devices.len() > 1;
+                let mut status_chunks: Vec<String> = Vec::new();
                 for dev in &s.active_devices {
                     let summary = dev
                         .settings
                         .as_ref()
                         .map(|st| st.summary_string())
-                        .unwrap_or_else(|| "asleep / move mouse".to_string());
-                    pills.push((dev.info.name.to_uppercase(), summary));
-                    if let Some(batt) = dev.battery {
-                        let lbl = if multi_dev {
-                            format!("{} BATT", dev.info.name.to_uppercase())
-                        } else {
-                            "BATTERY".to_string()
-                        };
-                        let val = match (batt.charging, batt.voltage_mv) {
-                            (true, _) => format!("{}% CHG", batt.percent),
-                            (false, Some(mv)) if mv > 0 => {
-                                format!("{}% ({:.2}V)", batt.percent, f32::from(mv) / 1000.0)
-                            }
-                            (false, _) => format!("{}%", batt.percent),
-                        };
-                        pills.push((lbl, val));
-                    }
-                }
-                if let Some(pending) = &s.pending_exe {
-                    pills.push(("DEBOUNCING".to_string(), pending.clone()));
+                        .unwrap_or_else(|| "asleep".to_string());
+                    let batt = dev
+                        .battery
+                        .map(|b| format!(" · {}", b.compact_label()))
+                        .unwrap_or_default();
+                    status_chunks.push(format!("{} ({summary}{batt})", dev.info.name));
                 }
                 if let Some((_, audio_name, _)) = s.audio_outputs.iter().find(|(_, _, def)| *def) {
-                    pills.push(("AUDIO".to_string(), audio_name.clone()));
+                    status_chunks.push(format!("Audio: {audio_name}"));
                 }
                 if let Some(locked_pct) = s.mic_lock_active {
-                    pills.push(("MIC LOCK".to_string(), format!("{locked_pct}%")));
+                    status_chunks.push(format!("Mic Lock: {locked_pct}%"));
                 }
-                if s.any_flash_only {
-                    pills.push((
-                        "FLASH WRITES".to_string(),
-                        s.total_flash_writes_session.to_string(),
-                    ));
+                if s.any_flash_only && s.total_flash_writes_session > 0 {
+                    status_chunks.push(format!("Flash writes: {}", s.total_flash_writes_session));
                 }
-                render_status_pill_rows(ui, p, inner_w, &pills);
+                if let Some(pending) = &s.pending_exe {
+                    status_chunks.push(format!("Debouncing: {pending}"));
+                }
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(status_chunks.join("  ·  "))
+                            .size(11.5)
+                            .color(p.text_muted),
+                    )
+                    .wrap(),
+                );
 
                 let low_batt_msgs: Vec<String> = s
                     .active_devices
@@ -1469,6 +1487,42 @@ impl ProfilesUiState {
 
             ui.add_space(8.0);
 
+            // Clean segmented sub-tabs inside Profile Editor (`Mouse` | `Audio & Power` | `General`)
+            ui.horizontal(|ui| {
+                for (tab, label) in [
+                    (ProfileEditorTab::Mouse, "Mouse"),
+                    (ProfileEditorTab::AudioPower, "Audio & Power"),
+                    (ProfileEditorTab::General, "General"),
+                ] {
+                    let selected = self.editor_tab == tab;
+                    let btn = egui::Button::new(
+                        RichText::new(label)
+                            .size(12.0)
+                            .color(if selected { p.text } else { p.text_muted })
+                            .strong(),
+                    )
+                    .fill(if selected {
+                        p.surface_alt
+                    } else {
+                        Color32::TRANSPARENT
+                    })
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if selected {
+                            p.border
+                        } else {
+                            Color32::TRANSPARENT
+                        },
+                    ))
+                    .corner_radius(CornerRadius::same(6));
+                    if ui.add(btn).clicked() {
+                        self.editor_tab = tab;
+                    }
+                }
+            });
+
+            ui.add_space(8.0);
+
             let active_target_caps: Option<DeviceCapabilities> =
                 self.editor.editing_device_id.as_deref().and_then(|dev_id| {
                     snap.and_then(|s| {
@@ -1526,7 +1580,7 @@ impl ProfilesUiState {
 
             egui::ScrollArea::vertical()
                 .id_salt("profile_editor_scroll")
-                .max_height((inner_col_h - 34.0).max(120.0))
+                .max_height((inner_col_h - 68.0).max(120.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let field_w = (inner_w - 175.0).clamp(140.0, 420.0);
@@ -1541,36 +1595,49 @@ impl ProfilesUiState {
 
                     egui::Grid::new("profile_editor_grid")
                         .num_columns(2)
-                        .spacing([14.0, 7.0])
+                        .spacing([14.0, 8.0])
                         .show(ui, |ui| {
-                            ui.label(RichText::new("Name").color(p.text_muted));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.editor.name)
-                                    .desired_width(field_w),
-                            );
-                            ui.end_row();
+                            if self.editor_tab == ProfileEditorTab::General {
+                                ui.label(RichText::new("Name").color(p.text_muted));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.editor.name)
+                                        .desired_width(field_w),
+                                );
+                                ui.end_row();
 
-                            if !self.editor.is_desktop_default {
-                                ui.label(RichText::new("Executables").color(p.text_muted));
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.editor.executables_csv)
+                                if !self.editor.is_desktop_default {
+                                    ui.label(RichText::new("Executables").color(p.text_muted));
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(
+                                                &mut self.editor.executables_csv,
+                                            )
                                             .desired_width((field_w - 94.0).max(110.0))
                                             .hint_text("cs2.exe, valorant-win64-shipping.exe"),
-                                    );
-                                    if ui
-                                        .add(secondary_btn("Pick Game...", p))
-                                        .on_hover_text(
-                                            "Browse installed Steam / Riot / Epic games or running apps",
-                                        )
-                                        .clicked()
-                                    {
-                                        open_game_picker = true;
-                                    }
-                                });
+                                        );
+                                        if ui
+                                            .add(secondary_btn("Pick Game...", p))
+                                            .on_hover_text(
+                                                "Browse installed Steam / Riot / Epic games or running apps",
+                                            )
+                                            .clicked()
+                                        {
+                                            open_game_picker = true;
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+
+                                ui.label(RichText::new("Notes (optional)").color(p.text_muted));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.editor.notes)
+                                        .desired_width(field_w)
+                                        .hint_text("Saved in exported profile JSON cards"),
+                                );
                                 ui.end_row();
                             }
 
+                            if self.editor_tab == ProfileEditorTab::Mouse {
                             ui.label(RichText::new("Mouse Target").color(p.text_muted));
                             ui.horizontal(|ui| {
                                 let target_label = match &self.editor.editing_device_id {
@@ -1821,7 +1888,9 @@ impl ProfilesUiState {
                                 });
                             }
                             ui.end_row();
+                            }
 
+                            if self.editor_tab == ProfileEditorTab::AudioPower {
                             ui.checkbox(&mut self.editor.set_win_speed, "Windows Speed");
                             ui.add_enabled(
                                 self.editor.set_win_speed,
@@ -1988,14 +2057,7 @@ impl ProfilesUiState {
                                 });
                             });
                             ui.end_row();
-
-                            ui.label(RichText::new("Notes (optional)").color(p.text_muted));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.editor.notes)
-                                    .desired_width(field_w)
-                                    .hint_text("Saved in exported profile JSON cards"),
-                            );
-                            ui.end_row();
+                            }
                         });
                 });
 
@@ -2036,11 +2098,19 @@ impl ProfilesUiState {
         card_frame(ui, p, card_w, |ui| {
             let log_entries = snap.map(|s| s.log.as_slice()).unwrap_or(&[]);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Activity Log").strong().color(p.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!log_entries.is_empty(), secondary_btn("Copy Log", p))
-                        .clicked()
+                    let toggle_lbl = if self.activity_log_open {
+                        "Hide ▴".to_string()
+                    } else {
+                        format!("Log ({}) ▾", log_entries.len())
+                    };
+                    if ui.add(secondary_btn(&toggle_lbl, p)).clicked() {
+                        self.activity_log_open = !self.activity_log_open;
+                    }
+                    if self.activity_log_open
+                        && ui
+                            .add_enabled(!log_entries.is_empty(), secondary_btn("Copy Log", p))
+                            .clicked()
                     {
                         let text = log_entries
                             .iter()
@@ -2068,11 +2138,46 @@ impl ProfilesUiState {
                             ),
                         ));
                     }
+
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("Activity")
+                                .size(12.0)
+                                .strong()
+                                .color(p.text_muted),
+                        );
+                        if !self.activity_log_open {
+                            if let Some(latest) = log_entries.first() {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "{}  {}",
+                                            latest.timestamp, latest.message
+                                        ))
+                                        .size(11.5)
+                                        .color(p.text_muted),
+                                    )
+                                    .truncate(),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("Idle — no profile switches yet.")
+                                        .size(11.5)
+                                        .color(p.text_muted),
+                                );
+                            }
+                        }
+                    });
                 });
             });
-            ui.add_space(4.0);
+
+            if !self.activity_log_open {
+                return;
+            }
+
+            ui.add_space(6.0);
             let log_scroll_h =
-                fixed_scroll_h.unwrap_or_else(|| (ui.available_height() - 4.0).max(60.0));
+                fixed_scroll_h.unwrap_or_else(|| (ui.available_height() - 6.0).clamp(90.0, 145.0));
             let row_w = (inner_w - 14.0).max(120.0);
             egui::ScrollArea::vertical()
                 .id_salt("profile_activity_log")
@@ -2214,123 +2319,7 @@ fn render_bool_sensor_row(
     }
 }
 
-/// Pre-measures all status pills and packs them into rows strictly bounded by `max_row_w`
-/// so pills always wrap reactively when the user resizes the window.
-fn render_status_pill_rows(
-    ui: &mut egui::Ui,
-    p: Palette,
-    max_row_w: f32,
-    pills: &[(String, String)],
-) {
-    let pad_x = 8.0_f32;
-    let pad_y = 4.0_f32;
-    let inner_gap = 6.0_f32;
-    let pill_gap_x = 6.0_f32;
-    let pill_gap_y = 6.0_f32;
-    let row_limit = max_row_w.max(120.0);
-
-    struct MeasuredPill {
-        label_text: String,
-        value_text: String,
-        label_galley: std::sync::Arc<egui::Galley>,
-        value_galley: std::sync::Arc<egui::Galley>,
-        full_w: f32,
-        clamped_w: f32,
-        height: f32,
-    }
-
-    let measured: Vec<MeasuredPill> = pills
-        .iter()
-        .map(|(label, value)| {
-            let label_galley = ui.painter().layout_no_wrap(
-                label.clone(),
-                FontId::proportional(10.0),
-                p.text_muted,
-            );
-            let value_galley =
-                ui.painter()
-                    .layout_no_wrap(value.clone(), FontId::monospace(11.0), p.text);
-            let full_w = label_galley.size().x + inner_gap + value_galley.size().x + pad_x * 2.0;
-            let clamped_w = full_w.min(row_limit);
-            let height = label_galley.size().y.max(value_galley.size().y) + pad_y * 2.0;
-            MeasuredPill {
-                label_text: label.clone(),
-                value_text: value.clone(),
-                label_galley,
-                value_galley,
-                full_w,
-                clamped_w,
-                height,
-            }
-        })
-        .collect();
-
-    // Group pills into rows strictly fitting inside `row_limit`.
-    let mut rows: Vec<Vec<usize>> = Vec::new();
-    let mut current_row: Vec<usize> = Vec::new();
-    let mut current_w = 0.0_f32;
-
-    for (idx, item) in measured.iter().enumerate() {
-        let added = if current_row.is_empty() {
-            item.clamped_w
-        } else {
-            pill_gap_x + item.clamped_w
-        };
-        if !current_row.is_empty() && current_w + added > row_limit {
-            rows.push(std::mem::take(&mut current_row));
-            current_w = 0.0;
-        }
-        current_w += if current_row.is_empty() {
-            item.clamped_w
-        } else {
-            pill_gap_x + item.clamped_w
-        };
-        current_row.push(idx);
-    }
-    if !current_row.is_empty() {
-        rows.push(current_row);
-    }
-
-    for (row_idx, row) in rows.iter().enumerate() {
-        if row_idx > 0 {
-            ui.add_space(pill_gap_y);
-        }
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = pill_gap_x;
-            for &idx in row {
-                let item = &measured[idx];
-                let (rect, resp) = ui.allocate_exact_size(
-                    Vec2::new(item.clamped_w, item.height),
-                    egui::Sense::hover(),
-                );
-                if ui.is_rect_visible(rect) {
-                    let painter = ui.painter_at(rect);
-                    painter.rect(
-                        rect,
-                        CornerRadius::same(6),
-                        p.surface_alt,
-                        Stroke::new(1.0_f32, p.border),
-                        egui::StrokeKind::Inside,
-                    );
-                    let label_pos = egui::pos2(
-                        rect.left() + pad_x,
-                        rect.center().y - item.label_galley.size().y * 0.5,
-                    );
-                    let value_pos = egui::pos2(
-                        label_pos.x + item.label_galley.size().x + inner_gap,
-                        rect.center().y - item.value_galley.size().y * 0.5,
-                    );
-                    painter.galley(label_pos, item.label_galley.clone(), p.text_muted);
-                    painter.galley(value_pos, item.value_galley.clone(), p.text);
-                }
-                if item.full_w > item.clamped_w + 1.0 {
-                    resp.on_hover_text(format!("{}: {}", item.label_text, item.value_text));
-                }
-            }
-        });
-    }
-}
-
+/// Pre-measured semantic status banner (`OK`, `INFO`, `WARN`, `BAD`).
 fn semantic_banner(
     ui: &mut egui::Ui,
     p: Palette,

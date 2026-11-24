@@ -246,6 +246,8 @@ pub struct PolledApp {
     summary: Option<ScanSummary>,
     snapshot_path: String,
     filter: FilterMode,
+    health_search: String,
+    expanded_checks: HashSet<String>,
     busy: bool,
     busy_label: String,
     status_message: Option<String>,
@@ -323,6 +325,8 @@ impl PolledApp {
             summary: None,
             snapshot_path,
             filter: FilterMode::All,
+            health_search: String::new(),
+            expanded_checks: HashSet::new(),
             busy: false,
             busy_label: String::new(),
             status_message: None,
@@ -866,195 +870,258 @@ impl eframe::App for PolledApp {
         let mut clicked_undo: Option<CheckReport> = None;
         let mut clicked_delete_custom: Option<String> = None;
 
-        // --- TOP HEADER BAR ---
-        egui::TopBottomPanel::top("topbar")
-            .frame(
-                egui::Frame::NONE
-                    .fill(p.surface)
-                    .inner_margin(Margin::symmetric(18, 12))
-                    .stroke(Stroke::new(1.0_f32, p.border)),
+        let issues_count = warn_count + bad_count;
+        let undo_count = undoable_set.len();
+        let screen_w = ctx.screen_rect().width();
+        let compact_shell = screen_w < 780.0;
+
+        let nav_mouse_line = self
+            .profiles_ui
+            .runtime_snapshot
+            .as_ref()
+            .and_then(|s| {
+                s.active_devices
+                    .iter()
+                    .find(|d| d.info.support_tier != SupportTier::Simulator)
+                    .or_else(|| s.active_devices.first())
+            })
+            .map(|d| {
+                let batt = d.battery.map(|b| b.compact_label());
+                (d.info.name.clone(), batt)
+            });
+        let nav_profile_name = self.profiles_ui.runtime_snapshot.as_ref().map(|s| {
+            (
+                s.active_profile_name.clone(),
+                s.auto_switch_enabled,
+                s.profile_locked,
             )
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
+        });
 
-                // Row 1: App title & Windows build (left) | Startup & Theme (right)
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Polled").size(18.0).strong().color(p.text));
-                    pill(
-                        ui,
-                        &format!("v{} · Experimental", env!("CARGO_PKG_VERSION")),
-                        p.surface_alt,
-                        p.text_muted,
-                        p.border,
-                    )
-                    .on_hover_text(
-                        "Early-development (0.x) experimental software. Original Windows values are snapshotted before changes; provided AS-IS under AGPL-3.0.",
-                    );
-                    if let Some(s) = &self.summary {
-                        pill(
-                            ui,
-                            &format!("Win {}", s.windows_version),
-                            p.surface_alt,
-                            p.text_muted,
-                            p.border,
-                        );
-                        if s.windows_build_changed {
-                            pill(
-                                ui,
-                                "Windows Updated",
-                                p.severity_bg(Severity::Warn, mode),
-                                p.warn,
-                                p.border,
-                            );
+        // --- SLEEK LEFT NAVIGATION RAIL (collapses to compact top strip only below 780px) ---
+        if compact_shell {
+            egui::TopBottomPanel::top("compact_nav")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.surface)
+                        .inner_margin(Margin::symmetric(14, 10))
+                        .stroke(Stroke::new(1.0_f32, p.border_subtle)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Polled").size(16.0).strong().color(p.text));
+                        ui.add_space(6.0);
+                        for (view, label) in [
+                            (ActiveView::HealthCheck, "Health"),
+                            (ActiveView::Profiles, "Profiles"),
+                            (ActiveView::InputLab, "Bench"),
+                        ] {
+                            let active = self.active_view == view;
+                            let btn = if active {
+                                primary_button(label, p)
+                            } else {
+                                ghost_button(label, p)
+                            };
+                            if ui.add(btn).clicked() {
+                                self.active_view = view;
+                            }
                         }
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(secondary_button(self.theme.label(), p)).clicked() {
-                            toggle_theme = true;
-                        }
-
-                        let hk_btn = if self.settings.hotkeys.enabled {
-                            primary_button("Settings · HK", p)
-                        } else {
-                            secondary_button("Settings", p)
-                        };
-                        if ui
-                            .add(hk_btn)
-                            .on_hover_text(
-                                "Configure live battery tray icon, low-battery / profile-switch notifications, and optional global hotkeys",
-                            )
-                            .clicked()
-                        {
-                            self.hotkeys_modal_open = true;
-                        }
-
-                        let startup_btn = if self.autostart_enabled {
-                            primary_button("Startup: ON", p)
-                        } else {
-                            secondary_button("Startup: OFF", p)
-                        };
-                        if ui
-                            .add(startup_btn)
-                            .on_hover_text(
-                                "Start Polled minimized to the system tray on Windows sign-in (HKCU Run, no admin required)",
-                            )
-                            .clicked()
-                        {
-                            toggle_autostart = true;
-                        }
-                    });
-                });
-
-                // Row 2: Navigation tabs (left) | Health Check bulk actions (right)
-                ui.horizontal(|ui| {
-                    let hc_btn = if self.active_view == ActiveView::HealthCheck {
-                        primary_button("Health Check", p)
-                    } else {
-                        secondary_button("Health Check", p)
-                    };
-                    if ui.add(hc_btn).clicked() {
-                        self.active_view = ActiveView::HealthCheck;
-                    }
-
-                    let prof_btn = if self.active_view == ActiveView::Profiles {
-                        primary_button("Profiles", p)
-                    } else {
-                        secondary_button("Profiles", p)
-                    };
-                    if ui.add(prof_btn).clicked() {
-                        self.active_view = ActiveView::Profiles;
-                    }
-
-                    let lab_label = if self.input_lab_ui.is_capturing() {
-                        "Bench ●"
-                    } else {
-                        "Bench"
-                    };
-                    let lab_btn = if self.active_view == ActiveView::InputLab {
-                        primary_button(lab_label, p)
-                    } else {
-                        secondary_button(lab_label, p)
-                    };
-                    if ui.add(lab_btn).clicked() {
-                        self.active_view = ActiveView::InputLab;
-                    }
-
-                    if self.active_view == ActiveView::HealthCheck {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let undo_count = undoable_set.len();
-                            if ui
-                                .add_enabled(
-                                    !self.busy && undo_count > 0,
-                                    secondary_button(&format!("Undo All ({undo_count})"), p),
-                                )
-                                .clicked()
-                            {
-                                trigger_undo_all = true;
+                            if ui.add(ghost_button(self.theme.label(), p)).clicked() {
+                                toggle_theme = true;
                             }
-
-                            if ui
-                                .add_enabled(
-                                    !self.busy && fixable_safe > 0,
-                                    primary_button(&format!("Fix Safe Issues ({fixable_safe})"), p),
-                                )
-                                .clicked()
-                            {
-                                trigger_fix_all_safe = true;
-                            }
-
-                            if ui
-                                .add_enabled(!self.busy, secondary_button("Rescan", p))
-                                .clicked()
-                            {
-                                trigger_rescan = true;
+                            if ui.add(ghost_button("Settings", p)).clicked() {
+                                self.hotkeys_modal_open = true;
                             }
                         });
-                    }
+                    });
                 });
-            });
-
-        // --- FOOTER ---
-        egui::TopBottomPanel::bottom("footer")
-            .frame(
-                egui::Frame::NONE
-                    .fill(p.surface)
-                    .inner_margin(Margin::symmetric(18, 8))
-                    .stroke(Stroke::new(1.0_f32, p.border)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("Close [X] minimizes to tray • No telemetry • AGPL-3.0")
-                                .size(11.0)
-                                .color(p.text_muted),
-                        );
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        } else {
+            egui::SidePanel::left("nav_rail")
+                .resizable(false)
+                .exact_width(196.0)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.surface)
+                        .inner_margin(Margin::symmetric(14, 16))
+                        .stroke(Stroke::new(1.0_f32, p.border_subtle)),
+                )
+                .show(ctx, |ui| {
+                    // Brand header
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Polled").size(18.0).strong().color(p.text));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(p.text_muted),
+                            );
+                        });
+                    });
+                    if let Some(s) = &self.summary {
+                        ui.horizontal(|ui| {
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(format!("Snapshot: {}", self.snapshot_path))
+                                    RichText::new(format!("Win {}", s.windows_version))
                                         .size(11.0)
-                                        .monospace()
                                         .color(p.text_muted),
                                 )
                                 .truncate(),
-                            )
-                            .on_hover_text(&self.snapshot_path);
+                            );
+                            if s.windows_build_changed {
+                                ui.label(RichText::new("· Updated").size(11.0).color(p.warn));
+                            }
                         });
+                    }
+
+                    ui.add_space(18.0);
+
+                    // Primary navigation
+                    let health_badge = if issues_count > 0 {
+                        Some((
+                            issues_count.to_string(),
+                            if bad_count > 0 { p.bad } else { p.warn },
+                        ))
+                    } else if self.summary.is_some() {
+                        Some(("OK".to_string(), p.ok))
+                    } else {
+                        None
+                    };
+                    if nav_rail_item(
+                        ui,
+                        p,
+                        "Health",
+                        self.active_view == ActiveView::HealthCheck,
+                        health_badge.as_ref().map(|(t, c)| (t.as_str(), *c)),
+                    ) {
+                        self.active_view = ActiveView::HealthCheck;
+                    }
+                    ui.add_space(2.0);
+
+                    let prof_badge = nav_profile_name.as_ref().and_then(|(_, auto, locked)| {
+                        if *locked {
+                            Some(("LOCK", p.warn))
+                        } else if *auto {
+                            Some(("AUTO", p.ok))
+                        } else {
+                            None
+                        }
+                    });
+                    if nav_rail_item(
+                        ui,
+                        p,
+                        "Profiles",
+                        self.active_view == ActiveView::Profiles,
+                        prof_badge,
+                    ) {
+                        self.active_view = ActiveView::Profiles;
+                    }
+                    ui.add_space(2.0);
+
+                    let bench_badge = if self.input_lab_ui.is_capturing() {
+                        Some(("LIVE", p.ok))
+                    } else {
+                        None
+                    };
+                    if nav_rail_item(
+                        ui,
+                        p,
+                        "Bench",
+                        self.active_view == ActiveView::InputLab,
+                        bench_badge,
+                    ) {
+                        self.active_view = ActiveView::InputLab;
+                    }
+
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    // Quiet live rig status
+                    ui.label(
+                        RichText::new("RIG STATUS")
+                            .size(9.5)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.add_space(6.0);
+                    if let Some((mouse_name, batt)) = &nav_mouse_line {
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if let Some(b) = batt {
+                                        ui.label(
+                                            RichText::new(b).size(11.0).monospace().color(p.text),
+                                        );
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(mouse_name)
+                                                        .size(11.5)
+                                                        .color(p.text_muted),
+                                                )
+                                                .truncate(),
+                                            );
+                                        },
+                                    );
+                                },
+                            );
+                        });
+                    }
+                    if let Some((prof_name, _, _)) = &nav_profile_name {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Profile: {prof_name}"))
+                                    .size(11.5)
+                                    .color(p.text_muted),
+                            )
+                            .truncate(),
+                        );
+                    }
+
+                    // Bottom utility stack
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                        ui.label(
+                            RichText::new("Tray on close · AGPL-3.0")
+                                .size(10.0)
+                                .color(p.text_muted),
+                        );
+                        ui.add_space(4.0);
+                        if nav_utility_item(ui, p, self.theme.label(), None) {
+                            toggle_theme = true;
+                        }
+                        let settings_badge =
+                            self.settings.hotkeys.enabled.then_some(("HK", p.info));
+                        if nav_utility_item(ui, p, "Settings", settings_badge) {
+                            self.hotkeys_modal_open = true;
+                        }
+                        let startup_badge = if self.autostart_enabled {
+                            Some(("ON", p.ok))
+                        } else {
+                            Some(("OFF", p.text_muted))
+                        };
+                        if nav_utility_item(ui, p, "Startup", startup_badge) {
+                            toggle_autostart = true;
+                        }
+                        ui.add_space(6.0);
+                        ui.separator();
                     });
                 });
-            });
+        }
 
-        // --- MAIN CONTENT ---
+        // --- MAIN CONTENT WORKSPACE ---
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(p.bg)
-                    .inner_margin(Margin::symmetric(18, 14)),
+                    .inner_margin(Margin::symmetric(24, 18)),
             )
             .show(ctx, |ui| {
-                let content_w = (ctx.screen_rect().width() - 36.0).max(320.0);
+                let content_w = ui.available_width().max(320.0);
                 ui.set_max_width(content_w);
 
                 if self.active_view == ActiveView::Profiles {
@@ -1081,10 +1148,16 @@ impl eframe::App for PolledApp {
                         .as_ref()
                         .map(|s| s.checks.as_slice())
                         .unwrap_or(&[]);
-                    if let Some(nav) =
-                        self.input_lab_ui
-                            .render(ctx, ui, p, mode, detected_dpi, health_checks)
-                    {
+                    let win_ver = self.summary.as_ref().map(|s| s.windows_version.as_str());
+                    if let Some(nav) = self.input_lab_ui.render(
+                        ctx,
+                        ui,
+                        p,
+                        mode,
+                        detected_dpi,
+                        health_checks,
+                        win_ver,
+                    ) {
                         match nav {
                             InputLabNavAction::OpenHealthCheck => {
                                 self.active_view = ActiveView::HealthCheck;
@@ -1097,6 +1170,93 @@ impl eframe::App for PolledApp {
                     }
                     return;
                 }
+
+                // --- HEALTH PAGE HEADER (Single calm row) ---
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Health").size(20.0).strong().color(p.text));
+                    ui.add_space(10.0);
+                    if self.busy {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new(&self.busy_label)
+                                .size(12.0)
+                                .color(p.text_muted),
+                        );
+                    } else if self.summary.is_some() {
+                        status_dot_count(ui, p.ok, &format!("{ok_count} ok"), p.text_muted);
+                        status_dot_count(ui, p.info, &format!("{info_count} info"), p.text_muted);
+                        if warn_count > 0 {
+                            status_dot_count(ui, p.warn, &format!("{warn_count} warn"), p.warn);
+                        }
+                        if bad_count > 0 {
+                            status_dot_count(ui, p.bad, &format!("{bad_count} bad"), p.bad);
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.menu_button(
+                            RichText::new("More ▾").size(12.5).color(p.text_muted),
+                            |ui| {
+                                ui.set_min_width(180.0);
+                                if ui
+                                    .add_enabled(
+                                        !self.busy && undo_count > 0,
+                                        egui::Button::new(format!("Undo All ({undo_count})")),
+                                    )
+                                    .clicked()
+                                {
+                                    trigger_undo_all = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("+ Custom Reversible Tweak").clicked() {
+                                    self.custom_tweak_draft = CustomTweakDraft {
+                                        open: true,
+                                        ..Default::default()
+                                    };
+                                    ui.close_menu();
+                                }
+                                let tips_lbl = if self.show_latency_tips {
+                                    "Hide Latency Checklist"
+                                } else {
+                                    "Show Latency Checklist"
+                                };
+                                if ui.button(tips_lbl).clicked() {
+                                    self.show_latency_tips = !self.show_latency_tips;
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if ui.button("Copy Snapshot Path").clicked() {
+                                    ctx.copy_text(self.snapshot_path.clone());
+                                    self.status_message = Some(format!(
+                                        "Copied snapshot path: {}",
+                                        self.snapshot_path
+                                    ));
+                                    ui.close_menu();
+                                }
+                            },
+                        );
+
+                        if fixable_safe > 0
+                            && ui
+                                .add_enabled(
+                                    !self.busy,
+                                    primary_button(&format!("Fix Safe ({fixable_safe})"), p),
+                                )
+                                .clicked()
+                        {
+                            trigger_fix_all_safe = true;
+                        }
+
+                        if ui
+                            .add_enabled(!self.busy, secondary_button("Rescan", p))
+                            .clicked()
+                        {
+                            trigger_rescan = true;
+                        }
+                    });
+                });
+
+                ui.add_space(12.0);
 
                 // Regression alert banner
                 if let Some(summary) = &self.summary {
@@ -1121,18 +1281,18 @@ impl eframe::App for PolledApp {
                                             reg.current.as_str().to_uppercase(),
                                             reg.current_value
                                         ))
-                                        .size(12.5)
+                                        .size(12.0)
                                         .color(p.text),
                                     )
                                     .wrap(),
                                 );
                             }
                         });
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
                     }
                 }
 
-                // Transient status / error banners (neutral B&W for status, BAD red for errors)
+                // Transient status / error banners
                 if let Some(msg) = self.status_message.clone() {
                     let mut dismiss = false;
                     banner_frame(ui, p, content_w, None, mode, |ui| {
@@ -1140,15 +1300,17 @@ impl eframe::App for PolledApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.add(secondary_button("Dismiss", p)).clicked() {
+                                    if ui.add(ghost_button("Dismiss", p)).clicked() {
                                         dismiss = true;
                                     }
                                     ui.with_layout(
                                         egui::Layout::left_to_right(egui::Align::Center),
                                         |ui| {
                                             ui.add(
-                                                egui::Label::new(RichText::new(&msg).color(p.text))
-                                                    .wrap(),
+                                                egui::Label::new(
+                                                    RichText::new(&msg).size(12.5).color(p.text),
+                                                )
+                                                .wrap(),
                                             );
                                         },
                                     );
@@ -1159,7 +1321,7 @@ impl eframe::App for PolledApp {
                     if dismiss {
                         self.status_message = None;
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                 }
 
                 if let Some(err) = self.error_message.clone() {
@@ -1169,15 +1331,17 @@ impl eframe::App for PolledApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.add(secondary_button("Dismiss", p)).clicked() {
+                                    if ui.add(ghost_button("Dismiss", p)).clicked() {
                                         dismiss = true;
                                     }
                                     ui.with_layout(
                                         egui::Layout::left_to_right(egui::Align::Center),
                                         |ui| {
                                             ui.add(
-                                                egui::Label::new(RichText::new(&err).color(p.bad))
-                                                    .wrap(),
+                                                egui::Label::new(
+                                                    RichText::new(&err).size(12.5).color(p.bad),
+                                                )
+                                                .wrap(),
                                             );
                                         },
                                     );
@@ -1188,153 +1352,75 @@ impl eframe::App for PolledApp {
                     if dismiss {
                         self.error_message = None;
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                 }
 
-                // Filter tabs + Custom Tweak / Tips buttons + severity counters
+                // Segmented filter strip + compact search
                 let total_count = self.summary.as_ref().map_or(0, |s| s.checks.len());
-                let issues_count = warn_count + bad_count;
                 let tweaks_count = self.summary.as_ref().map_or(0, |s| {
                     s.checks.iter().filter(|c| c.is_optional_tweak).count()
                 });
-                let undo_count = undoable_set.len();
 
-                let draw_filter_tabs = |ui: &mut egui::Ui, filter: &mut FilterMode| {
+                ui.horizontal_wrapped(|ui| {
                     filter_tab(
                         ui,
                         p,
-                        filter,
+                        &mut self.filter,
                         FilterMode::All,
                         &format!("All ({total_count})"),
                     );
                     filter_tab(
                         ui,
                         p,
-                        filter,
+                        &mut self.filter,
                         FilterMode::Issues,
                         &format!("Issues ({issues_count})"),
                     );
                     filter_tab(
                         ui,
                         p,
-                        filter,
+                        &mut self.filter,
                         FilterMode::Tweaks,
                         &format!("Tweaks ({tweaks_count})"),
                     );
-                    filter_tab(ui, p, filter, FilterMode::ReportOnly, "Report Only");
                     filter_tab(
                         ui,
                         p,
-                        filter,
+                        &mut self.filter,
+                        FilterMode::ReportOnly,
+                        "Report Only",
+                    );
+                    filter_tab(
+                        ui,
+                        p,
+                        &mut self.filter,
                         FilterMode::Undoable,
                         &format!("Undoable ({undo_count})"),
                     );
-                };
 
-                if content_w < 900.0 {
-                    ui.horizontal_wrapped(|ui| {
-                        draw_filter_tabs(ui, &mut self.filter);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.health_search.is_empty() && ui.add(ghost_button("×", p)).clicked()
+                        {
+                            self.health_search.clear();
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.health_search)
+                                .desired_width(168.0)
+                                .hint_text("Search checks..."),
+                        );
                     });
-                    ui.add_space(5.0);
-                    ui.horizontal_wrapped(|ui| {
-                        let tips_btn = if self.show_latency_tips {
-                            primary_button("Latency Tips", p)
-                        } else {
-                            secondary_button("Latency Tips", p)
-                        };
-                        if ui.add(tips_btn).clicked() {
-                            self.show_latency_tips = !self.show_latency_tips;
-                        }
-                        if ui.add(secondary_button("+ Custom Tweak", p)).clicked() {
-                            self.custom_tweak_draft = CustomTweakDraft {
-                                open: true,
-                                ..Default::default()
-                            };
-                        }
-                        ui.add_space(4.0);
-                        if self.busy {
-                            ui.spinner();
-                            ui.label(
-                                RichText::new(&self.busy_label)
-                                    .size(12.0)
-                                    .color(p.text_muted),
-                            );
-                        } else {
-                            pill(ui, &format!("{ok_count} OK"), p.surface, p.ok, p.border);
-                            pill(
-                                ui,
-                                &format!("{info_count} Info"),
-                                p.surface,
-                                p.info,
-                                p.border,
-                            );
-                            pill(
-                                ui,
-                                &format!("{warn_count} Warn"),
-                                p.surface,
-                                p.warn,
-                                p.border,
-                            );
-                            pill(ui, &format!("{bad_count} Bad"), p.surface, p.bad, p.border);
-                        }
-                    });
-                } else {
-                    ui.horizontal(|ui| {
-                        draw_filter_tabs(ui, &mut self.filter);
-                        ui.add_space(4.0);
-                        let tips_btn = if self.show_latency_tips {
-                            primary_button("Latency Tips", p)
-                        } else {
-                            secondary_button("Latency Tips", p)
-                        };
-                        if ui.add(tips_btn).clicked() {
-                            self.show_latency_tips = !self.show_latency_tips;
-                        }
-                        if ui.add(secondary_button("+ Custom Tweak", p)).clicked() {
-                            self.custom_tweak_draft = CustomTweakDraft {
-                                open: true,
-                                ..Default::default()
-                            };
-                        }
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if self.busy {
-                                ui.spinner();
-                                ui.label(
-                                    RichText::new(&self.busy_label)
-                                        .size(12.0)
-                                        .color(p.text_muted),
-                                );
-                            } else {
-                                pill(ui, &format!("{bad_count} Bad"), p.surface, p.bad, p.border);
-                                pill(
-                                    ui,
-                                    &format!("{warn_count} Warn"),
-                                    p.surface,
-                                    p.warn,
-                                    p.border,
-                                );
-                                pill(
-                                    ui,
-                                    &format!("{info_count} Info"),
-                                    p.surface,
-                                    p.info,
-                                    p.border,
-                                );
-                                pill(ui, &format!("{ok_count} OK"), p.surface, p.ok, p.border);
-                            }
-                        });
-                    });
-                }
+                });
 
                 if self.show_latency_tips {
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                     render_latency_tips_card(ui, p, content_w);
                 }
 
                 ui.add_space(10.0);
 
-                let card_w = (content_w - 14.0).max(240.0);
+                // --- UNIFIED CALM CHECKLIST CONTAINER ---
+                let list_w = (content_w - 8.0).max(260.0);
+                let query = self.health_search.trim().to_ascii_lowercase();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -1358,14 +1444,20 @@ impl eframe::App for PolledApp {
                                 FilterMode::ReportOnly => !c.can_fix,
                                 FilterMode::Undoable => undoable_set.contains(&c.id),
                             })
+                            .filter(|c| {
+                                query.is_empty()
+                                    || c.name.to_ascii_lowercase().contains(&query)
+                                    || c.id.to_ascii_lowercase().contains(&query)
+                                    || c.current_value.to_ascii_lowercase().contains(&query)
+                            })
                             .collect();
 
                         if visible.is_empty() {
                             egui::Frame::NONE
                                 .fill(p.surface)
-                                .stroke(Stroke::new(1.0_f32, p.border))
-                                .corner_radius(CornerRadius::same(8))
-                                .inner_margin(Margin::same(28))
+                                .stroke(Stroke::new(1.0_f32, p.border_subtle))
+                                .corner_radius(CornerRadius::same(10))
+                                .inner_margin(Margin::same(32))
                                 .show(ui, |ui| {
                                     ui.centered_and_justified(|ui| {
                                         ui.label(
@@ -1377,22 +1469,48 @@ impl eframe::App for PolledApp {
                             return;
                         }
 
-                        for check in visible {
-                            let is_undoable = undoable_set.contains(&check.id);
-                            render_check_card(
-                                ui,
-                                p,
-                                mode,
-                                card_w,
-                                check,
-                                is_undoable,
-                                self.busy,
-                                &mut clicked_fix,
-                                &mut clicked_undo,
-                                &mut clicked_delete_custom,
-                            );
-                            ui.add_space(8.0);
-                        }
+                        egui::Frame::NONE
+                            .fill(p.surface)
+                            .stroke(Stroke::new(1.0_f32, p.border))
+                            .corner_radius(CornerRadius::same(10))
+                            .inner_margin(Margin::symmetric(0, 4))
+                            .show(ui, |ui| {
+                                ui.set_min_width(list_w);
+                                ui.set_max_width(list_w);
+                                let total_vis = visible.len();
+                                for (idx, check) in visible.into_iter().enumerate() {
+                                    let is_undoable = undoable_set.contains(&check.id);
+                                    let expanded = self.expanded_checks.contains(&check.id);
+                                    let toggled = render_check_row(
+                                        ui,
+                                        p,
+                                        mode,
+                                        list_w,
+                                        check,
+                                        is_undoable,
+                                        expanded,
+                                        self.busy,
+                                        &mut clicked_fix,
+                                        &mut clicked_undo,
+                                        &mut clicked_delete_custom,
+                                    );
+                                    if toggled {
+                                        if expanded {
+                                            self.expanded_checks.remove(&check.id);
+                                        } else {
+                                            self.expanded_checks.insert(check.id.clone());
+                                        }
+                                    }
+                                    if idx + 1 < total_vis {
+                                        let rect = ui.allocate_space(Vec2::new(list_w, 1.0)).1;
+                                        ui.painter().hline(
+                                            (rect.left() + 14.0)..=(rect.right() - 14.0),
+                                            rect.center().y,
+                                            Stroke::new(1.0_f32, p.border_subtle),
+                                        );
+                                    }
+                                }
+                            });
                     });
             });
 
@@ -2148,172 +2266,316 @@ fn render_hotkey_binding_row(
     }
 }
 
+/// Clean sidebar navigation row with subtle left active bar and right-aligned semantic badge.
+fn nav_rail_item(
+    ui: &mut egui::Ui,
+    p: Palette,
+    label: &str,
+    active: bool,
+    badge: Option<(&str, Color32)>,
+) -> bool {
+    let width = ui.available_width().max(120.0);
+    let desired = Vec2::new(width, 34.0);
+    let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        let fill = if active {
+            p.surface_alt
+        } else if resp.hovered() {
+            Color32::from_rgba_unmultiplied(p.text.r(), p.text.g(), p.text.b(), 10)
+        } else {
+            Color32::TRANSPARENT
+        };
+        if fill != Color32::TRANSPARENT {
+            painter.rect_filled(rect, CornerRadius::same(7), fill);
+        }
+        if active {
+            let accent = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 1.0, rect.top() + 7.0),
+                egui::pos2(rect.left() + 3.5, rect.bottom() - 7.0),
+            );
+            painter.rect_filled(accent, CornerRadius::same(2), p.text);
+        }
+        let text_col = if active || resp.hovered() {
+            p.text
+        } else {
+            p.text_muted
+        };
+        painter.text(
+            egui::pos2(rect.left() + 12.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(13.5),
+            text_col,
+        );
+        if let Some((b_txt, b_col)) = badge {
+            painter.text(
+                egui::pos2(rect.right() - 10.0, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                b_txt,
+                egui::FontId::monospace(10.5),
+                b_col,
+            );
+        }
+    }
+    resp.clicked()
+}
+
+/// Quiet sidebar bottom utility row (Startup / Settings / Theme).
+fn nav_utility_item(
+    ui: &mut egui::Ui,
+    p: Palette,
+    label: &str,
+    badge: Option<(&str, Color32)>,
+) -> bool {
+    let width = ui.available_width().max(120.0);
+    let desired = Vec2::new(width, 28.0);
+    let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        if resp.hovered() {
+            painter.rect_filled(rect, CornerRadius::same(6), p.surface_alt);
+        }
+        let text_col = if resp.hovered() { p.text } else { p.text_muted };
+        painter.text(
+            egui::pos2(rect.left() + 8.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(12.2),
+            text_col,
+        );
+        if let Some((b_txt, b_col)) = badge {
+            painter.text(
+                egui::pos2(rect.right() - 8.0, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                b_txt,
+                egui::FontId::monospace(10.0),
+                b_col,
+            );
+        }
+    }
+    resp.clicked()
+}
+
+fn status_dot_count(ui: &mut egui::Ui, dot: Color32, text: &str, text_col: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 14.0), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().circle_filled(rect.center(), 3.2, dot);
+    }
+    ui.label(RichText::new(text).size(12.0).color(text_col));
+    ui.add_space(4.0);
+}
+
 #[allow(clippy::too_many_arguments)]
-fn render_check_card(
+fn render_check_row(
     ui: &mut egui::Ui,
     p: Palette,
     mode: ThemeMode,
     outer_w: f32,
     check: &CheckReport,
     is_undoable: bool,
+    expanded: bool,
     busy: bool,
     clicked_fix: &mut Option<CheckReport>,
     clicked_undo: &mut Option<CheckReport>,
     clicked_delete_custom: &mut Option<String>,
-) {
+) -> bool {
     let sev_fg = p.severity_fg(check.severity);
-    let sev_bg = p.severity_bg(check.severity, mode);
     let is_custom = check.id.starts_with("custom_");
     let show_fix = check.can_fix
         && (check.severity >= Severity::Warn
             || ((check.is_optional_tweak || check.id == "power_plan")
                 && check.severity == Severity::Info));
 
-    let inner_w = (outer_w - 26.0).max(160.0);
-    let frame = egui::Frame::NONE
-        .fill(p.surface)
-        .stroke(Stroke::new(1.0_f32, p.border))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(13));
+    let inner_w = (outer_w - 28.0).max(160.0);
+    let mut toggled = false;
 
-    let resp = frame.show(ui, |ui| {
-        ui.set_min_width(inner_w);
-        ui.set_max_width(inner_w);
+    egui::Frame::NONE
+        .fill(if expanded {
+            p.surface_alt
+        } else {
+            Color32::TRANSPARENT
+        })
+        .inner_margin(Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_min_width(inner_w);
+            ui.set_max_width(inner_w);
 
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if show_fix {
-                    let verb = if check.is_optional_tweak {
-                        "Apply"
-                    } else {
-                        "Fix"
-                    };
-                    let label = if check.requires_elevation {
-                        format!("{verb} [Admin]")
-                    } else {
-                        verb.to_string()
-                    };
-                    if ui.add_enabled(!busy, primary_button(&label, p)).clicked() {
-                        *clicked_fix = Some(check.clone());
-                    }
-                }
-
-                if is_undoable && ui.add_enabled(!busy, secondary_button("Undo", p)).clicked() {
-                    *clicked_undo = Some(check.clone());
-                }
-
-                if is_custom
-                    && ui
-                        .add_enabled(!busy, secondary_button("Delete", p))
-                        .clicked()
-                {
-                    *clicked_delete_custom = Some(check.id.clone());
-                }
-
-                if check.requires_reboot && check.can_fix {
-                    pill(ui, "Reboot", p.surface_alt, p.text_muted, p.border);
-                }
-
-                if check.requires_relogin && check.severity >= Severity::Warn {
-                    pill(
-                        ui,
-                        "Sign-out required",
-                        p.surface_alt,
-                        p.text_muted,
-                        p.border,
-                    );
-                }
-
-                if check.is_optional_tweak {
-                    pill(
-                        ui,
-                        if is_custom {
-                            "Custom tweak"
-                        } else {
-                            "Optional tweak"
-                        },
-                        p.surface_alt,
-                        p.text_muted,
-                        p.border,
-                    );
-                }
-
-                if !check.can_fix {
-                    pill(ui, "Report only", p.surface_alt, p.text_muted, p.border);
-                }
-
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    pill(
-                        ui,
-                        &check.severity.as_str().to_uppercase(),
-                        sev_bg,
-                        sev_fg,
-                        p.border,
-                    );
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(&check.name).size(14.5).strong().color(p.text),
+            // Compact 1-line summary header (click title area to expand/collapse)
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let chev = if expanded { "▾" } else { "▸" };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(chev).size(12.0).color(p.text_muted))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
                         )
-                        .truncate(),
-                    );
-                    if inner_w >= 640.0 {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&check.id)
-                                    .size(11.5)
-                                    .monospace()
-                                    .color(p.text_muted),
-                            )
-                            .truncate(),
-                        );
+                        .clicked()
+                    {
+                        toggled = true;
                     }
+
+                    if show_fix {
+                        let verb = if check.is_optional_tweak {
+                            "Apply"
+                        } else {
+                            "Fix"
+                        };
+                        let label = if check.requires_elevation {
+                            format!("{verb} · Admin")
+                        } else {
+                            verb.to_string()
+                        };
+                        let btn = if check.severity >= Severity::Warn {
+                            primary_button(&label, p)
+                        } else {
+                            secondary_button(&label, p)
+                        };
+                        if ui.add_enabled(!busy, btn).clicked() {
+                            *clicked_fix = Some(check.clone());
+                        }
+                    }
+
+                    if is_undoable && ui.add_enabled(!busy, secondary_button("Undo", p)).clicked() {
+                        *clicked_undo = Some(check.clone());
+                    }
+
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let (dot_r, _) =
+                            ui.allocate_exact_size(Vec2::new(10.0, 18.0), egui::Sense::hover());
+                        if ui.is_rect_visible(dot_r) {
+                            ui.painter().circle_filled(dot_r.center(), 3.8, sev_fg);
+                        }
+
+                        let header_resp = ui
+                            .vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&check.name)
+                                                .size(13.5)
+                                                .strong()
+                                                .color(p.text),
+                                        )
+                                        .truncate(),
+                                    );
+                                    if check.severity >= Severity::Warn {
+                                        ui.label(
+                                            RichText::new(check.severity.as_str().to_uppercase())
+                                                .size(10.0)
+                                                .strong()
+                                                .monospace()
+                                                .color(sev_fg),
+                                        );
+                                    } else if check.is_optional_tweak {
+                                        ui.label(
+                                            RichText::new(if is_custom {
+                                                "custom"
+                                            } else {
+                                                "optional"
+                                            })
+                                            .size(10.5)
+                                            .color(p.text_muted),
+                                        );
+                                    }
+                                });
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&check.current_value)
+                                            .size(11.8)
+                                            .color(p.text_muted),
+                                    )
+                                    .truncate(),
+                                );
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+                        if header_resp.clicked() {
+                            toggled = true;
+                        }
+                    });
                 });
             });
+
+            if expanded {
+                ui.add_space(10.0);
+                let col_gap = 10.0;
+                if inner_w < 540.0 {
+                    value_box(ui, p, inner_w, "CURRENT", &check.current_value, p.text);
+                    ui.add_space(6.0);
+                    value_box(
+                        ui,
+                        p,
+                        inner_w,
+                        "RECOMMENDED",
+                        &check.recommended_value,
+                        p.text_muted,
+                    );
+                } else {
+                    let col_w = ((inner_w - col_gap) * 0.5).max(120.0);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = col_gap;
+                        value_box(ui, p, col_w, "CURRENT", &check.current_value, p.text);
+                        value_box(
+                            ui,
+                            p,
+                            col_w,
+                            "RECOMMENDED",
+                            &check.recommended_value,
+                            p.text_muted,
+                        );
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(RichText::new(&check.reason).size(12.2).color(p.text_muted))
+                        .wrap(),
+                );
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(&check.id)
+                            .size(10.5)
+                            .monospace()
+                            .color(p.text_muted),
+                    );
+                    if !check.can_fix {
+                        pill(ui, "Report only", p.surface, p.text_muted, p.border_subtle);
+                    }
+                    if check.requires_reboot && check.can_fix {
+                        pill(
+                            ui,
+                            "Reboot required",
+                            p.severity_bg(Severity::Info, mode),
+                            p.info,
+                            p.border_subtle,
+                        );
+                    }
+                    if check.requires_relogin && check.severity >= Severity::Warn {
+                        pill(
+                            ui,
+                            "Sign-out required",
+                            p.surface,
+                            p.text_muted,
+                            p.border_subtle,
+                        );
+                    }
+                    if is_custom
+                        && ui
+                            .add_enabled(!busy, secondary_button("Delete Tweak", p))
+                            .clicked()
+                    {
+                        *clicked_delete_custom = Some(check.id.clone());
+                    }
+                });
+            }
         });
 
-        ui.add_space(8.0);
-
-        if inner_w < 540.0 {
-            value_box(ui, p, inner_w, "CURRENT", &check.current_value, p.text);
-            ui.add_space(6.0);
-            value_box(
-                ui,
-                p,
-                inner_w,
-                "RECOMMENDED",
-                &check.recommended_value,
-                p.text_muted,
-            );
-        } else {
-            let col_gap = 8.0;
-            let col_w = ((inner_w - col_gap) * 0.5).max(120.0);
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = col_gap;
-                value_box(ui, p, col_w, "CURRENT", &check.current_value, p.text);
-                value_box(
-                    ui,
-                    p,
-                    col_w,
-                    "RECOMMENDED",
-                    &check.recommended_value,
-                    p.text_muted,
-                );
-            });
-        }
-
-        ui.add_space(7.0);
-        ui.add(
-            egui::Label::new(RichText::new(&check.reason).size(12.2).color(p.text_muted)).wrap(),
-        );
-    });
-
-    let rect = resp.response.rect;
-    let stripe = egui::Rect::from_min_max(
-        rect.left_top() + egui::vec2(1.0, 2.0),
-        egui::pos2(rect.left() + 4.5, rect.bottom() - 2.0),
-    );
-    ui.painter()
-        .rect_filled(stripe, CornerRadius::same(2), sev_fg);
+    toggled
 }
 
 fn render_latency_tips_card(ui: &mut egui::Ui, p: Palette, outer_w: f32) {
@@ -2388,6 +2650,13 @@ fn secondary_button(label: &str, p: Palette) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).color(p.text))
         .fill(p.surface_alt)
         .stroke(Stroke::new(1.0_f32, p.border))
+        .corner_radius(CornerRadius::same(6))
+}
+
+fn ghost_button(label: &str, p: Palette) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(label).color(p.text_muted))
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::NONE)
         .corner_radius(CornerRadius::same(6))
 }
 

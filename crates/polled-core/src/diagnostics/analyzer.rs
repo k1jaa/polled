@@ -604,6 +604,22 @@ pub fn build_diagnostic_advice(
             });
         }
 
+        if snap.system_load.os_correlated_dropouts > 0 || snap.system_load.scheduler_stalls >= 2 {
+            advice.push(DiagnosticAdvice {
+                severity: sev,
+                category: "CPU / OS Stalls".to_string(),
+                title: format!(
+                    "Eliminate Windows CPU/scheduler stalls ({} correlated dropout{}, peak {:.0}% CPU / {:.0}% kernel)",
+                    snap.system_load.os_correlated_dropouts,
+                    if snap.system_load.os_correlated_dropouts == 1 { "" } else { "s" },
+                    snap.system_load.peak_cpu_pct,
+                    snap.system_load.peak_kernel_pct,
+                ),
+                detail: "One or more mouse dropouts happened during a Windows CPU or kernel/DPC spike rather than wireless RF loss. Close background overlays, RGB suites, browser hardware-accelerated tabs, or heavy monitoring tools while gaming.".to_string(),
+                action_target: Some("health_check".to_string()),
+            });
+        }
+
         if nominal_hz >= 4000 && (configured_dpi < 1600 || p.saturated_pct < 65.0) {
             advice.push(DiagnosticAdvice {
                 severity: Severity::Info,
@@ -757,6 +773,23 @@ pub fn format_advice_summary(advice: &[DiagnosticAdvice]) -> String {
     lines.join("\n")
 }
 
+/// Live OS/CPU load and scheduler-stall correlation collected alongside a Raw Input capture.
+///
+/// Helps separate wireless/USB hardware dropouts from Windows CPU saturation or kernel/DPC stalls
+/// occurring at the exact millisecond a mouse packet arrived late.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SystemLoadStats {
+    pub sample_count: u64,
+    pub avg_cpu_pct: f64,
+    pub peak_cpu_pct: f64,
+    pub peak_kernel_pct: f64,
+    pub scheduler_stalls: u64,
+    pub max_wake_overshoot_ms: f64,
+    pub os_correlated_dropouts: u64,
+    pub transport_only_dropouts: u64,
+    pub diagnosis: String,
+}
+
 /// Immutable snapshot published periodically (~30 Hz) from the capture thread to the GUI.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticsSnapshot {
@@ -768,6 +801,8 @@ pub struct DiagnosticsSnapshot {
     pub clicks: ClickBounceSnapshot,
     #[serde(default)]
     pub keyboard: KeyboardPollingStats,
+    #[serde(default)]
+    pub system_load: SystemLoadStats,
     pub error: Option<String>,
 }
 
@@ -1649,6 +1684,20 @@ pub fn format_diagnostic_report(
         format!(
             "Anomalies:      true dropouts: {} | slow empty slots: {} | bunched: {} | packets: {}",
             p.true_dropout_count, p.slow_slot_count, p.bunch_count, p.total_motion_packets
+        ),
+        format!(
+            "OS Correlation: {} (avg CPU {:.0}%, peak {:.0}%, kernel peak {:.0}%, stalls {}, OS-linked dropouts {}/{})",
+            if snap.system_load.diagnosis.is_empty() {
+                "n/a"
+            } else {
+                snap.system_load.diagnosis.as_str()
+            },
+            snap.system_load.avg_cpu_pct,
+            snap.system_load.peak_cpu_pct,
+            snap.system_load.peak_kernel_pct,
+            snap.system_load.scheduler_stalls,
+            snap.system_load.os_correlated_dropouts,
+            snap.system_load.os_correlated_dropouts + snap.system_load.transport_only_dropouts,
         ),
         format!(
             "Tracking:       peak {:.1} IPS ({:.2} m/s) | peak accel {:.1} G (at {} DPI)",

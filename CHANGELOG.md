@@ -16,6 +16,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.0] - 2026-11-24
+
+### Added
+- **Full Monochrome UI Revamp (`theme.rs`, `app.rs`, `profiles_ui.rs`, `input_lab_ui.rs`):**
+  - Replaced the double-decker top bar and file-path footer with a sleek **left navigation rail** (`Health` / `Profiles` / `Bench`), live rig status readout, and bottom utility stack (`Startup`, `Settings`, `Dark/Light`), auto-collapsing cleanly on narrow windows.
+  - **Calm Health Check Accordion:** Replaced 32 tall double-boxed cards with a unified, searchable, single-line scannable checklist — warnings and `Fix` buttons stand out immediately, and clicking any row smoothly expands full `Current → Recommended` details and explanation.
+  - **Decluttered Profiles Tab:** Replaced the dense pill wall with a clean inline rig readout, split the profile editor into **3 tidy sub-tabs** (`Mouse`, `Audio & Power`, `General`), and made the **Activity Log** a collapsible 1-line strip at the bottom.
+  - **Organized Bench Workspace:** Split Bench's 12 stacked cards into **4 focused sub-tabs** (`Polling`, `Aim & Switches`, `System & USB`, `Audio & Net`), replaced the 8-button export strip with one **`Export ▾`** menu, and added 4 crisp Hero KPI tiles.
+- **Bench v2 Diagnostics (`diagnostics/raw_capture.rs`, `diagnostics/analyzer.rs`, `diagnostics/sensitivity.rs`, `diagnostics/export.rs`):**
+  - **Real-Time CPU & OS Scheduler Stall Correlation:** Samples `GetSystemTimes` (total + kernel/DPC CPU %) and scheduler wake overshoots on the decoupled ~30 Hz analyzer thread (zero work on the `WM_INPUT` capture thread) to separate OS/CPU-linked dropouts from wireless/USB transport dropouts — integrated into Polling KPIs, System & USB breakdown, **Recommended Fixes**, and diagnostic reports.
+  - **eDPI & `cm/360°` Sensitivity Converter:** Exact calculator for CS2/Source, Valorant, Apex Legends, Overwatch 2/CoD, Rainbow Six Siege, and Fortnite with 1-click DPI-step (`800 → 1600 / 3200`) and cross-game sensitivity conversion.
+  - **All-in-One Rig Scorecard PNG (1040×620):** Export a single shareable monochrome bento card combining Windows Health Check, 4K/8K Polling + OS Stalls, USB PnP Topology, WASAPI Audio / OS Timer, and Dual-Hop Network Ping.
+
+---
+
 ## [0.8.0] - 2026-11-24
 
 ### Added

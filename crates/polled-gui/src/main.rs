@@ -34,8 +34,8 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title(window_title)
-            .with_inner_size([1040.0, 740.0])
-            .with_min_inner_size([680.0, 540.0])
+            .with_inner_size([1120.0, 740.0])
+            .with_min_inner_size([740.0, 540.0])
             .with_visible(!start_minimized)
             .with_icon(icon::window_icon()),
         ..Default::default()

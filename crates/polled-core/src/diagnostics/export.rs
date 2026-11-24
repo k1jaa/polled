@@ -8,13 +8,29 @@
 
 use chrono::Local;
 
-use crate::checks::Severity;
+use crate::checks::{CheckReport, Severity};
 use crate::diagnostics::{
     DiagnosticsSnapshot, PinnedBenchmark, TimerJitterBenchmark, BOUNCE_THRESHOLD_MS,
 };
+use crate::win::{AudioLatencyBenchmark, NetworkJitterBenchmark, UsbMouseTopology};
 
 const IMG_W: usize = 960;
 const IMG_H: usize = 560;
+const RIG_W: usize = 1040;
+const RIG_H: usize = 620;
+
+/// Combined snapshot of Windows health, mouse polling, USB topology, audio, timer, and network
+/// benchmarks rendered into a single shareable All-in-One Rig Scorecard PNG.
+pub struct RigScorecardInput<'a> {
+    pub windows_version: Option<&'a str>,
+    pub health_checks: &'a [CheckReport],
+    pub diagnostics: &'a DiagnosticsSnapshot,
+    pub configured_dpi: u32,
+    pub usb_topology: &'a [UsbMouseTopology],
+    pub timer: Option<&'a TimerJitterBenchmark>,
+    pub audio: Option<&'a AudioLatencyBenchmark>,
+    pub network: Option<&'a NetworkJitterBenchmark>,
+}
 
 // 16-entry indexed palette (strict monochrome B&W + 4 semantic status colors only).
 const C_BG: u8 = 0;
@@ -912,6 +928,411 @@ fn draw_summary_panel(
     }
 }
 
+/// Renders a shareable 1040×620 monochrome All-in-One Rig Scorecard PNG combining Windows Health,
+/// 4K/8K Mouse Polling + OS Stall Correlation, USB PnP Topology, WASAPI Audio / Timer, and Dual-Hop Ping.
+pub fn render_rig_scorecard_png(input: &RigScorecardInput<'_>, dark_mode: bool) -> Vec<u8> {
+    let mut c = Canvas::new(RIG_W, RIG_H, C_BG);
+    c.stroke_rect(0, 0, RIG_W, RIG_H, C_BORDER);
+
+    let (mut ok_n, mut info_n, mut warn_n, mut bad_n) = (0usize, 0usize, 0usize, 0usize);
+    for ch in input.health_checks {
+        match ch.severity {
+            Severity::Ok => ok_n += 1,
+            Severity::Info => info_n += 1,
+            Severity::Warn => warn_n += 1,
+            Severity::Bad => bad_n += 1,
+        }
+    }
+
+    let worst = [
+        if bad_n > 0 {
+            Some(Severity::Bad)
+        } else if warn_n > 0 {
+            Some(Severity::Warn)
+        } else if !input.health_checks.is_empty() {
+            Some(Severity::Ok)
+        } else {
+            None
+        },
+        input.diagnostics.polling.health_severity,
+        input.timer.map(|t| t.severity),
+        input.audio.map(|a| a.severity),
+        input.network.map(|n| n.severity),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(Severity::Info);
+
+    // --- HEADER (y: 18..62) ---
+    c.draw_text_scaled(26, 20, "POLLED RIG SCORECARD", C_TEXT, 2);
+    let win_ver = input.windows_version.unwrap_or("Windows");
+    let sub = format!(
+        "v{} · ALL-IN-ONE LATENCY & INPUT AUDIT · {}",
+        env!("CARGO_PKG_VERSION"),
+        win_ver
+    );
+    c.draw_text_clipped(26, 40, &sub, C_MUTED, 620);
+
+    let (badge_txt, badge_fg, badge_bg) = match worst {
+        Severity::Ok => ("COMPETITIVE READY", C_OK, C_OK_BG),
+        Severity::Info => ("BASELINE CAPTURED", C_INFO, C_INFO_BG),
+        Severity::Warn => ("ATTENTION NEEDED", C_WARN, C_WARN_BG),
+        Severity::Bad => ("ISSUES DETECTED", C_BAD, C_BAD_BG),
+    };
+    let badge_w = text_width(badge_txt, 1) + 22;
+    let badge_x = RIG_W - 26 - badge_w;
+    c.fill_rect(badge_x, 20, badge_w, 24, badge_bg);
+    c.stroke_rect(badge_x, 20, badge_w, 24, badge_fg);
+    c.draw_text(badge_x + 11, 29, badge_txt, badge_fg);
+
+    let ts = Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let ts_w = text_width(&ts, 1);
+    c.draw_text(badge_x.saturating_sub(ts_w + 16), 29, &ts, C_MUTED);
+    c.hline(26, RIG_W - 26, 60, C_BORDER);
+
+    // Helper for bento panels.
+    let draw_card = |c: &mut Canvas,
+                     x: usize,
+                     y: usize,
+                     w: usize,
+                     h: usize,
+                     title: &str,
+                     sev: Option<Severity>| {
+        c.fill_rect(x, y, w, h, C_SURFACE);
+        c.stroke_rect(x, y, w, h, C_BORDER);
+        c.draw_text(x + 14, y + 14, title, C_MUTED);
+        if let Some(s) = sev {
+            let tag = s.as_str().to_uppercase();
+            let tw = text_width(&tag, 1) + 12;
+            let tx = x + w - 14 - tw;
+            c.fill_rect(tx, y + 10, tw, 16, severity_bg_color(s));
+            c.stroke_rect(tx, y + 10, tw, 16, severity_color(s));
+            c.draw_text(tx + 6, y + 15, &tag, severity_color(s));
+        }
+        c.hline(x + 14, x + w - 14, y + 32, C_BORDER);
+    };
+
+    // --- ROW 1: HEALTH CHECK (left) + 4K/8K MOUSE POLLING & STALLS (right) ---
+    let r1_y = 74;
+    let r1_h = 248;
+    let left_w = 480;
+    let right_x = 26 + left_w + 16;
+    let right_w = RIG_W - 26 - right_x;
+
+    // 1. Windows Health Check Card
+    let hc_sev = if bad_n > 0 {
+        Some(Severity::Bad)
+    } else if warn_n > 0 {
+        Some(Severity::Warn)
+    } else if !input.health_checks.is_empty() {
+        Some(Severity::Ok)
+    } else {
+        None
+    };
+    draw_card(
+        &mut c,
+        26,
+        r1_y,
+        left_w,
+        r1_h,
+        "1. WINDOWS HEALTH AUDIT",
+        hc_sev,
+    );
+    if input.health_checks.is_empty() {
+        c.draw_text(40, r1_y + 52, "No health scan data yet.", C_DIM);
+    } else {
+        let score_txt = format!("{ok_n}/{} CHECKS CLEAN", input.health_checks.len());
+        c.draw_text_scaled(40, r1_y + 46, &score_txt, C_TEXT, 2);
+        let counts = format!("{ok_n} OK  |  {info_n} INFO  |  {warn_n} WARN  |  {bad_n} BAD");
+        c.draw_text(40, r1_y + 72, &counts, C_MUTED);
+
+        let issues: Vec<&CheckReport> = input
+            .health_checks
+            .iter()
+            .filter(|ch| ch.severity >= Severity::Warn)
+            .take(5)
+            .collect();
+        if issues.is_empty() {
+            c.draw_text(
+                40,
+                r1_y + 102,
+                "All audited mouse, USB, power, audio & NIC",
+                C_OK,
+            );
+            c.draw_text(40, r1_y + 118, "settings passed with zero warnings.", C_OK);
+        } else {
+            c.draw_text(40, r1_y + 98, "ACTIVE WARNINGS:", C_MUTED);
+            for (idx, issue) in issues.iter().enumerate() {
+                let y = r1_y + 116 + idx * 22;
+                let col = severity_color(issue.severity);
+                c.fill_rect(40, y + 1, 5, 6, col);
+                let line = format!("{} - {}", issue.name, issue.current_value);
+                c.draw_text_clipped(52, y, &line, C_TEXT, left_w - 40);
+            }
+        }
+    }
+
+    // 2. Mouse Polling & CPU/OS Stall Correlation Card
+    let p = &input.diagnostics.polling;
+    let sys = &input.diagnostics.system_load;
+    draw_card(
+        &mut c,
+        right_x,
+        r1_y,
+        right_w,
+        r1_h,
+        "2. MOUSE POLLING & OS STALL BENCH",
+        p.health_severity,
+    );
+    if p.total_motion_packets == 0 {
+        c.draw_text(
+            right_x + 14,
+            r1_y + 52,
+            "Run Bench Capture to record 1K-8K mouse stability.",
+            C_DIM,
+        );
+    } else {
+        let rate_big = format!("{:.0} HZ", p.effective_hz);
+        c.draw_text_scaled(right_x + 14, r1_y + 46, &rate_big, C_TEXT, 2);
+        let meta = format!(
+            "TARGET {} HZ  |  PEAK {:.0} HZ  |  {} DPI",
+            p.nominal_hz, p.peak_hz, input.configured_dpi
+        );
+        c.draw_text_clipped(right_x + 14, r1_y + 72, &meta, C_MUTED, right_w - 28);
+
+        let lines = [
+            format!(
+                "INTERVALS   med {:.3}ms | p95 {:.3}ms | p99 {:.3}ms | sd {:.3}ms",
+                p.median_us / 1000.0,
+                p.p95_us / 1000.0,
+                p.p99_us / 1000.0,
+                p.std_dev_us / 1000.0
+            ),
+            format!(
+                "STABILITY   sat {:.0}% | sat +/-15% {:.1}% | dropouts {} | bunched {}",
+                p.saturated_pct, p.saturated_within_15_pct, p.true_dropout_count, p.bunch_count
+            ),
+            format!(
+                "TRACKING    peak {:.1} IPS ({:.1} G) | click faults {}",
+                input
+                    .diagnostics
+                    .tracking
+                    .peak_ips(f64::from(input.configured_dpi.max(1))),
+                input
+                    .diagnostics
+                    .tracking
+                    .peak_accel_g(f64::from(input.configured_dpi.max(1))),
+                input.diagnostics.clicks.total_bounce_faults
+            ),
+            format!(
+                "OS STALLS   avg CPU {:.0}% (peak {:.0}%, kernel {:.0}%) | stalls {}",
+                sys.avg_cpu_pct, sys.peak_cpu_pct, sys.peak_kernel_pct, sys.scheduler_stalls
+            ),
+            format!(
+                "CAUSE SPLIT {} OS-linked vs {} wireless/USB-only dropouts",
+                sys.os_correlated_dropouts, sys.transport_only_dropouts
+            ),
+        ];
+        for (i, ln) in lines.iter().enumerate() {
+            c.draw_text_clipped(
+                right_x + 14,
+                r1_y + 102 + i * 24,
+                ln,
+                if i == 4 && sys.os_correlated_dropouts > 0 {
+                    C_WARN
+                } else {
+                    C_TEXT
+                },
+                right_w - 28,
+            );
+        }
+    }
+
+    // --- ROW 2: USB TOPOLOGY (left) + AUDIO & TIMER (mid) + DUAL-HOP NETWORK (right) ---
+    let r2_y = r1_y + r1_h + 16;
+    let r2_h = RIG_H - r2_y - 40;
+    let col_gap = 14;
+    let col_w = (RIG_W - 52 - col_gap * 2) / 3;
+    let c1_x = 26;
+    let c2_x = c1_x + col_w + col_gap;
+    let c3_x = c2_x + col_w + col_gap;
+
+    // 3. USB PnP Topology
+    let usb_sev = if input.usb_topology.is_empty() {
+        None
+    } else if input
+        .usb_topology
+        .iter()
+        .any(|u| u.behind_external_hub || !u.shared_heavy_devices.is_empty())
+    {
+        Some(Severity::Warn)
+    } else {
+        Some(Severity::Ok)
+    };
+    draw_card(
+        &mut c,
+        c1_x,
+        r2_y,
+        col_w,
+        r2_h,
+        "3. USB PNP TOPOLOGY",
+        usb_sev,
+    );
+    if input.usb_topology.is_empty() {
+        c.draw_text(c1_x + 14, r2_y + 52, "No USB mouse topology loaded.", C_DIM);
+    } else {
+        for (idx, dev) in input.usb_topology.iter().take(2).enumerate() {
+            let y = r2_y + 46 + idx * 84;
+            c.draw_text_clipped(c1_x + 14, y, &dev.name, C_TEXT, col_w - 28);
+            let port_line = match (dev.port_number, dev.hub_number) {
+                (Some(port), Some(hub)) => format!("Port #{port}, Hub #{hub}"),
+                _ => "Direct USB".to_string(),
+            };
+            c.draw_text_clipped(c1_x + 14, y + 16, &port_line, C_MUTED, col_w - 28);
+            c.draw_text_clipped(c1_x + 14, y + 32, &dev.hub_name, C_MUTED, col_w - 28);
+            let status = if dev.behind_external_hub {
+                ("Behind external hub", C_WARN)
+            } else if !dev.shared_heavy_devices.is_empty() {
+                ("Shared with heavy USB device", C_WARN)
+            } else {
+                ("Direct & uncontested", C_OK)
+            };
+            c.draw_text_clipped(c1_x + 14, y + 48, status.0, status.1, col_w - 28);
+        }
+    }
+
+    // 4. Audio & OS Timer
+    let aud_timer_sev = match (
+        input.audio.map(|a| a.severity),
+        input.timer.map(|t| t.severity),
+    ) {
+        (Some(a), Some(t)) => Some(a.max(t)),
+        (a, t) => a.or(t),
+    };
+    draw_card(
+        &mut c,
+        c2_x,
+        r2_y,
+        col_w,
+        r2_h,
+        "4. WASAPI AUDIO & TIMER",
+        aud_timer_sev,
+    );
+    if let Some(a) = input.audio {
+        c.draw_text_clipped(c2_x + 14, r2_y + 46, &a.device_name, C_TEXT, col_w - 28);
+        let fmt_line = format!(
+            "{} Hz | {:.2}ms period | {} glitches",
+            a.sample_rate_hz, a.default_period_ms, a.glitch_count
+        );
+        c.draw_text_clipped(c2_x + 14, r2_y + 64, &fmt_line, C_MUTED, col_w - 28);
+        let wake_line = format!("Wake med {:.2}ms | p99 {:.2}ms", a.median_ms, a.p99_ms);
+        c.draw_text_clipped(
+            c2_x + 14,
+            r2_y + 82,
+            &wake_line,
+            severity_color(a.severity),
+            col_w - 28,
+        );
+    } else {
+        c.draw_text(c2_x + 14, r2_y + 52, "Audio bench not run yet.", C_DIM);
+    }
+    c.hline(c2_x + 14, c2_x + col_w - 14, r2_y + 114, C_BORDER);
+    if let Some(t) = input.timer {
+        let t1 = format!(
+            "OS Timer 1s: med {:.2}ms | p99 {:.2}ms",
+            t.median_ms, t.p99_ms
+        );
+        let t2 = format!(
+            "Max {:.2}ms | spikes >3ms: {}",
+            t.max_ms, t.spike_count_over_3ms
+        );
+        c.draw_text_clipped(c2_x + 14, r2_y + 130, &t1, C_TEXT, col_w - 28);
+        c.draw_text_clipped(
+            c2_x + 14,
+            r2_y + 148,
+            &t2,
+            severity_color(t.severity),
+            col_w - 28,
+        );
+    } else {
+        c.draw_text(
+            c2_x + 14,
+            r2_y + 132,
+            "OS Timer 1s test not run yet.",
+            C_DIM,
+        );
+    }
+
+    // 5. Dual-Hop Network Ping
+    draw_card(
+        &mut c,
+        c3_x,
+        r2_y,
+        col_w,
+        r2_h,
+        "5. DUAL-HOP NETWORK PING",
+        input.network.map(|n| n.severity),
+    );
+    if let Some(net) = input.network {
+        let link = format!("{} - {}", net.adapter_kind.label(), net.adapter_name);
+        c.draw_text_clipped(c3_x + 14, r2_y + 46, &link, C_TEXT, col_w - 28);
+        if let Some(gw) = &net.gateway {
+            let gw_line = format!(
+                "GW {}: {:.2}ms (jit {:.2}ms)",
+                gw.target_ip,
+                gw.median_ms.unwrap_or(0.0),
+                gw.jitter_ms.unwrap_or(0.0)
+            );
+            c.draw_text_clipped(c3_x + 14, r2_y + 68, &gw_line, C_INFO, col_w - 28);
+        }
+        let inet_line = format!(
+            "NET {}: {:.1}ms | p95 {:.1}ms",
+            net.internet.target_ip,
+            net.internet.median_ms.unwrap_or(0.0),
+            net.internet.p95_ms.unwrap_or(0.0)
+        );
+        let loss_line = format!(
+            "Jitter {:.1}ms | Loss {:.0}% ({}/{})",
+            net.internet.jitter_ms.unwrap_or(0.0),
+            net.internet.loss_pct,
+            net.internet.lost,
+            net.internet.sent
+        );
+        c.draw_text_clipped(c3_x + 14, r2_y + 90, &inet_line, C_TEXT, col_w - 28);
+        c.draw_text_clipped(
+            c3_x + 14,
+            r2_y + 110,
+            &loss_line,
+            severity_color(net.severity),
+            col_w - 28,
+        );
+        c.draw_text_clipped(c3_x + 14, r2_y + 140, &net.diagnosis, C_MUTED, col_w - 28);
+    } else {
+        c.draw_text(
+            c3_x + 14,
+            r2_y + 52,
+            "Run 5s Dual-Hop Ping in Bench.",
+            C_DIM,
+        );
+    }
+
+    // --- FOOTER ---
+    c.draw_text(
+        26,
+        RIG_H - 22,
+        "GENERATED LOCALLY BY POLLED · OPEN-SOURCE AGPL-3.0 · ZERO TELEMETRY",
+        C_DIM,
+    );
+
+    let palette = if dark_mode {
+        &DARK_PALETTE
+    } else {
+        &LIGHT_PALETTE
+    };
+    encode_indexed_4bit_png(&c.pixels, RIG_W, RIG_H, palette)
+}
+
 fn severity_color(s: Severity) -> u8 {
     match s {
         Severity::Ok => C_OK,
@@ -1326,6 +1747,7 @@ mod tests {
             dpi_measurement: Default::default(),
             clicks: Default::default(),
             keyboard: Default::default(),
+            system_load: Default::default(),
             error: None,
         }
     }
@@ -1398,5 +1820,26 @@ mod tests {
         let bytes = render_ab_comparison_png(&base, &snap_b, "Rear CPU USB 4K", 1600, false);
         assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
         assert!(bytes.len() > 1000);
+    }
+
+    #[test]
+    fn rig_scorecard_png_renders_valid_1040x620_png() {
+        let snap = sample_snapshot();
+        let input = RigScorecardInput {
+            windows_version: Some("11 24H2 (26100)"),
+            health_checks: &[],
+            diagnostics: &snap,
+            configured_dpi: 1600,
+            usb_topology: &[],
+            timer: None,
+            audio: None,
+            network: None,
+        };
+        let bytes = render_rig_scorecard_png(&input, true);
+        assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+        let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        assert_eq!(w, RIG_W as u32);
+        assert_eq!(h, RIG_H as u32);
     }
 }

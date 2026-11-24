@@ -5,7 +5,7 @@
 //! Plain monochrome black & white Dark / Light palette for Polled.
 //! Only the four semantic status colors (`OK`, `INFO`, `WARN`, `BAD`) carry chroma.
 
-use eframe::egui::{self, Color32};
+use eframe::egui::{self, Color32, CornerRadius, Stroke, Vec2};
 use polled_core::{Severity, ThemePreference};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub struct Palette {
     pub surface: Color32,
     pub surface_alt: Color32,
     pub border: Color32,
+    pub border_subtle: Color32,
     pub text: Color32,
     pub text_muted: Color32,
     /// Primary monochrome button fill (white in dark mode, black in light mode).
@@ -60,8 +61,8 @@ impl ThemeMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            ThemeMode::Dark => "Light theme",
-            ThemeMode::Light => "Dark theme",
+            ThemeMode::Dark => "Light mode",
+            ThemeMode::Light => "Dark mode",
         }
     }
 
@@ -69,11 +70,12 @@ impl ThemeMode {
         match self {
             ThemeMode::Dark => Palette {
                 bg: Color32::from_rgb(9, 9, 11),
-                surface: Color32::from_rgb(18, 18, 20),
-                surface_alt: Color32::from_rgb(26, 26, 29),
-                border: Color32::from_rgb(46, 46, 51),
+                surface: Color32::from_rgb(15, 15, 18),
+                surface_alt: Color32::from_rgb(24, 24, 28),
+                border: Color32::from_rgb(42, 42, 48),
+                border_subtle: Color32::from_rgb(30, 30, 35),
                 text: Color32::from_rgb(245, 245, 247),
-                text_muted: Color32::from_rgb(161, 161, 170),
+                text_muted: Color32::from_rgb(148, 148, 158),
                 btn_primary_bg: Color32::from_rgb(245, 245, 247),
                 btn_primary_fg: Color32::from_rgb(9, 9, 11),
                 ok: Color32::from_rgb(34, 197, 94),
@@ -82,13 +84,14 @@ impl ThemeMode {
                 bad: Color32::from_rgb(239, 68, 68),
             },
             ThemeMode::Light => Palette {
-                bg: Color32::from_rgb(255, 255, 255),
-                surface: Color32::from_rgb(248, 248, 249),
-                surface_alt: Color32::from_rgb(240, 240, 242),
-                border: Color32::from_rgb(212, 212, 216),
+                bg: Color32::from_rgb(250, 250, 251),
+                surface: Color32::from_rgb(255, 255, 255),
+                surface_alt: Color32::from_rgb(242, 242, 245),
+                border: Color32::from_rgb(218, 218, 224),
+                border_subtle: Color32::from_rgb(232, 232, 236),
                 text: Color32::from_rgb(12, 12, 14),
-                text_muted: Color32::from_rgb(82, 82, 91),
-                btn_primary_bg: Color32::from_rgb(12, 12, 14),
+                text_muted: Color32::from_rgb(92, 92, 102),
+                btn_primary_bg: Color32::from_rgb(15, 15, 18),
                 btn_primary_fg: Color32::from_rgb(255, 255, 255),
                 ok: Color32::from_rgb(21, 128, 61),
                 info: Color32::from_rgb(3, 105, 161),
@@ -106,14 +109,39 @@ impl ThemeMode {
         };
         visuals.panel_fill = p.bg;
         visuals.window_fill = p.surface;
+        visuals.window_stroke = Stroke::new(1.0_f32, p.border);
+        visuals.window_corner_radius = CornerRadius::same(10);
         visuals.override_text_color = Some(p.text);
+
         visuals.widgets.noninteractive.bg_fill = p.surface;
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
+        visuals.widgets.noninteractive.corner_radius = CornerRadius::same(6);
+
         visuals.widgets.inactive.bg_fill = p.surface_alt;
+        visuals.widgets.inactive.weak_bg_fill = p.surface_alt;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
+        visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
+
         visuals.widgets.hovered.bg_fill = p.border;
+        visuals.widgets.hovered.weak_bg_fill = p.border;
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.text_muted);
+        visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
+
         visuals.widgets.active.bg_fill = p.border;
+        visuals.widgets.active.weak_bg_fill = p.border;
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, p.text);
+        visuals.widgets.active.corner_radius = CornerRadius::same(6);
+
         visuals.selection.bg_fill = p.border;
-        visuals.selection.stroke.color = p.text;
+        visuals.selection.stroke = Stroke::new(1.0_f32, p.text);
         ctx.set_visuals(visuals);
+
+        ctx.style_mut(|style| {
+            style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+            style.spacing.button_padding = Vec2::new(10.0, 5.0);
+            style.spacing.combo_height = 240.0;
+            style.spacing.scroll = egui::style::ScrollStyle::thin();
+        });
     }
 }
 
@@ -130,8 +158,8 @@ impl Palette {
     pub fn severity_bg(self, severity: Severity, mode: ThemeMode) -> Color32 {
         let c = self.severity_fg(severity);
         let alpha = match mode {
-            ThemeMode::Dark => 34,
-            ThemeMode::Light => 26,
+            ThemeMode::Dark => 28,
+            ThemeMode::Light => 20,
         };
         Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
     }

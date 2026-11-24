@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use crate::diagnostics::analyzer::{
     ClickBounceAnalyzer, DiagnosticsSnapshot, DpiCalibrator, KeyboardPollingAnalyzer,
-    MouseButtonKind, PollingAnalyzer, PollingTarget,
+    MouseButtonKind, PollingAnalyzer, PollingTarget, SystemLoadStats,
 };
 
 const TARGET_AUTO_SENTINEL: u32 = 0;
@@ -277,6 +277,159 @@ fn qpc_frequency() -> u64 {
     freq.max(1) as u64
 }
 
+#[cfg(windows)]
+fn read_system_cpu_ticks() -> Option<(u64, u64, u64)> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::GetSystemTimes;
+
+    let mut idle = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: Standard Win32 `GetSystemTimes` writes 64-bit tick counters into valid stack structs.
+    unsafe {
+        GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).ok()?;
+    }
+    let to_u64 = |ft: FILETIME| (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
+    Some((to_u64(idle), to_u64(kernel), to_u64(user)))
+}
+
+#[cfg(not(windows))]
+fn read_system_cpu_ticks() -> Option<(u64, u64, u64)> {
+    None
+}
+
+/// Lightweight OS/CPU stall tracker running strictly on the ~30 Hz analyzer thread
+/// (zero work on the `WM_INPUT` capture thread) to correlate late mouse packets against
+/// Windows CPU saturation, kernel/DPC spikes, or scheduler wake overshoots.
+#[derive(Debug, Default)]
+struct SystemStallTracker {
+    prev_ticks: Option<(u64, u64, u64)>,
+    sample_count: u64,
+    sum_cpu_pct: f64,
+    peak_cpu_pct: f64,
+    peak_kernel_pct: f64,
+    scheduler_stalls: u64,
+    max_wake_overshoot_ms: f64,
+    last_window_was_stressed: bool,
+    os_correlated_dropouts: u64,
+    transport_only_dropouts: u64,
+    prev_total_dropouts: u64,
+}
+
+impl SystemStallTracker {
+    fn reset(&mut self) {
+        *self = Self::default();
+        self.prev_ticks = read_system_cpu_ticks();
+    }
+
+    fn sample_window(&mut self, wake_overshoot_ms: f64) {
+        if wake_overshoot_ms > self.max_wake_overshoot_ms {
+            self.max_wake_overshoot_ms = wake_overshoot_ms;
+        }
+        let mut stressed = false;
+        if wake_overshoot_ms >= 15.0 {
+            self.scheduler_stalls += 1;
+            stressed = true;
+        }
+
+        if let Some((idle, kernel, user)) = read_system_cpu_ticks() {
+            if let Some((p_idle, p_kernel, p_user)) = self.prev_ticks {
+                let d_idle = idle.saturating_sub(p_idle);
+                let d_kernel = kernel.saturating_sub(p_kernel);
+                let d_user = user.saturating_sub(p_user);
+                let d_total = d_kernel.saturating_add(d_user);
+                if d_total > 0 {
+                    // In Win32 `GetSystemTimes`, `kernel` includes `idle`.
+                    let d_kernel_busy = d_kernel.saturating_sub(d_idle);
+                    let d_busy = d_kernel_busy.saturating_add(d_user);
+                    let cpu_pct = ((d_busy as f64) * 100.0 / (d_total as f64)).clamp(0.0, 100.0);
+                    let kernel_pct =
+                        ((d_kernel_busy as f64) * 100.0 / (d_total as f64)).clamp(0.0, 100.0);
+                    self.sample_count += 1;
+                    self.sum_cpu_pct += cpu_pct;
+                    if cpu_pct > self.peak_cpu_pct {
+                        self.peak_cpu_pct = cpu_pct;
+                    }
+                    if kernel_pct > self.peak_kernel_pct {
+                        self.peak_kernel_pct = kernel_pct;
+                    }
+                    if cpu_pct >= 85.0 || kernel_pct >= 30.0 {
+                        stressed = true;
+                    }
+                }
+            }
+            self.prev_ticks = Some((idle, kernel, user));
+        }
+
+        self.last_window_was_stressed = stressed;
+    }
+
+    fn correlate_new_dropouts(&mut self, current_true_dropouts: u64) {
+        if current_true_dropouts > self.prev_total_dropouts {
+            let delta = current_true_dropouts - self.prev_total_dropouts;
+            if self.last_window_was_stressed {
+                self.os_correlated_dropouts += delta;
+            } else {
+                self.transport_only_dropouts += delta;
+            }
+        }
+        self.prev_total_dropouts = current_true_dropouts;
+    }
+
+    fn snapshot(&self) -> SystemLoadStats {
+        let avg_cpu_pct = if self.sample_count > 0 {
+            self.sum_cpu_pct / (self.sample_count as f64)
+        } else {
+            0.0
+        };
+        let total_corr = self.os_correlated_dropouts + self.transport_only_dropouts;
+        let diagnosis = if self.sample_count == 0 {
+            "Start a capture to correlate mouse dropouts against Windows CPU & scheduler stalls."
+                .to_string()
+        } else if total_corr == 0 && self.scheduler_stalls == 0 {
+            format!(
+                "Clean OS headroom — avg {avg_cpu_pct:.0}% CPU (peak {:.0}%, kernel {:.0}%), 0 scheduler stalls.",
+                self.peak_cpu_pct, self.peak_kernel_pct
+            )
+        } else if self.os_correlated_dropouts > 0
+            && self.os_correlated_dropouts >= self.transport_only_dropouts
+        {
+            format!(
+                "OS/CPU-linked dropouts — {}/{total_corr} coincided with CPU/kernel spikes (peak {:.0}% CPU, {:.0}% kernel, {} stalls).",
+                self.os_correlated_dropouts,
+                self.peak_cpu_pct,
+                self.peak_kernel_pct,
+                self.scheduler_stalls
+            )
+        } else if self.transport_only_dropouts > 0 && self.os_correlated_dropouts == 0 {
+            format!(
+                "Wireless / USB isolated — 0/{total_corr} dropouts matched OS CPU stalls (avg {avg_cpu_pct:.0}% CPU, {} stalls).",
+                self.scheduler_stalls
+            )
+        } else {
+            format!(
+                "Mixed causes — {} OS/CPU-linked vs {} wireless/USB-only dropouts (peak {:.0}% CPU, {} stalls).",
+                self.os_correlated_dropouts,
+                self.transport_only_dropouts,
+                self.peak_cpu_pct,
+                self.scheduler_stalls
+            )
+        };
+
+        SystemLoadStats {
+            sample_count: self.sample_count,
+            avg_cpu_pct,
+            peak_cpu_pct: self.peak_cpu_pct,
+            peak_kernel_pct: self.peak_kernel_pct,
+            scheduler_stalls: self.scheduler_stalls,
+            max_wake_overshoot_ms: self.max_wake_overshoot_ms,
+            os_correlated_dropouts: self.os_correlated_dropouts,
+            transport_only_dropouts: self.transport_only_dropouts,
+            diagnosis,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_analyzer_loop(
     initial_target_raw: u32,
@@ -297,9 +450,12 @@ fn run_analyzer_loop(
     let mut dpi_cal = DpiCalibrator::default();
     let mut clicks = ClickBounceAnalyzer::new();
     let mut keyboard = KeyboardPollingAnalyzer::new();
+    let mut sys_stall = SystemStallTracker::default();
+    sys_stall.reset();
     let mut last_target_raw = initial_target_raw;
     let mut local_batch = Vec::<RawEvent>::with_capacity(INITIAL_QUEUE_CAPACITY);
     let mut last_seq = 0u64;
+    let mut last_wake_overshoot_ms = 0.0f64;
 
     loop {
         let stopping = analyzer_stop.load(Ordering::SeqCst);
@@ -315,7 +471,9 @@ fn run_analyzer_loop(
             clicks.reset();
             dpi_cal.reset();
             keyboard.reset();
+            sys_stall.reset();
             local_batch.clear();
+            last_wake_overshoot_ms = 0.0;
         }
         if dpi_reset_requested.swap(false, Ordering::SeqCst) {
             dpi_cal.reset();
@@ -359,15 +517,20 @@ fn run_analyzer_loop(
         #[cfg(not(windows))]
         let now_ns = None;
 
+        sys_stall.sample_window(last_wake_overshoot_ms);
+        let polling_snap = polling.snapshot(now_ns);
+        sys_stall.correlate_new_dropouts(polling_snap.true_dropout_count);
+
         let prev_err = snapshot.lock().ok().and_then(|g| g.error.clone());
         let next_snap = DiagnosticsSnapshot {
             capturing: !stopping && prev_err.is_none(),
             target: polling.target(),
-            polling: polling.snapshot(now_ns),
+            polling: polling_snap,
             tracking: polling.tracking_snapshot(now_ns),
             dpi_measurement: dpi_cal.snapshot(),
             clicks: clicks.snapshot(),
             keyboard: keyboard.snapshot(),
+            system_load: sys_stall.snapshot(),
             error: prev_err,
         };
         if let Ok(mut guard) = snapshot.lock() {
@@ -379,12 +542,18 @@ fn run_analyzer_loop(
             break;
         }
 
+        last_wake_overshoot_ms = 0.0;
         if let Ok(guard) = wake_signal.0.lock() {
             if *guard == last_seq {
-                let (guard_after, _) = wake_signal
+                let wait_start = std::time::Instant::now();
+                let (guard_after, timeout_res) = wake_signal
                     .1
                     .wait_timeout(guard, Duration::from_millis(PUBLISH_INTERVAL_MS))
                     .unwrap_or_else(|e| e.into_inner());
+                if timeout_res.timed_out() {
+                    let actual_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+                    last_wake_overshoot_ms = (actual_ms - (PUBLISH_INTERVAL_MS as f64)).max(0.0);
+                }
                 last_seq = *guard_after;
             } else {
                 last_seq = *guard;
