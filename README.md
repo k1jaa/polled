@@ -1,7 +1,7 @@
 # Polled
 
 > [!WARNING]
-> **Experimental Software (`0.x` Early Development):** Polled is under active early development. It modifies Windows registry and power settings and sends raw USB HID configuration commands to supported mice. Although Polled snapshots your original Windows values before making changes and validates/verifies mouse writes, **use at your own risk** and consider creating a Windows System Restore Point before applying system-wide (`HKLM`) or custom tweaks. Provided **"AS IS"** without warranty under the [GNU General Public License v3.0](LICENSE) (Sections 15–16).
+> **Experimental Software (`0.x` Early Development):** Polled is under active early development. It modifies Windows registry and power settings and sends raw USB HID configuration commands to supported mice. Although Polled snapshots your original Windows values before making changes and validates/verifies mouse writes, **use at your own risk** and consider creating a Windows System Restore Point before applying system-wide (`HKLM`) or custom tweaks. Provided **"AS IS"** without warranty under the [GNU Affero General Public License v3.0](LICENSE) (Sections 15–16).
 
 A lightweight, pure-Rust Windows 10/11 tray utility and CLI that does three things:
 
@@ -52,16 +52,22 @@ A lightweight, pure-Rust Windows 10/11 tray utility and CLI that does three thin
 
 ## Supported Mice
 
-See [**docs/COMPATIBILITY.md**](docs/COMPATIBILITY.md) for the complete compatibility table, known issues, and per-device caveats.
+See [**docs/COMPATIBILITY.md**](docs/COMPATIBILITY.md) for the complete compatibility matrix, known issues, and per-device caveats.
 
 | Mouse / Protocol Family | Verification Status | Memory Mode |
 | --- | --- | --- |
 | **Pulsar X2 CrazyLight Mini Wireless** (`3710:5406`) | **Tested on hardware** | Onboard flash *(diffed & rate-limited)* |
 | **LAMZU 4K Receiver** (`3554:f510`) | **Tested on hardware** | Onboard flash *(diffed & rate-limited)* |
-| **Other Compx / Nordic mice** (Pulsar X2 CrazyLight, X2A, Xlite V3, LAMZU 1K/Wired, generic `3554:*`) | Implemented from docs *(unverified)* | Onboard flash *(diffed & rate-limited)* |
-| **Logitech HID++ 2.0** (G Pro X Superlight 1/2, G305, G502, G703, G403, G903, MX) | Implemented from docs *(unverified)* | Volatile RAM *(zero flash wear)* |
+| **Other Compx 17B / Nordic mice** (Pulsar X2 CrazyLight, X2A, Xlite V3, LAMZU 1K/Wired, generic `3554:*`) | Implemented from docs *(unverified)* | Onboard flash *(diffed & rate-limited)* |
+| **Razer 90B Protocol (`1532:*`, 80+ models)** (Viper V3 Pro / SE / HyperSpeed, Viper V2 Pro / Ultimate / 8KHz, DeathAdder V4 Pro / V3 Pro / V3 / V2 / Essential, Basilisk V3 Pro / V3, Cobra Pro, Naga V2 Pro, Orochi V2, Mouse Dock Pro) | Implemented from docs *(unverified)* | VARSTORE *(diffed & rate-limited)* / NOSTORE RAM on V2 |
+| **CompX 64B Page Protocol** (**WLMouse** Beast X / Pro / Max / Mini / Miao / Sword X / Strider, **LAMZU** Maya X / Inca 8K / Paro Aurora, **Attack Shark** R5 Ultra / R6 / R8, **Vancer** Akitsu, **RAWM** Leviathan V4 GT, **CRDRAKO**, **LunaFury**) | Implemented from docs *(unverified)* | Onboard flash *(diffed & rate-limited)* |
+| **Endgame Gear (`3367:*`)** (OP1 8K / v2 / Purple Frost, XM2 8K / v2, OP1w 4K / v2, XM2w 4K / v2) | Implemented from docs *(unverified)* | Onboard flash *(diffed & rate-limited)* |
+| **Finalmouse (`361d:*`)** (UltralightX & Starlight X dongles) | Implemented from docs *(unverified)* | Onboard memory *(diffed & rate-limited)* |
+| **VAXEE (`3057:*`)** (XE / V2 / XE-S, NP-01 / NP-01S V2 / V3 / Ergo, Outset AX, E1, Sora) | Implemented from docs *(unverified)* | Onboard memory *(diffed & rate-limited)* |
+| **Ninjutso (`093a:*`, `1915:*`)** (Sora V2, Sora V3, TEN / TEN AIR) | Implemented from docs *(unverified)* | Onboard memory *(diffed & rate-limited)* |
+| **Logitech HID++ 2.0 (`046d:*`)** (G Pro X Superlight 1/2, G305, G502, G703, G403, G903, MX) | Implemented from docs *(unverified)* | Volatile RAM *(zero flash wear)* |
 
-> **Note on onboard flash:** Mice using the Compx/Nordic protocol store profile changes in onboard flash rather than RAM. Polled protects against flash wear by skipping unchanged registers, debouncing alt-tabs, rate-limiting rapid bursts (max 4 writes / 60 s), and rolling back automatically if read-back verification fails.
+> **Note on onboard flash:** Most modern wireless mice persist profile changes to onboard flash rather than RAM. Polled protects against flash wear by skipping unchanged registers, debouncing alt-tabs, rate-limiting rapid bursts (max 4 writes / 60 s), and rolling back automatically if read-back verification fails.
 
 Using an unsupported mouse or testing an unverified model? Run `.\polled.exe --dump` (serial numbers are automatically redacted) and `.\polled.exe --detect` in PowerShell, then open an issue with the output.
 
@@ -79,6 +85,12 @@ Binaries are output to `target\release\polled.exe` and `target\release\polled-gu
 
 ---
 
-## License
+## License & Attribution
 
-Licensed under the [GNU General Public License v3.0 or later](LICENSE). Provided **AS IS**, without warranty of any kind.
+Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE). Provided **AS IS**, without warranty of any kind.
+
+Protocol codecs and hardware catalogs incorporate work from open-source projects (attributed in each driver source file):
+- [OpenMouse-Project/mouse-protocol](https://github.com/OpenMouse-Project/mouse-protocol) (AGPL-3.0-or-later)
+- [openrazer/openrazer](https://github.com/openrazer/openrazer) (GPL-2.0-or-later)
+- [libratbag/libratbag](https://github.com/libratbag/libratbag) (MIT) & [pwr-Solaar/Solaar](https://github.com/pwr-Solaar/Solaar) (GPL-2.0-or-later)
+- [packerlschupfer/pulsar-mouse-linux](https://github.com/packerlschupfer/pulsar-mouse-linux) (MIT), [LeadSun/lamzu-cfg](https://github.com/LeadSun/lamzu-cfg) (MIT/Apache-2.0), & [anany1702/lamzu-ctl](https://github.com/anany1702/lamzu-ctl) (MIT)

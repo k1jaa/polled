@@ -1,6 +1,6 @@
 // Polled - Windows input health check & per-game peripheral profiles
 // Copyright (C) 2026 k1jaa
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Dedicated Win32 Raw Input (`WM_INPUT` + `RIDEV_INPUTSINK`) capture thread using
 //! `QueryPerformanceCounter` timestamps so GUI framerate never skews 4K/8K measurements.

@@ -1,6 +1,6 @@
 // Polled - Windows input health check & per-game peripheral profiles
 // Copyright (C) 2026 k1jaa
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Procedurally renders Polled's crisp monochrome black-and-white crosshair icon as RGBA bytes
 //! (zero external image-decoding dependencies).

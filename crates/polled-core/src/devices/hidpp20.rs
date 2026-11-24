@@ -1,11 +1,11 @@
 // Polled - Windows input health check & per-game peripheral profiles
 // Copyright (C) 2026 k1jaa
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Logitech HID++ 2.0 protocol-family driver (G Pro X Superlight 1/2, G305, G502, G703,
 //! G403, G903, G203, MX series, wired USB & Lightspeed / Unifying / Bolt receivers).
 //!
-//! # Protocol Attribution & Licenses (all GPL-3.0 compatible)
+//! # Protocol Attribution & Licenses (all AGPL-3.0 compatible)
 //! Every HID report ID, frame layout, feature ID, function ID, bitmask, and error code in this
 //! module is verified directly from documented open-source implementations:
 //! - `libratbag/libratbag` (<https://github.com/libratbag/libratbag>)

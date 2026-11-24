@@ -1,6 +1,6 @@
 // Polled - Windows input health check & per-game peripheral profiles
 // Copyright (C) 2026 k1jaa
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 use crate::checks::{CheckReport, HealthCheck, SavedValue, Severity};
 use crate::error::{PolledError, Result};

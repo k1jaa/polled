@@ -1,6 +1,6 @@
 // Polled - Windows input health check & per-game peripheral profiles
 // Copyright (C) 2026 k1jaa
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Read-only inspection of PCI xHCI USB 3.x Host Controller Message Signaled Interrupt (MSI) mode.
 

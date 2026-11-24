@@ -1,6 +1,6 @@
 // Polled - Windows input health check & per-game peripheral profiles
 // Copyright (C) 2026 k1jaa
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Background profile-switching runtime connecting `ForegroundWatcher` -> `FocusDebouncer`
 //! -> `match_profile` -> multi-mouse `SafeDeviceController` (+ optional Windows pointer speed),

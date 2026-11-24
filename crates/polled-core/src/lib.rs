@@ -1,6 +1,6 @@
 // Polled - Windows input health check & per-game peripheral profiles
 // Copyright (C) 2026 k1jaa
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 pub mod checks;
 pub mod devices;
@@ -18,10 +18,12 @@ pub use checks::{
     UndoSummary,
 };
 pub use devices::{
-    detect_hardware_devices, hid_topology_fingerprint, ApplyOutcome, CompxDevice,
-    CompxProtocolDriver, DeviceCapabilities, DeviceDriver, DeviceInfo, DryRunDevice, Hidpp20Device,
-    Hidpp20ProtocolDriver, LiftOffDistance, MouseDevice, MouseSettings, SafeDeviceController,
-    SupportTier, WriteMode,
+    detect_hardware_devices, hid_topology_fingerprint, ApplyOutcome, Compx64Device,
+    Compx64ProtocolDriver, CompxDevice, CompxProtocolDriver, DeviceCapabilities, DeviceDriver,
+    DeviceInfo, DryRunDevice, EndgameGearOp1Device, EndgameGearOp1ProtocolDriver, FinalmouseDevice,
+    FinalmouseProtocolDriver, Hidpp20Device, Hidpp20ProtocolDriver, LiftOffDistance, MouseDevice,
+    MouseSettings, NinjutsoDevice, NinjutsoProtocolDriver, RazerDevice, RazerProtocolDriver,
+    SafeDeviceController, SupportTier, VaxeeDevice, VaxeeProtocolDriver, WriteMode,
 };
 pub use diagnostics::{
     format_diagnostic_report, run_timer_jitter_benchmark, ButtonBounceStats, ClickBounceAnalyzer,

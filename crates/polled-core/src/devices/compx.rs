@@ -1,6 +1,6 @@
 // Polled - Windows input health check & per-game peripheral profiles
 // Copyright (C) 2026 k1jaa
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Unified Compx CX52850 / Nordic 17-byte (`Report ID 0x08` on `usage_page 0xFF02`) protocol driver.
 //!
@@ -8,7 +8,7 @@
 //! configuration protocol (including Pulsar X2 CrazyLight / Nordic series, LAMZU 4K/1K/Wired,
 //! and generic `0x3554` Compx mice).
 //!
-//! # Protocol Attribution & Licenses (all GPL-3.0 compatible)
+//! # Protocol Attribution & Licenses (all AGPL-3.0 compatible)
 //! Every USB VID/PID, HID report ID, frame checksum, register address, and DPI encoding formula
 //! in this module comes from verified open-source implementations:
 //! - `packerlschupfer/pulsar-mouse-linux` (<https://github.com/packerlschupfer/pulsar-mouse-linux>)

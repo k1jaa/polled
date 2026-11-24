@@ -8,11 +8,28 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## Known Issues & Limitations (Current)
 
 - **Unsigned Windows binaries:** Release executables (`polled.exe`, `polled-gui.exe`) are not yet signed with a commercial code-signing certificate, so Windows Defender SmartScreen may prompt on first run. Every release ships `SHA256SUMS.txt` and builds publicly via GitHub Actions.
-- **Unverified mouse models (`Implemented from docs`):** Only **Pulsar X2 CrazyLight Mini Wireless** (`3710:5406`) and **LAMZU 4K Receiver** (`3554:f510`) have been verified on physical hardware. Logitech HID++ 2.0 and other Compx/Nordic models are implemented from open-source protocol documentation and may exhibit firmware-specific quirks (see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
-- **Onboard flash writes on Compx/Nordic mice:** Compx/Nordic firmware exposes no volatile RAM-only write command; Polled mitigates flash wear via register diffing, focus debouncing, and a 4-writes / 60-second sliding-window cap.
+- **Unverified mouse models (`Implemented from docs`):** Only **Pulsar X2 CrazyLight Mini Wireless** (`3710:5406`) and **LAMZU 4K Receiver** (`3554:f510`) have been verified on physical hardware in Polled. Razer, CompX 64B (WLMouse / LAMZU Maya X & Inca / Attack Shark / Vancer / RAWM), Endgame Gear, Finalmouse, VAXEE, Ninjutso, Logitech HID++ 2.0, and other CompX 17B models are implemented from open-source protocol documentation and prompt for confirmation before the first write in a session (see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
+- **Onboard flash writes:** Most wireless gaming mice persist settings to onboard memory rather than RAM; Polled mitigates flash wear via register diffing, focus debouncing, and a 4-writes / 60-second sliding-window cap.
 - **No built-in auto-updater:** Portable zip releases are updated manually.
 - **Minimum window size:** The GUI enforces a minimum viewport of `680×540` px to avoid crowding Input Lab plots and Profile editors.
-- **Version metadata in `v0.2.0`:** The `v0.2.0` tagged binaries reported `0.1.0` from `polled --version` because workspace `Cargo.toml` was not bumped prior to tagging `v0.2.0` (fixed in `v0.2.1`).
+- **Version metadata in `v0.2.0`:** The `v0.2.0` tagged binaries reported `0.1.0` from `polled --version` because workspace `Cargo.toml` was not bumped prior to tagging `v0.2.0` (fixed in `v0.2.1`+).
+
+---
+
+## [0.3.0] - 2026-11-24
+
+### Added
+- **Six native Rust gaming-mouse protocol drivers** (ported with full attribution from [`OpenMouse-Project/mouse-protocol`](https://github.com/OpenMouse-Project/mouse-protocol) & `openrazer`, protected by `SafeDeviceController` diffing, flash-wear rate limiting, read-back verification/rollback, and the GUI Unverified Hardware Warning):
+  - **Razer (`devices/razer.rs`)**: 80+ Razer models over 90-byte HID feature reports (`0x1532`) — Viper V3 Pro / SE / HyperSpeed, Viper V2 Pro / Ultimate / 8KHz / Mini SE, DeathAdder V4 Pro / V3 Pro / V3 / V2 / Essential, Basilisk V3 Pro / V3 / X, Cobra Pro, Naga V2 Pro / Pro / X, Orochi V2, Mouse Dock Pro, and HyperPolling Wireless Dongle.
+  - **CompX 64B Page-Command (`devices/compx64.rs`)**: **WLMouse** (Beast X / Pro / Max / Mini / Mini Pro / Miao / G, Sword X, Strider, Huan, Ying, 1K Receiver), **LAMZU Aurora / 8K Gen** (Maya X, Inca 8K, Paro Aurora, Aurora 1K/8K Receivers), **Attack Shark** (R5 Ultra, R6, R8), **Vancer** Akitsu Medium 3950, **RAWM** Leviathan V4 GT, **CRDRAKO** KO-ONE, and **LunaFury** LUNA33/TYPE33.
+  - **Endgame Gear (`devices/endgame_gear.rs`)**: OP1 8K / v2 / Purple Frost, XM2 8K / v2, OP1w 4K / v2, XM2w 4K / v2 (`0x3367`, Feature Report `0xA0`/`0xA1`, wired config store & wireless 4K block writes).
+  - **Finalmouse (`devices/finalmouse.rs`)**: UltralightX (ULX) and Starlight X (SLX) receivers (`0x361D`).
+  - **VAXEE (`devices/vaxee.rs`)**: XE / V2 / XE-S, NP-01 / NP-01S V2 / V3 / Ergo, Outset AX, E1, and VAXEE x Ninjutso Sora (`0x3057`, Feature Report `0x0E`).
+  - **Ninjutso (`devices/ninjutso.rs`)**: Sora V2 (legacy `0x1915`), Sora V3, and TEN / TEN AIR (`0x093A`).
+- Expanded USB HID hot-plug fingerprinting (`hid_topology_fingerprint`) to also track Generic Desktop Mouse collections (`0x01:0x02`) so Razer mice hot-plug cleanly.
+
+### Changed
+- **Re-licensed Polled from `GPL-3.0-or-later` to `AGPL-3.0-or-later`** (`LICENSE`, `Cargo.toml`, all source SPDX headers, GUI footer/tooltip, and docs) for full license compatibility with `OpenMouse-Project/mouse-protocol`.
 
 ---
 

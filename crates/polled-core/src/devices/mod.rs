@@ -1,11 +1,17 @@
 // Polled - Windows input health check & per-game peripheral profiles
 // Copyright (C) 2026 k1jaa
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 pub mod compx;
+pub mod compx64;
 pub mod controller;
 pub mod dry_run;
+pub mod endgame_gear;
+pub mod finalmouse;
 pub mod hidpp20;
+pub mod ninjutso;
+pub mod razer;
+pub mod vaxee;
 
 use std::fmt;
 
@@ -15,9 +21,15 @@ use serde::{Deserialize, Serialize};
 use crate::error::{PolledError, Result};
 
 pub use compx::{CompxDevice, CompxProtocolDriver};
+pub use compx64::{Compx64Device, Compx64ProtocolDriver};
 pub use controller::{ApplyOutcome, SafeDeviceController};
 pub use dry_run::DryRunDevice;
+pub use endgame_gear::{EndgameGearOp1Device, EndgameGearOp1ProtocolDriver};
+pub use finalmouse::{FinalmouseDevice, FinalmouseProtocolDriver};
 pub use hidpp20::{Hidpp20Device, Hidpp20ProtocolDriver};
+pub use ninjutso::{NinjutsoDevice, NinjutsoProtocolDriver};
+pub use razer::{RazerDevice, RazerProtocolDriver};
+pub use vaxee::{VaxeeDevice, VaxeeProtocolDriver};
 
 /// Explicitly communicates how a device backend was verified (surfaced in UI and README).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,7 +370,13 @@ pub fn detect_hardware_devices() -> Result<Vec<Box<dyn MouseDevice>>> {
     })?;
     let drivers: Vec<Box<dyn DeviceDriver>> = vec![
         Box::new(CompxProtocolDriver),
+        Box::new(Compx64ProtocolDriver),
         Box::new(Hidpp20ProtocolDriver),
+        Box::new(RazerProtocolDriver),
+        Box::new(EndgameGearOp1ProtocolDriver),
+        Box::new(FinalmouseProtocolDriver),
+        Box::new(VaxeeProtocolDriver),
+        Box::new(NinjutsoProtocolDriver),
     ];
     let mut devices = Vec::new();
     for driver in &drivers {
@@ -377,7 +395,7 @@ pub fn hid_topology_fingerprint() -> Vec<(u16, u16, u16, u16)> {
     };
     let mut fp: Vec<(u16, u16, u16, u16)> = api
         .device_list()
-        .filter(|d| d.usage_page() >= 0xFF00)
+        .filter(|d| d.usage_page() >= 0xFF00 || (d.usage_page() == 0x01 && d.usage() == 0x02))
         .map(|d| (d.vendor_id(), d.product_id(), d.usage_page(), d.usage()))
         .collect();
     fp.sort_unstable();
