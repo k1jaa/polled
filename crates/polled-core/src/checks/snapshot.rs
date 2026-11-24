@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PolledError, Result};
-use crate::win::{AccessibilityKind, MouseAccelParams, RegHive};
+use crate::win::{AccessibilityKind, KeyboardRepeatParams, MouseAccelParams, RegHive};
 
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
@@ -72,6 +72,12 @@ pub enum SavedValue {
     AccessibilityFlags {
         kind: AccessibilityKind,
         flags: u32,
+    },
+    KeyboardRepeat(KeyboardRepeatParams),
+    NetworkNagle {
+        interface_guid: String,
+        tcp_ack_frequency: Option<u32>,
+        tcp_no_delay: Option<u32>,
     },
 }
 

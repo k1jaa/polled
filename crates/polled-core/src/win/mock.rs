@@ -7,10 +7,10 @@ use std::sync::Mutex;
 
 use crate::error::{PolledError, Result};
 use crate::win::{
-    AccessibilityKind, AudioEndpointInfo, AudioFlow, DisplayModeInfo, MouseAccelParams,
-    NetworkAdapterInfo, NetworkAdapterKind, PowerSchemeInfo, PowerValueIndex, ProcessSample,
-    RegHive, SystemEnv, TimerResolutionSample, UsbControllerInfo, UsbMouseTopology, UsbPowerDevice,
-    WindowsVersion,
+    AccessibilityKind, AudioEndpointInfo, AudioFlow, DisplayModeInfo, KeyboardRepeatParams,
+    MouseAccelParams, NetworkAdapterInfo, NetworkAdapterKind, PowerSchemeInfo, PowerValueIndex,
+    ProcessSample, RegHive, SystemEnv, TimerResolutionSample, UsbControllerInfo, UsbMouseTopology,
+    UsbPowerDevice, WindowsVersion,
 };
 
 #[derive(Debug, Clone)]
@@ -25,6 +25,7 @@ struct MockState {
     registry: HashMap<(RegHive, String, String), MockRegValue>,
     mouse_accel: MouseAccelParams,
     mouse_speed: u32,
+    keyboard_repeat: KeyboardRepeatParams,
     accessibility_flags: HashMap<AccessibilityKind, u32>,
     active_power_scheme: String,
     power_schemes: Vec<PowerSchemeInfo>,
@@ -59,6 +60,10 @@ impl Default for MockState {
                 speed: 0,
             },
             mouse_speed: 10,
+            keyboard_repeat: KeyboardRepeatParams {
+                delay: 1,
+                speed: 31,
+            },
             accessibility_flags,
             active_power_scheme: balanced.clone(),
             power_schemes: vec![
@@ -327,6 +332,18 @@ impl SystemEnv for MockEnv {
             Self::key(RegHive::Hkcu, r"Control Panel\Mouse", "MouseSensitivity"),
             MockRegValue::String(clamped.to_string()),
         );
+        Ok(())
+    }
+
+    fn get_keyboard_repeat(&self) -> Result<KeyboardRepeatParams> {
+        Ok(self.state.lock().unwrap().keyboard_repeat)
+    }
+
+    fn set_keyboard_repeat(&self, params: KeyboardRepeatParams) -> Result<()> {
+        self.state.lock().unwrap().keyboard_repeat = KeyboardRepeatParams {
+            delay: params.delay.min(3),
+            speed: params.speed.min(31),
+        };
         Ok(())
     }
 

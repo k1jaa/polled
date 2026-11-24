@@ -7,13 +7,14 @@ use std::mem::size_of;
 
 use windows::Win32::UI::Accessibility::{FILTERKEYS, MOUSEKEYS, STICKYKEYS, STICKYKEYS_FLAGS};
 use windows::Win32::UI::WindowsAndMessaging::{
-    SystemParametersInfoW, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SPI_GETFILTERKEYS, SPI_GETMOUSE,
-    SPI_GETMOUSEKEYS, SPI_GETMOUSESPEED, SPI_GETSTICKYKEYS, SPI_SETFILTERKEYS, SPI_SETMOUSE,
+    SystemParametersInfoW, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SPI_GETFILTERKEYS,
+    SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED, SPI_GETMOUSE, SPI_GETMOUSEKEYS, SPI_GETMOUSESPEED,
+    SPI_GETSTICKYKEYS, SPI_SETFILTERKEYS, SPI_SETKEYBOARDDELAY, SPI_SETKEYBOARDSPEED, SPI_SETMOUSE,
     SPI_SETMOUSEKEYS, SPI_SETMOUSESPEED, SPI_SETSTICKYKEYS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
 use crate::error::{PolledError, Result};
-use crate::win::{AccessibilityKind, MouseAccelParams};
+use crate::win::{AccessibilityKind, KeyboardRepeatParams, MouseAccelParams};
 
 const PERSIST_AND_BROADCAST: SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS =
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(SPIF_UPDATEINIFILE.0 | SPIF_SENDCHANGE.0);
@@ -87,6 +88,50 @@ pub fn set_mouse_speed(speed: u32) -> Result<()> {
         )
     }
     .map_err(|e| spi_err("SPI_SETMOUSESPEED", e))
+}
+
+pub fn get_keyboard_repeat() -> Result<KeyboardRepeatParams> {
+    let mut delay: i32 = 1;
+    let mut speed: u32 = 31;
+    // SAFETY: `SPI_GETKEYBOARDDELAY` writes an `i32` (0..=3) into `pvParam`.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETKEYBOARDDELAY,
+            0,
+            Some((&mut delay as *mut i32).cast::<c_void>()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .map_err(|e| spi_err("SPI_GETKEYBOARDDELAY", e))?;
+
+    // SAFETY: `SPI_GETKEYBOARDSPEED` writes a `u32` (0..=31) into `pvParam`.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETKEYBOARDSPEED,
+            0,
+            Some((&mut speed as *mut u32).cast::<c_void>()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .map_err(|e| spi_err("SPI_GETKEYBOARDSPEED", e))?;
+
+    Ok(KeyboardRepeatParams {
+        delay: delay.clamp(0, 3) as u32,
+        speed: speed.min(31),
+    })
+}
+
+pub fn set_keyboard_repeat(params: KeyboardRepeatParams) -> Result<()> {
+    let delay = params.delay.min(3);
+    let speed = params.speed.min(31);
+    // SAFETY: Per Microsoft docs, both `SPI_SETKEYBOARDDELAY` and `SPI_SETKEYBOARDSPEED`
+    // pass the integer value in `uiParam` with `pvParam = None`.
+    unsafe {
+        SystemParametersInfoW(SPI_SETKEYBOARDDELAY, delay, None, PERSIST_AND_BROADCAST)
+            .map_err(|e| spi_err("SPI_SETKEYBOARDDELAY", e))?;
+        SystemParametersInfoW(SPI_SETKEYBOARDSPEED, speed, None, PERSIST_AND_BROADCAST)
+            .map_err(|e| spi_err("SPI_SETKEYBOARDSPEED", e))
+    }
 }
 
 pub fn get_accessibility_flags(kind: AccessibilityKind) -> Result<u32> {

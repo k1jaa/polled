@@ -7,28 +7,36 @@ pub mod accessibility_shortcuts;
 pub mod audio_comms_ducking;
 pub mod audio_enhancements;
 pub mod audio_format;
+pub mod cpu_core_parking;
 pub mod cpu_throttle;
 pub mod cursor_sanity;
 pub mod custom_tweaks;
+pub mod delivery_optimization;
 pub mod enhance_pointer_precision;
+pub mod fast_startup;
 pub mod game_bar_capture;
 pub mod game_mode;
 pub mod global_timer_requests;
 pub mod hags;
+pub mod keyboard_repeat;
 pub mod mmcss_gaming;
 pub mod monitor_refresh;
 pub mod mouse_queue_size;
+pub mod mpo_toggle;
 pub mod network_connection;
 pub mod network_dns;
+pub mod network_nagle;
 pub mod network_nic_power;
 pub mod pcie_aspm;
 pub mod pointer_speed;
 pub mod power_plan;
+pub mod power_throttling;
 pub mod priority_separation;
 pub mod runner;
 pub mod snapshot;
 pub mod state;
 pub mod timer_resolution;
+pub mod transparency_effects;
 pub mod usb_msi_mode;
 pub mod usb_power_management;
 pub mod usb_selective_suspend;
@@ -145,7 +153,7 @@ pub trait HealthCheck: Send + Sync {
     }
 }
 
-/// Returns all 32 registered built-in input, audio & network health checks and optional tweaks in display order.
+/// Returns all 40 registered built-in input, audio, network & OS health checks and optional tweaks in display order.
 pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
     vec![
         // --- Core Mouse & Cursor Input ---
@@ -176,9 +184,17 @@ pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
         Box::new(windowed_optimizations::WindowedOptimizationsCheck),
         Box::new(game_mode::GameModeCheck),
         Box::new(game_bar_capture::GameBarCaptureCheck),
-        Box::new(hags::HagsCheck),
         Box::new(vbs_memory_integrity::VbsMemoryIntegrityCheck),
-        // --- Optional Reversible Low-Latency Tweaks (Opt-In) ---
+        // --- Optional Reversible Low-Latency Tweaks (Opt-In, 12 Total) ---
+        Box::new(keyboard_repeat::KeyboardRepeatCheck),
+        Box::new(transparency_effects::TransparencyEffectsCheck),
+        Box::new(cpu_core_parking::CpuCoreParkingCheck),
+        Box::new(power_throttling::PowerThrottlingCheck),
+        Box::new(fast_startup::FastStartupCheck),
+        Box::new(delivery_optimization::DeliveryOptimizationCheck),
+        Box::new(network_nagle::NetworkNagleCheck),
+        Box::new(hags::HagsCheck),
+        Box::new(mpo_toggle::MpoToggleCheck),
         Box::new(mmcss_gaming::MmcssGamingCheck),
         Box::new(priority_separation::PrioritySeparationCheck),
         Box::new(global_timer_requests::GlobalTimerRequestsCheck),

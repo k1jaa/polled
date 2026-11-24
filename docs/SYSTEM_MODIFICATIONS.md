@@ -7,7 +7,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 
 ---
 
-## 1. Built-In Health Checks & Optional Tweaks (32 Total)
+## 1. Built-In Health Checks & Optional Tweaks (40 Total)
 
 ### 1.1 Core Mouse & Cursor Input
 
@@ -56,15 +56,23 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 | `windowed_optimizations` | Fixable | `HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings` (`REG_SZ`) | Inserts/updates `SwapEffectUpgradeEnable=1;` while preserving all other semicolon-delimited tokens | No admin / Immediate (new game launches) | Restores exact original `DirectXUserGlobalSettings` string (or deletes value if absent) |
 | `game_mode` | Fixable | `HKCU\Software\Microsoft\GameBar\AutoGameModeEnabled` & `AllowAutoGameMode` (`REG_DWORD`) | Sets `AutoGameModeEnabled=1` (and `AllowAutoGameMode=1` if it was `0`) | No admin / Immediate | Restores both captured `REG_DWORD` values (or deletes if absent) |
 | `game_bar_capture` | Fixable | `HKCU\Software\Microsoft\Windows\CurrentVersion\GameDVR\AppCaptureEnabled` & `HKCU\System\GameConfigStore\GameDVR_Enabled` (`REG_DWORD`) | `0` for both (does **not** touch Fullscreen Optimizations) | No admin / Immediate | Restores both captured `REG_DWORD` values (or deletes if absent) |
-| `hags` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\HwSchMode` | *None (never modifies)* | No admin | N/A |
 | `vbs_memory_integrity` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\EnableVirtualizationBasedSecurity` & `...\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled` | *None (Polled never weakens OS security)* | No admin | N/A |
 
-### 1.6 Optional Reversible Low-Latency Tweaks (Opt-In Only)
+### 1.6 Optional Reversible Low-Latency Tweaks (Opt-In Only, 12 Total)
 
 Optional tweaks are **never** applied by **Fix Safe Issues** and always show an explicit confirmation warning before applying.
 
 | Check ID | Mode | Exact Windows Target | Value Written on Apply | Admin / Restart | Rollback Behavior |
 | --- | --- | --- | --- | --- | --- |
+| `keyboard_repeat` | Optional Tweak | Win32 `SystemParametersInfoW(SPI_SETKEYBOARDDELAY)` & `SPI_SETKEYBOARDSPEED` | `delay = 0` (~250 ms), `speed = 31` (~30 Hz) | No admin / Immediate | Restores captured `(delay, speed)` |
+| `transparency_effects` | Optional Tweak | `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\EnableTransparency` (`REG_DWORD`) | `0` (disables Mica/Acrylic DWM blur) | No admin / Immediate | Restores captured `REG_DWORD` (or deletes if absent) |
+| `cpu_core_parking` | Optional Tweak | `powrprof.dll` active scheme → Subgroup `54533251-82be-4824-96c1-47b60b740d00` → Setting `0cc5b647-c1df-4637-891a-dec35c318583` (`CPMINCORES`) | AC index = `100` (%); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
+| `power_throttling` | Optional Tweak | `HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling\PowerThrottlingOff` (`REG_DWORD`) | `1` (disables EcoQoS background throttling) | **UAC (Admin)** / **Reboot** | Restores captured `REG_DWORD` (or deletes if absent) |
+| `fast_startup` | Optional Tweak | `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power\HiberbootEnabled` (`REG_DWORD`) | `0` (clean kernel boot on Shutdown; Sleep untouched) | **UAC (Admin)** / Next Shutdown | Restores captured `REG_DWORD` (or deletes if absent) |
+| `delivery_optimization` | Optional Tweak | `HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization\DODownloadMode` (`REG_DWORD`) | `0` (HTTP-only; disables P2P update seeding) | **UAC (Admin)** / Immediate | Restores captured `REG_DWORD` (or deletes if absent) |
+| `network_nagle` | Optional Tweak | `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{primary_guid}` (`TcpAckFrequency`, `TCPNoDelay`) | `1` for both (TCP games/MMOs; UDP unchanged) | **UAC (Admin)** / **Reboot** | Restores both captured `REG_DWORD` values on saved interface GUID |
+| `hags` | Optional Tweak | `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\HwSchMode` (`REG_DWORD`) | `2` (Enables Hardware-Accelerated GPU Scheduling) | **UAC (Admin)** / **Reboot** | Restores captured `REG_DWORD` (e.g. `1` or deletes if absent) |
+| `mpo_toggle` | Optional Tweak | `HKLM\SOFTWARE\Microsoft\Windows\Dwm\OverlayTestMode` (`REG_DWORD`) | `5` (Troubleshooting override disabling Multi-Plane Overlay) | **UAC (Admin)** / **Reboot** | Restores captured `REG_DWORD` (deletes value to re-enable MPO) |
 | `mmcss_gaming` | Optional Tweak | `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile` (`SystemResponsiveness`, `NetworkThrottlingIndex`) & `...\Tasks\Games` (`GPU Priority`, `Priority`, `Scheduling Category`, `SFIO Priority`) | `SystemResponsiveness=10`, `NetworkThrottlingIndex=0xFFFFFFFF`, `GPU Priority=8`, `Priority=6`, `Scheduling Category="High"`, `SFIO Priority="High"` | **UAC (Admin)** / **Reboot** | Restores all 6 values to exact captured state (or deletes any previously absent value) |
 | `win32_priority_separation` | Optional Tweak | `HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl\Win32PrioritySeparation` (`REG_DWORD`) | `0x26` (38 decimal — Short, Variable, 3:1 High foreground boost) | **UAC (Admin)** / Immediate | Restores captured `REG_DWORD` (or deletes value if absent) |
 | `global_timer_requests` | Optional Tweak | `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel\GlobalTimerResolutionRequests` (`REG_DWORD`) | `1` | **UAC (Admin)** / **Reboot** | Restores captured `REG_DWORD` (or deletes value if absent) |

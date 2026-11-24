@@ -16,6 +16,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.0] - 2026-11-24
+
+### Added
+- **Expanded Reversible Low-Latency Tweak Suite (Total Built-In Checks: 32 → 40; Curated Opt-In Tweaks: 3 → 12):**
+  - `cpu_core_parking`: sets `CPMINCORES = 100%` on AC power via `powrprof.dll` (leaving DC/battery untouched) to eliminate CPU core-unpark wake stutters.
+  - `power_throttling`: sets `PowerThrottlingOff = 1` to stop Windows EcoQoS from down-clocking background audio, voice, capture, and peripheral helpers onto slow cores.
+  - `keyboard_repeat`: zero-admin immediate Win32 `SPI_SETKEYBOARDDELAY` / `SPI_SETKEYBOARDSPEED` tweak for shortest repeat delay (`250 ms`) and fastest repeat rate (`31/31`).
+  - `fast_startup`: sets `HiberbootEnabled = 0` so Windows Shutdown performs a clean kernel boot instead of hibernating stale driver/DPC state (Sleep untouched).
+  - `delivery_optimization`: sets `DODownloadMode = 0` (HTTP-only) to stop Windows Update from silently seeding P2P update uploads and causing mid-match ping spikes.
+  - `network_nagle`: sets `TcpAckFrequency = 1` and `TCPNoDelay = 1` on the primary active network adapter for TCP-based games/MMOs.
+  - `transparency_effects`: zero-admin immediate `EnableTransparency = 0` tweak disabling Mica/Acrylic multi-pass DWM backdrop blur.
+  - `mpo_toggle`: official `OverlayTestMode = 5` troubleshooting override for mixed-Hz dual-monitor stutter / flicker, with clean delete-on-undo.
+  - Upgraded `hags` (`HwSchMode`) from report-only to a reversible opt-in tweak backed by `baseline_snapshot.json`.
+
+---
+
 ## [0.9.0] - 2026-11-24
 
 ### Added

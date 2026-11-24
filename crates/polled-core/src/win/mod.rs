@@ -248,6 +248,13 @@ impl NetworkAdapterKind {
     }
 }
 
+/// Windows keyboard repeat delay (`0..=3`, 0 ≈ 250 ms) and repeat rate (`0..=31`, 31 ≈ 30 Hz).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyboardRepeatParams {
+    pub delay: u32,
+    pub speed: u32,
+}
+
 /// Read-only snapshot of an active Windows network adapter, gateway, DNS, and NIC latency flags.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkAdapterInfo {
@@ -317,6 +324,9 @@ pub trait SystemEnv: Send + Sync {
 
     fn get_mouse_speed(&self) -> Result<u32>;
     fn set_mouse_speed(&self, speed: u32) -> Result<()>;
+
+    fn get_keyboard_repeat(&self) -> Result<KeyboardRepeatParams>;
+    fn set_keyboard_repeat(&self, params: KeyboardRepeatParams) -> Result<()>;
 
     fn get_accessibility_flags(&self, kind: AccessibilityKind) -> Result<u32>;
     fn set_accessibility_flags(&self, kind: AccessibilityKind, flags: u32) -> Result<()>;
@@ -410,6 +420,14 @@ impl SystemEnv for WindowsEnv {
 
     fn set_mouse_speed(&self, speed: u32) -> Result<()> {
         spi::set_mouse_speed(speed)
+    }
+
+    fn get_keyboard_repeat(&self) -> Result<KeyboardRepeatParams> {
+        spi::get_keyboard_repeat()
+    }
+
+    fn set_keyboard_repeat(&self, params: KeyboardRepeatParams) -> Result<()> {
+        spi::set_keyboard_repeat(params)
     }
 
     fn get_accessibility_flags(&self, kind: AccessibilityKind) -> Result<u32> {
