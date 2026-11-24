@@ -113,6 +113,7 @@ const ADDR_DPI_BASE: u16 = 0x000C;
 const DPI_STAGE_STRIDE: u16 = 4;
 const ADDR_DEBOUNCE: u16 = 0x00A9;
 const ADDR_MOTION_SYNC: u16 = 0x00AB;
+const ADDR_SLEEP_TIME: u16 = 0x00AD;
 const ADDR_ANGLE_SNAPPING: u16 = 0x00AF;
 const ADDR_RIPPLE_CONTROL: u16 = 0x00B1;
 
@@ -226,8 +227,7 @@ fn rot2_nibble(n: u8) -> u8 {
     ((n << 2) | (n >> 2)) & 0x0F
 }
 
-/// Encodes DPI into the 3 data bytes `[x_lo, y_lo, high]` according to `encoding`.
-pub fn encode_dpi_raw(dpi: u16, encoding: DpiEncoding) -> Option<[u8; 3]> {
+fn encode_dpi_axis(dpi: u16, encoding: DpiEncoding) -> Option<(u8, u8)> {
     match encoding {
         DpiEncoding::MultiMode10Step => {
             if !(10..=32000).contains(&dpi) {
@@ -258,12 +258,9 @@ pub fn encode_dpi_raw(dpi: u16, encoding: DpiEncoding) -> Option<[u8; 3]> {
             let page = (index / 256) as u8;
             let low = (index % 256) as u8;
             let nib = rot2_nibble((mode << 2) | page);
-            let high = (nib << 4) | nib;
-            Some([low, low, high])
+            Some((low, nib))
         }
         DpiEncoding::SingleMode50Step => {
-            // Standard Compx CX52850 / LAMZU / Pulsar Nordic / VGN / G-Wolves / Hitscan / Scyrox V8:
-            // dpi = (lo + 1 + 256 * page) * 50, with `high` nibble storing rot2(page).
             if !(50..=30000).contains(&dpi) {
                 return None;
             }
@@ -278,15 +275,13 @@ pub fn encode_dpi_raw(dpi: u16, encoding: DpiEncoding) -> Option<[u8; 3]> {
             let page = (index / 256) as u8;
             let low = (index % 256) as u8;
             let nib = rot2_nibble(page);
-            let high = (nib << 4) | nib;
-            Some([low, low, high])
+            Some((low, nib))
         }
     }
 }
 
-/// Decodes the 3 data bytes `[x_lo, y_lo, high]` according to `encoding`.
-pub fn decode_dpi_raw(raw: [u8; 3], encoding: DpiEncoding) -> Option<u16> {
-    let high = rot2_nibble(raw[2] & 0x0F);
+fn decode_dpi_axis(low: u8, raw_nib: u8, encoding: DpiEncoding) -> Option<u16> {
+    let high = rot2_nibble(raw_nib & 0x0F);
     let mode = high >> 2;
     let page = u32::from(high & 0x03);
     let (step, base) = match encoding {
@@ -298,8 +293,32 @@ pub fn decode_dpi_raw(raw: [u8; 3], encoding: DpiEncoding) -> Option<u16> {
         },
         DpiEncoding::SingleMode50Step => (50u32, 1u32),
     };
-    let dpi = (u32::from(raw[0]) + base + 256 * page) * step;
+    let dpi = (u32::from(low) + base + 256 * page) * step;
     u16::try_from(dpi).ok()
+}
+
+/// Encodes independent X/Y DPI into `[x_lo, y_lo, (y_nib << 4) | x_nib]`.
+pub fn encode_dpi_xy_raw(dpi_x: u16, dpi_y: u16, encoding: DpiEncoding) -> Option<[u8; 3]> {
+    let (x_lo, x_nib) = encode_dpi_axis(dpi_x, encoding)?;
+    let (y_lo, y_nib) = encode_dpi_axis(dpi_y, encoding)?;
+    Some([x_lo, y_lo, (y_nib << 4) | x_nib])
+}
+
+/// Decodes `[x_lo, y_lo, high]` into `(dpi_x, dpi_y)`.
+pub fn decode_dpi_xy_raw(raw: [u8; 3], encoding: DpiEncoding) -> Option<(u16, u16)> {
+    let x = decode_dpi_axis(raw[0], raw[2] & 0x0F, encoding)?;
+    let y = decode_dpi_axis(raw[1], (raw[2] >> 4) & 0x0F, encoding)?;
+    Some((x, y))
+}
+
+/// Encodes uniform DPI into the 3 data bytes `[x_lo, y_lo, high]` according to `encoding`.
+pub fn encode_dpi_raw(dpi: u16, encoding: DpiEncoding) -> Option<[u8; 3]> {
+    encode_dpi_xy_raw(dpi, dpi, encoding)
+}
+
+/// Decodes the 3 data bytes `[x_lo, y_lo, high]` according to `encoding` (X axis).
+pub fn decode_dpi_raw(raw: [u8; 3], encoding: DpiEncoding) -> Option<u16> {
+    decode_dpi_xy_raw(raw, encoding).map(|(x, _)| x)
 }
 
 /// Resolves the Compx/Nordic capability spec from USB `(vid, pid)` and OS product/manufacturer strings.
@@ -721,12 +740,32 @@ impl CompxDevice {
         Ok(bytes[0].min(self.spec.max_dpi_stages.saturating_sub(1)))
     }
 
+    fn is_wireless(&self) -> bool {
+        !self.spec.wired_1k_cap
+            && !self
+                .spec
+                .connection_label
+                .to_ascii_lowercase()
+                .contains("wired")
+    }
+
     fn read_bool_scalar(&mut self, addr: u16) -> Option<bool> {
         let bytes = self.mem_read(addr, 2).ok()?;
         if bytes.len() < 2 || checksum(&[bytes[0]]) != bytes[1] {
             return None;
         }
         Some(bytes[0] != 0)
+    }
+
+    fn read_sleep_timeout_secs(&mut self) -> Option<u16> {
+        if !self.is_wireless() {
+            return None;
+        }
+        let bytes = self.mem_read(ADDR_SLEEP_TIME, 2).ok()?;
+        if bytes.len() < 2 || checksum(&[bytes[0]]) != bytes[1] || bytes[0] == 0 {
+            return None;
+        }
+        Some(u16::from(bytes[0]) * 10)
     }
 }
 
@@ -764,10 +803,12 @@ impl MouseDevice for CompxDevice {
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
+        let wireless = self.is_wireless();
         DeviceCapabilities {
             dpi_min: self.spec.dpi_min,
             dpi_max: self.spec.dpi_max,
             dpi_step: self.spec.dpi_step,
+            supports_xy_dpi: true,
             polling_rates_hz: self.spec.polling_rates_hz.clone(),
             lod_options: self.spec.lod_options.clone(),
             supports_debounce: true,
@@ -776,6 +817,9 @@ impl MouseDevice for CompxDevice {
             supports_motion_sync: true,
             supports_angle_snapping: true,
             supports_ripple_control: true,
+            supports_sleep_timeout: wireless,
+            sleep_timeout_min_secs: if wireless { 10 } else { 0 },
+            sleep_timeout_max_secs: if wireless { 1800 } else { 0 },
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} uses Compx/Nordic onboard profile flash (no volatile RAM-only write command). Polled diffs every register and rate-limits writes to prevent flash wear.",
@@ -800,7 +844,7 @@ impl MouseDevice for CompxDevice {
         let active_stage = self.read_active_dpi_stage()?;
         let stage_addr = ADDR_DPI_BASE + u16::from(active_stage) * DPI_STAGE_STRIDE;
         let dpi_bytes = self.mem_read(stage_addr, 4)?;
-        let dpi = decode_dpi_raw(
+        let (dpi_x, dpi_y) = decode_dpi_xy_raw(
             [dpi_bytes[0], dpi_bytes[1], dpi_bytes[2]],
             self.spec.dpi_encoding,
         )
@@ -821,15 +865,18 @@ impl MouseDevice for CompxDevice {
         let motion_sync = self.read_bool_scalar(ADDR_MOTION_SYNC);
         let angle_snapping = self.read_bool_scalar(ADDR_ANGLE_SNAPPING);
         let ripple_control = self.read_bool_scalar(ADDR_RIPPLE_CONTROL);
+        let sleep_timeout_secs = self.read_sleep_timeout_secs();
 
         Ok(MouseSettings {
-            dpi: Some(dpi),
+            dpi: Some(dpi_x),
+            dpi_y: (dpi_y != dpi_x).then_some(dpi_y),
             polling_rate_hz: Some(effective_hz),
             lod: Some(lod),
             debounce_ms: Some(debounce_ms),
             motion_sync,
             angle_snapping,
             ripple_control,
+            sleep_timeout_secs,
         })
     }
 
@@ -854,17 +901,20 @@ impl MouseDevice for CompxDevice {
             }
         }
 
-        if let Some(target_dpi) = settings.dpi {
-            if current.dpi != Some(target_dpi) {
-                let raw = encode_dpi_raw(target_dpi, self.spec.dpi_encoding).ok_or_else(|| {
-                    PolledError::UnsupportedSetting {
+        if settings.dpi.is_some() || settings.dpi_y.is_some() {
+            let cur_x = current.dpi.unwrap_or(800);
+            let cur_y = current.dpi_y.unwrap_or(cur_x);
+            let target_x = settings.dpi.unwrap_or(cur_x);
+            let target_y = settings.dpi_y.or(settings.dpi).unwrap_or(cur_y);
+            if target_x != cur_x || target_y != cur_y {
+                let raw = encode_dpi_xy_raw(target_x, target_y, self.spec.dpi_encoding)
+                    .ok_or_else(|| PolledError::UnsupportedSetting {
                         device: self.spec.display_name.clone(),
                         detail: format!(
-                            "DPI {target_dpi} cannot be encoded for {}",
+                            "DPI {target_x}x{target_y} cannot be encoded for {}",
                             self.spec.display_name
                         ),
-                    }
-                })?;
+                    })?;
                 let active_stage = self.read_active_dpi_stage()?;
                 let stage_addr = ADDR_DPI_BASE + u16::from(active_stage) * DPI_STAGE_STRIDE;
                 self.mem_write(stage_addr, &[raw[0], raw[1], raw[2], checksum(&raw)])?;
@@ -898,6 +948,13 @@ impl MouseDevice for CompxDevice {
         if let Some(target_rip) = settings.ripple_control {
             if current.ripple_control != Some(target_rip) {
                 self.write_byte_with_checksum(ADDR_RIPPLE_CONTROL, u8::from(target_rip))?;
+            }
+        }
+
+        if let Some(target_sleep) = settings.sleep_timeout_secs {
+            if self.is_wireless() && current.sleep_timeout_secs != Some(target_sleep) {
+                let units = ((target_sleep.saturating_add(5)) / 10).clamp(1, 180) as u8;
+                self.write_byte_with_checksum(ADDR_SLEEP_TIME, units)?;
             }
         }
 

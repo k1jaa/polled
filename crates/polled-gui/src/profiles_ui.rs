@@ -12,8 +12,9 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontId, Margin, RichText, Stroke, TextFormat, Vec2,
 };
 use polled_core::{
-    export_profile_json, import_profile_json, AppPaths, DeviceCapabilities, GameProfile,
-    LiftOffDistance, MouseSettings, PowerPlanPreset, ProfileStore, Severity, SupportTier,
+    discover_installed_games, discover_running_apps, export_profile_json, import_profile_json,
+    AppPaths, DeviceCapabilities, DiscoveredGame, GameProfile, LiftOffDistance, MouseSettings,
+    PowerPlanPreset, ProfileStore, Severity, SupportTier,
 };
 
 use crate::profile_runtime::{
@@ -33,6 +34,13 @@ enum PendingUnverifiedWrite {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GamePickerTab {
+    #[default]
+    Installed,
+    Running,
+}
+
 pub struct ProfilesUiState {
     pub store: ProfileStore,
     pub selected_profile_id: String,
@@ -41,6 +49,11 @@ pub struct ProfilesUiState {
     pub export_modal_json: Option<String>,
     pub import_modal_open: bool,
     pub import_text: String,
+    game_picker_open: bool,
+    game_picker_tab: GamePickerTab,
+    game_picker_search: String,
+    discovered_installed: Vec<DiscoveredGame>,
+    discovered_running: Vec<DiscoveredGame>,
     pub notice: Option<(Severity, String)>,
     acknowledged_unverified_devices: HashSet<String>,
     pending_unverified_action: Option<PendingUnverifiedWrite>,
@@ -58,6 +71,8 @@ pub struct ProfileDraft {
     pub editing_device_id: Option<String>,
     pub set_dpi: bool,
     pub dpi: u16,
+    pub set_dpi_y: bool,
+    pub dpi_y: u16,
     pub set_polling: bool,
     pub polling_rate_hz: u16,
     pub set_lod: bool,
@@ -70,6 +85,8 @@ pub struct ProfileDraft {
     pub angle_snapping: bool,
     pub set_ripple_control: bool,
     pub ripple_control: bool,
+    pub set_sleep: bool,
+    pub sleep_timeout_secs: u16,
     pub set_win_speed: bool,
     pub win_speed: u32,
     pub set_power_plan: bool,
@@ -90,6 +107,8 @@ impl ProfileDraft {
             editing_device_id: None,
             set_dpi: false,
             dpi: 800,
+            set_dpi_y: false,
+            dpi_y: 800,
             set_polling: false,
             polling_rate_hz: 1000,
             set_lod: false,
@@ -102,6 +121,8 @@ impl ProfileDraft {
             angle_snapping: false,
             set_ripple_control: false,
             ripple_control: false,
+            set_sleep: false,
+            sleep_timeout_secs: 300,
             set_win_speed: p.windows_pointer_speed.is_some(),
             win_speed: p.windows_pointer_speed.unwrap_or(10),
             set_power_plan: p.windows_power_plan.is_some(),
@@ -118,6 +139,8 @@ impl ProfileDraft {
     fn load_mouse_fields(&mut self, m: &MouseSettings) {
         self.set_dpi = m.dpi.is_some();
         self.dpi = m.dpi.unwrap_or(800);
+        self.set_dpi_y = m.dpi_y.is_some();
+        self.dpi_y = m.dpi_y.unwrap_or(self.dpi);
         self.set_polling = m.polling_rate_hz.is_some();
         self.polling_rate_hz = m.polling_rate_hz.unwrap_or(1000);
         self.set_lod = m.lod.is_some();
@@ -130,17 +153,21 @@ impl ProfileDraft {
         self.angle_snapping = m.angle_snapping.unwrap_or(false);
         self.set_ripple_control = m.ripple_control.is_some();
         self.ripple_control = m.ripple_control.unwrap_or(false);
+        self.set_sleep = m.sleep_timeout_secs.is_some();
+        self.sleep_timeout_secs = m.sleep_timeout_secs.unwrap_or(300);
     }
 
     fn current_mouse_fields(&self) -> MouseSettings {
         MouseSettings {
             dpi: self.set_dpi.then_some(self.dpi),
+            dpi_y: self.set_dpi_y.then_some(self.dpi_y),
             polling_rate_hz: self.set_polling.then_some(self.polling_rate_hz),
             lod: self.set_lod.then_some(self.lod),
             debounce_ms: self.set_debounce.then_some(self.debounce_ms),
             motion_sync: self.set_motion_sync.then_some(self.motion_sync),
             angle_snapping: self.set_angle_snapping.then_some(self.angle_snapping),
             ripple_control: self.set_ripple_control.then_some(self.ripple_control),
+            sleep_timeout_secs: self.set_sleep.then_some(self.sleep_timeout_secs),
         }
     }
 
@@ -245,6 +272,11 @@ impl ProfilesUiState {
             export_modal_json: None,
             import_modal_open: false,
             import_text: String::new(),
+            game_picker_open: false,
+            game_picker_tab: GamePickerTab::Installed,
+            game_picker_search: String::new(),
+            discovered_installed: Vec::new(),
+            discovered_running: Vec::new(),
             notice: None,
             acknowledged_unverified_devices: HashSet::new(),
             pending_unverified_action: None,
@@ -493,6 +525,186 @@ impl ProfilesUiState {
             }
         }
 
+        // --- SMART GAME PICKER MODAL ---
+        if self.game_picker_open {
+            let mut close_picker = false;
+            let mut refresh_picker = false;
+            let mut added_exe: Option<(String, String)> = None;
+            let picker_w = (ctx.screen_rect().width() - 48.0).clamp(360.0, 560.0);
+            egui::Window::new("Smart Game Picker (Installed & Running)")
+                .collapsible(false)
+                .resizable(true)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .default_width(picker_w)
+                .max_width(picker_w)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.5_f32, p.text))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(16)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let inst_lbl = format!("Installed ({})", self.discovered_installed.len());
+                        let inst_btn = if self.game_picker_tab == GamePickerTab::Installed {
+                            primary_btn(&inst_lbl, p)
+                        } else {
+                            secondary_btn(&inst_lbl, p)
+                        };
+                        if ui.add(inst_btn).clicked() {
+                            self.game_picker_tab = GamePickerTab::Installed;
+                        }
+                        let run_lbl = format!("Running Apps ({})", self.discovered_running.len());
+                        let run_btn = if self.game_picker_tab == GamePickerTab::Running {
+                            primary_btn(&run_lbl, p)
+                        } else {
+                            secondary_btn(&run_lbl, p)
+                        };
+                        if ui.add(run_btn).clicked() {
+                            self.game_picker_tab = GamePickerTab::Running;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(secondary_btn("Refresh", p)).clicked() {
+                                refresh_picker = true;
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.game_picker_search)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Filter by game or .exe name..."),
+                    );
+                    ui.add_space(8.0);
+
+                    let query = self.game_picker_search.trim().to_ascii_lowercase();
+                    let list = match self.game_picker_tab {
+                        GamePickerTab::Installed => &self.discovered_installed,
+                        GamePickerTab::Running => &self.discovered_running,
+                    };
+                    let existing: Vec<String> = self
+                        .editor
+                        .executables_csv
+                        .split([',', ';', '\n'])
+                        .map(|s| s.trim().to_ascii_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("smart_game_picker_scroll")
+                        .max_height(260.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let mut shown = 0usize;
+                            for g in list {
+                                if !query.is_empty()
+                                    && !g.display_name.to_ascii_lowercase().contains(&query)
+                                    && !g.exe_name.contains(&query)
+                                {
+                                    continue;
+                                }
+                                shown += 1;
+                                let already = existing.iter().any(|e| e == &g.exe_name);
+                                egui::Frame::NONE
+                                    .fill(p.surface_alt)
+                                    .stroke(Stroke::new(1.0_f32, p.border))
+                                    .corner_radius(CornerRadius::same(6))
+                                    .inner_margin(Margin::symmetric(10, 6))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.label(
+                                                    RichText::new(&g.display_name)
+                                                        .strong()
+                                                        .size(12.5)
+                                                        .color(p.text),
+                                                );
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{} · {}",
+                                                        g.exe_name,
+                                                        g.source.label()
+                                                    ))
+                                                    .size(11.0)
+                                                    .monospace()
+                                                    .color(p.text_muted),
+                                                );
+                                            });
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if already {
+                                                        ui.label(
+                                                            RichText::new("ADDED")
+                                                                .size(10.5)
+                                                                .strong()
+                                                                .color(p.ok),
+                                                        );
+                                                    } else if ui
+                                                        .add(primary_btn("+ Add", p))
+                                                        .clicked()
+                                                    {
+                                                        added_exe = Some((
+                                                            g.display_name.clone(),
+                                                            g.exe_name.clone(),
+                                                        ));
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                                ui.add_space(4.0);
+                            }
+                            if shown == 0 {
+                                ui.label(
+                                    RichText::new(
+                                        "No matching applications found. You can also type any .exe manually.",
+                                    )
+                                    .size(12.0)
+                                    .color(p.text_muted),
+                                );
+                            }
+                        });
+
+                    ui.add_space(10.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(secondary_btn("Done", p)).clicked() {
+                            close_picker = true;
+                        }
+                    });
+                });
+
+            if refresh_picker {
+                self.discovered_installed = discover_installed_games();
+                self.discovered_running = discover_running_apps();
+            }
+            if let Some((title, exe)) = added_exe {
+                let mut cur: Vec<String> = self
+                    .editor
+                    .executables_csv
+                    .split([',', ';', '\n'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("game.exe"))
+                    .map(str::to_string)
+                    .collect();
+                if !cur.iter().any(|e| e.eq_ignore_ascii_case(&exe)) {
+                    cur.push(exe.clone());
+                }
+                self.editor.executables_csv = cur.join(", ");
+                if self.editor.name.starts_with("Game Profile") {
+                    self.editor.name = title.clone();
+                }
+                self.notice = Some((
+                    Severity::Ok,
+                    format!("Added '{exe}' ({title}) to profile draft — click Save to persist."),
+                ));
+            }
+            if close_picker {
+                self.game_picker_open = false;
+            }
+        }
+
         // --- UNVERIFIED HARDWARE FIRST-WRITE WARNING MODAL ---
         let mut confirm_unverified = false;
         let mut cancel_unverified = false;
@@ -711,16 +923,18 @@ impl ProfilesUiState {
             };
 
             let auto_on = snap.is_some_and(|s| s.auto_switch_enabled);
+            let locked = snap.is_some_and(|s| s.profile_locked);
             let mut debounce_ms = self.store.debounce_ms;
             let mut debounce_committed = false;
             let mut toggle_auto_clicked = false;
+            let mut toggle_lock_clicked = false;
 
             if split_controls {
                 ui.horizontal(|ui| {
                     render_device_picker(ui);
                 });
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let toggle_label = if auto_on {
                         "Auto-Switch: ON"
                     } else {
@@ -733,6 +947,21 @@ impl ProfilesUiState {
                     };
                     if ui.add(btn).clicked() {
                         toggle_auto_clicked = true;
+                    }
+                    let lock_label = if locked { "Locked" } else { "Lock Profile" };
+                    let lock_btn = if locked {
+                        primary_btn(lock_label, p)
+                    } else {
+                        secondary_btn(lock_label, p)
+                    };
+                    if ui
+                        .add(lock_btn)
+                        .on_hover_text(
+                            "Hold the current active profile and pause automatic focus switches",
+                        )
+                        .clicked()
+                    {
+                        toggle_lock_clicked = true;
                     }
                     ui.label(RichText::new("Debounce:").color(p.text_muted).size(12.0));
                     let resp = ui.add(
@@ -762,6 +991,21 @@ impl ProfilesUiState {
                     if ui.add(btn).clicked() {
                         toggle_auto_clicked = true;
                     }
+                    let lock_label = if locked { "Locked" } else { "Lock" };
+                    let lock_btn = if locked {
+                        primary_btn(lock_label, p)
+                    } else {
+                        secondary_btn(lock_label, p)
+                    };
+                    if ui
+                        .add(lock_btn)
+                        .on_hover_text(
+                            "Hold the current active profile and pause automatic focus switches",
+                        )
+                        .clicked()
+                    {
+                        toggle_lock_clicked = true;
+                    }
                     ui.label(RichText::new("Debounce:").color(p.text_muted).size(12.0));
                     let resp = ui.add(
                         egui::DragValue::new(&mut debounce_ms)
@@ -773,6 +1017,10 @@ impl ProfilesUiState {
                         debounce_committed = true;
                     }
                 });
+            }
+
+            if toggle_lock_clicked {
+                runtime.send(ProfileRuntimeCmd::SetProfileLock(!locked));
             }
 
             if toggle_auto_clicked {
@@ -804,7 +1052,14 @@ impl ProfilesUiState {
                     "FOREGROUND".to_string(),
                     s.foreground_exe.as_deref().unwrap_or("(none)").to_string(),
                 ));
-                pills.push(("ACTIVE PROFILE".to_string(), s.active_profile_name.clone()));
+                pills.push((
+                    "ACTIVE PROFILE".to_string(),
+                    if s.profile_locked {
+                        format!("{} [LOCKED]", s.active_profile_name)
+                    } else {
+                        s.active_profile_name.clone()
+                    },
+                ));
                 let multi_dev = s.active_devices.len() > 1;
                 for dev in &s.active_devices {
                     let summary = dev
@@ -921,12 +1176,14 @@ impl ProfilesUiState {
                             executables: vec!["game.exe".to_string()],
                             mouse: MouseSettings {
                                 dpi: Some(800),
+                                dpi_y: None,
                                 polling_rate_hz: Some(4000),
                                 lod: Some(LiftOffDistance::Mm10),
                                 debounce_ms: Some(1),
                                 motion_sync: None,
                                 angle_snapping: None,
                                 ripple_control: None,
+                                sleep_timeout_secs: None,
                             },
                             device_overrides: BTreeMap::new(),
                             windows_pointer_speed: None,
@@ -1151,9 +1408,22 @@ impl ProfilesUiState {
             let supports_ripple_control = active_target_caps
                 .as_ref()
                 .is_none_or(|c| c.supports_ripple_control);
+            let supports_xy_dpi = active_target_caps
+                .as_ref()
+                .is_none_or(|c| c.supports_xy_dpi);
+            let supports_sleep = active_target_caps
+                .as_ref()
+                .is_none_or(|c| c.supports_sleep_timeout);
+            let sleep_min = active_target_caps
+                .as_ref()
+                .map_or(10, |c| c.sleep_timeout_min_secs);
+            let sleep_max = active_target_caps
+                .as_ref()
+                .map_or(1800, |c| c.sleep_timeout_max_secs);
 
             let mut next_target: Option<(Option<String>, Option<DeviceCapabilities>)> = None;
             let mut remove_override = false;
+            let mut open_game_picker = false;
 
             egui::ScrollArea::vertical()
                 .id_salt("profile_editor_scroll")
@@ -1182,11 +1452,22 @@ impl ProfilesUiState {
 
                             if !self.editor.is_desktop_default {
                                 ui.label(RichText::new("Executables").color(p.text_muted));
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.editor.executables_csv)
-                                        .desired_width(field_w)
-                                        .hint_text("cs2.exe, valorant-win64-shipping.exe"),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.editor.executables_csv)
+                                            .desired_width((field_w - 94.0).max(110.0))
+                                            .hint_text("cs2.exe, valorant-win64-shipping.exe"),
+                                    );
+                                    if ui
+                                        .add(secondary_btn("Pick Game...", p))
+                                        .on_hover_text(
+                                            "Browse installed Steam / Riot / Epic games or running apps",
+                                        )
+                                        .clicked()
+                                    {
+                                        open_game_picker = true;
+                                    }
+                                });
                                 ui.end_row();
                             }
 
@@ -1281,6 +1562,18 @@ impl ProfilesUiState {
                                     .suffix(" DPI"),
                             );
                             ui.end_row();
+
+                            if supports_xy_dpi {
+                                ui.checkbox(&mut self.editor.set_dpi_y, "Separate Y DPI");
+                                ui.add_enabled(
+                                    self.editor.set_dpi_y,
+                                    egui::DragValue::new(&mut self.editor.dpi_y)
+                                        .range(dpi_min..=dpi_max)
+                                        .speed(f64::from(dpi_step))
+                                        .suffix(" DPI (vertical)"),
+                                );
+                                ui.end_row();
+                            }
 
                             ui.checkbox(&mut self.editor.set_polling, "Polling Rate");
                             ui.add_enabled_ui(self.editor.set_polling, |ui| {
@@ -1377,6 +1670,48 @@ impl ProfilesUiState {
                             );
                             ui.end_row();
 
+                            if !supports_sleep {
+                                ui.label(RichText::new("Idle Sleep").color(p.text_muted));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new("Not configurable on this mouse")
+                                            .size(12.0)
+                                            .color(p.text_muted),
+                                    )
+                                    .wrap(),
+                                );
+                            } else {
+                                ui.checkbox(&mut self.editor.set_sleep, "Idle Sleep");
+                                ui.add_enabled_ui(self.editor.set_sleep, |ui| {
+                                    const SLEEP_PRESETS: &[(u16, &str)] = &[
+                                        (10, "10 s"),
+                                        (30, "30 s"),
+                                        (60, "1 min"),
+                                        (120, "2 min"),
+                                        (180, "3 min"),
+                                        (300, "5 min"),
+                                        (600, "10 min"),
+                                        (900, "15 min"),
+                                        (1800, "30 min"),
+                                    ];
+                                    let current_lbl = format_sleep_secs(self.editor.sleep_timeout_secs);
+                                    egui::ComboBox::from_id_salt("sleep_timeout_combo")
+                                        .selected_text(current_lbl)
+                                        .show_ui(ui, |ui| {
+                                            for &(secs, lbl) in SLEEP_PRESETS {
+                                                if secs >= sleep_min && secs <= sleep_max {
+                                                    ui.selectable_value(
+                                                        &mut self.editor.sleep_timeout_secs,
+                                                        secs,
+                                                        lbl,
+                                                    );
+                                                }
+                                            }
+                                        });
+                                });
+                            }
+                            ui.end_row();
+
                             ui.checkbox(&mut self.editor.set_win_speed, "Windows Speed");
                             ui.add_enabled(
                                 self.editor.set_win_speed,
@@ -1412,6 +1747,14 @@ impl ProfilesUiState {
                         });
                 });
 
+            if open_game_picker {
+                self.game_picker_open = true;
+                self.game_picker_search.clear();
+                self.discovered_running = discover_running_apps();
+                if self.discovered_installed.is_empty() {
+                    self.discovered_installed = discover_installed_games();
+                }
+            }
             if remove_override {
                 self.editor.remove_current_override();
             } else if let Some((target_id, caps)) = next_target {
@@ -1551,6 +1894,14 @@ fn primary_btn(label: &str, p: Palette) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).color(p.btn_primary_fg).strong())
         .fill(p.btn_primary_bg)
         .corner_radius(CornerRadius::same(6))
+}
+
+fn format_sleep_secs(secs: u16) -> String {
+    if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
 }
 
 fn secondary_btn(label: &str, p: Palette) -> egui::Button<'_> {

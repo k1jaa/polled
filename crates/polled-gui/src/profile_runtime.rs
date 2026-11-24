@@ -55,6 +55,7 @@ pub struct ConnectedDeviceStatus {
 #[derive(Debug, Clone)]
 pub struct ProfileRuntimeSnapshot {
     pub auto_switch_enabled: bool,
+    pub profile_locked: bool,
     pub selection: BackendSelection,
     pub detected_hardware: Vec<DeviceInfo>,
     pub active_devices: Vec<ConnectedDeviceStatus>,
@@ -64,12 +65,15 @@ pub struct ProfileRuntimeSnapshot {
     pub pending_exe: Option<String>,
     pub active_profile_id: String,
     pub active_profile_name: String,
+    pub available_profiles: Vec<(String, String)>,
     pub total_flash_writes_session: u64,
     pub log: Vec<ProfileLogEntry>,
 }
 
 pub enum ProfileRuntimeCmd {
     SetAutoSwitch(bool),
+    SetProfileLock(bool),
+    CycleNextProfile,
     UpdateStore(ProfileStore),
     SelectBackend(BackendSelection),
     RedetectHardware,
@@ -163,6 +167,7 @@ impl ManagedController {
 struct RuntimeState {
     store: ProfileStore,
     auto_switch_enabled: bool,
+    profile_locked: bool,
     selection: BackendSelection,
     detected_hardware_info: Vec<DeviceInfo>,
     controllers: Vec<ManagedController>,
@@ -223,8 +228,16 @@ impl RuntimeState {
             .map(|m| m.controller.flash_writes_this_session())
             .sum();
 
+        let available_profiles: Vec<(String, String)> = self
+            .store
+            .profiles
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect();
+
         ProfileRuntimeSnapshot {
             auto_switch_enabled: self.auto_switch_enabled,
+            profile_locked: self.profile_locked,
             selection: self.selection.clone(),
             detected_hardware: self.detected_hardware_info.clone(),
             active_devices,
@@ -234,6 +247,7 @@ impl RuntimeState {
             pending_exe,
             active_profile_id: self.active_profile_id.clone(),
             active_profile_name: self.active_profile_name.clone(),
+            available_profiles,
             total_flash_writes_session,
             log: self.log.clone(),
         }
@@ -582,6 +596,7 @@ fn run_runtime_loop(
     let mut state = RuntimeState {
         store: initial_store,
         auto_switch_enabled: initial_auto_switch,
+        profile_locked: false,
         selection: BackendSelection::AutoConnected,
         detected_hardware_info: Vec::new(),
         controllers: Vec::new(),
@@ -620,7 +635,7 @@ fn run_runtime_loop(
             }
         }
 
-        if state.auto_switch_enabled {
+        if state.auto_switch_enabled && !state.profile_locked {
             let now = Instant::now();
             if let Some(committed_exe) = state.debouncer.poll_ready(now) {
                 let matched = match_profile(&state.store, committed_exe.as_deref()).cloned();
@@ -704,6 +719,39 @@ fn run_runtime_loop(
                     state.push_log(Severity::Info, "Paused automatic per-game switching.");
                 }
                 state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::SetProfileLock(locked)) => {
+                state.profile_locked = locked;
+                state.pending_retry = None;
+                if locked {
+                    state.push_log(
+                        Severity::Info,
+                        format!(
+                            "Locked active profile '{}' (auto-switch paused until unlocked).",
+                            state.active_profile_name
+                        ),
+                    );
+                } else {
+                    state.push_log(
+                        Severity::Info,
+                        "Unlocked active profile (auto-switch resumed).".to_string(),
+                    );
+                }
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::CycleNextProfile) => {
+                if !state.store.profiles.is_empty() {
+                    let cur_idx = state
+                        .store
+                        .profiles
+                        .iter()
+                        .position(|p| p.id == state.active_profile_id)
+                        .unwrap_or(0);
+                    let next_idx = (cur_idx + 1) % state.store.profiles.len();
+                    let next_profile = state.store.profiles[next_idx].clone();
+                    state.apply_profile(&next_profile, "hotkey cycle");
+                    state.emit(&ui_tx, &ctx);
+                }
             }
             Ok(ProfileRuntimeCmd::UpdateStore(new_store)) => {
                 state

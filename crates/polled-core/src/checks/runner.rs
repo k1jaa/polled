@@ -438,10 +438,10 @@ mod tests {
         .unwrap();
 
         let engine = HealthEngine::with_default_checks();
-        assert_eq!(engine.checks().len(), 25);
+        assert_eq!(engine.checks().len(), 26);
 
         let initial = engine.scan_all(&env, &paths, true).unwrap();
-        assert_eq!(initial.checks.len(), 25);
+        assert_eq!(initial.checks.len(), 26);
 
         // `fix_all_safe` fixes safe core issues (pointer_speed, game_bar_capture, windowed_optimizations)
         // and intentionally skips optional tweaks (mmcss_gaming, win32_priority_separation, etc.).
@@ -488,7 +488,7 @@ mod tests {
         store.save_atomic(&paths.custom_tweaks_path()).unwrap();
 
         let engine = HealthEngine::with_default_and_custom_checks(&paths);
-        assert_eq!(engine.checks().len(), 26);
+        assert_eq!(engine.checks().len(), 27);
 
         let fixed = engine.fix_check("custom_hover_fast", &env, &paths).unwrap();
         assert_eq!(fixed.severity, Severity::Ok);

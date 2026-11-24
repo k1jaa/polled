@@ -12,13 +12,14 @@ use polled_core::win::{RegHive, WindowsEnv};
 use polled_core::{
     curated_custom_tweak_presets, is_autostart_enabled, set_autostart_enabled, AppPaths,
     AppSettings, CheckReport, CustomTweakDef, CustomTweakStore, CustomValueKind, HealthEngine,
-    PolledError, ScanSummary, Severity, ThemePreference,
+    HotkeyBinding, PolledError, ScanSummary, Severity, ThemePreference,
 };
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
+use crate::hotkeys::{HotkeyAction, HotkeyManager};
 use crate::input_lab_ui::InputLabUiState;
 use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
-use crate::profile_runtime::{ProfileRuntimeHandle, ProfileRuntimeSnapshot};
+use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::profiles_ui::ProfilesUiState;
 use crate::single_instance::SingleInstanceGuard;
 use crate::theme::{Palette, ThemeMode};
@@ -218,6 +219,7 @@ fn build_non_elevated_confirm_warning(check: &CheckReport) -> String {
 /// Messages sent from background worker/tray threads back to the `egui` UI thread.
 pub(crate) enum WorkerMsg {
     TraySyncAutoSwitch(bool),
+    HotkeyTriggered(HotkeyAction),
     ScanFinished {
         result: Result<ScanSummary, String>,
         notify_regressions: bool,
@@ -246,16 +248,19 @@ pub struct PolledApp {
     pending_elevation: Option<PendingElevation>,
     pending_confirm: Option<PendingConfirm>,
     show_latency_tips: bool,
+    hotkeys_modal_open: bool,
     custom_tweak_draft: CustomTweakDraft,
 
     profiles_ui: ProfilesUiState,
     profile_runtime: ProfileRuntimeHandle,
     input_lab_ui: InputLabUiState,
+    hotkey_manager: HotkeyManager,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
     main_hwnd: Arc<AtomicIsize>,
     auto_switch_state: Arc<AtomicBool>,
+    profile_locked_state: Arc<AtomicBool>,
     quit_requested: Arc<AtomicBool>,
     _instance_guard: SingleInstanceGuard,
     tray: TrayController,
@@ -273,6 +278,7 @@ impl PolledApp {
         let (tx, rx) = mpsc::channel();
         let main_hwnd = Arc::new(AtomicIsize::new(find_own_main_hwnd()));
         let auto_switch_state = Arc::new(AtomicBool::new(settings.auto_switch_on_startup));
+        let profile_locked_state = Arc::new(AtomicBool::new(false));
         let quit_requested = Arc::new(AtomicBool::new(false));
 
         let profiles_ui = ProfilesUiState::load();
@@ -282,6 +288,8 @@ impl PolledApp {
             tx.clone(),
             cc.egui_ctx.clone(),
         );
+        let hotkey_manager =
+            HotkeyManager::start(settings.hotkeys.clone(), tx.clone(), cc.egui_ctx.clone());
 
         instance_guard.start_show_listener(
             Arc::clone(&main_hwnd),
@@ -294,6 +302,7 @@ impl PolledApp {
             profile_runtime.command_sender(),
             Arc::clone(&main_hwnd),
             Arc::clone(&auto_switch_state),
+            Arc::clone(&profile_locked_state),
             Arc::clone(&quit_requested),
         );
         spawn_windows_build_watcher(tx.clone(), cc.egui_ctx.clone());
@@ -315,14 +324,17 @@ impl PolledApp {
             pending_elevation: None,
             pending_confirm: None,
             show_latency_tips: false,
+            hotkeys_modal_open: false,
             custom_tweak_draft: CustomTweakDraft::default(),
             profiles_ui,
             profile_runtime,
             input_lab_ui: InputLabUiState::new(),
+            hotkey_manager,
             tx,
             rx,
             main_hwnd,
             auto_switch_state,
+            profile_locked_state,
             quit_requested,
             _instance_guard: instance_guard,
             tray,
@@ -652,12 +664,30 @@ impl PolledApp {
     }
 
     fn drain_worker_messages(&mut self, ctx: &egui::Context) {
-        let _ = ctx;
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 WorkerMsg::TraySyncAutoSwitch(enabled) => {
                     self.settings.auto_switch_on_startup = enabled;
                 }
+                WorkerMsg::HotkeyTriggered(action) => match action {
+                    HotkeyAction::CycleProfile => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::CycleNextProfile);
+                    }
+                    HotkeyAction::ToggleProfileLock => {
+                        let next = !self.profile_locked_state.load(Ordering::SeqCst);
+                        self.profile_locked_state.store(next, Ordering::SeqCst);
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::SetProfileLock(next));
+                    }
+                    HotkeyAction::ToggleInputLab => {
+                        if self.input_lab_ui.is_capturing() {
+                            self.input_lab_ui.stop_capture();
+                        } else {
+                            self.input_lab_ui.start_capture(ctx);
+                        }
+                    }
+                },
                 WorkerMsg::ScanFinished {
                     result,
                     notify_regressions,
@@ -694,6 +724,8 @@ impl PolledApp {
                 WorkerMsg::ProfileRuntimeUpdated(snap) => {
                     self.auto_switch_state
                         .store(snap.auto_switch_enabled, Ordering::SeqCst);
+                    self.profile_locked_state
+                        .store(snap.profile_locked, Ordering::SeqCst);
                     let battery_parts: Vec<String> = snap
                         .active_devices
                         .iter()
@@ -709,7 +741,10 @@ impl PolledApp {
                     };
                     self.tray.update_status(
                         snap.auto_switch_enabled,
+                        snap.profile_locked,
+                        &snap.active_profile_id,
                         &snap.active_profile_name,
+                        &snap.available_profiles,
                         battery_summary.as_deref(),
                     );
                     if self.settings.auto_switch_on_startup != snap.auto_switch_enabled {
@@ -832,6 +867,21 @@ impl eframe::App for PolledApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(secondary_button(self.theme.label(), p)).clicked() {
                             toggle_theme = true;
+                        }
+
+                        let hk_btn = if self.settings.hotkeys.enabled {
+                            primary_button("Hotkeys: ON", p)
+                        } else {
+                            secondary_button("Hotkeys", p)
+                        };
+                        if ui
+                            .add(hk_btn)
+                            .on_hover_text(
+                                "Configure optional global hotkeys (Win32 RegisterHotKey, zero hooks)",
+                            )
+                            .clicked()
+                        {
+                            self.hotkeys_modal_open = true;
                         }
 
                         let startup_btn = if self.autostart_enabled {
@@ -1768,6 +1818,102 @@ impl eframe::App for PolledApp {
             }
         }
 
+        // --- GLOBAL HOTKEYS MODAL ---
+        if self.hotkeys_modal_open {
+            let mut close_hk = false;
+            let mut save_hk = false;
+            let modal_w = (ctx.screen_rect().width() - 48.0).clamp(360.0, 500.0);
+            egui::Window::new("Global Hotkeys (Win32 RegisterHotKey)")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .default_width(modal_w)
+                .max_width(modal_w)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.5_f32, p.text))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(16)),
+                )
+                .show(ctx, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Uses official Windows RegisterHotKey (zero keyboard hooks, anti-cheat safe). Off by default.",
+                            )
+                            .size(12.0)
+                            .color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(8.0);
+                    ui.checkbox(
+                        &mut self.settings.hotkeys.enabled,
+                        "Enable Global Hotkeys",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.add_enabled_ui(self.settings.hotkeys.enabled, |ui| {
+                        egui::Grid::new("global_hotkeys_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                render_hotkey_binding_row(
+                                    ui,
+                                    "Cycle Next Profile",
+                                    "hk_cycle",
+                                    &mut self.settings.hotkeys.cycle_profile,
+                                    "P",
+                                );
+                                ui.end_row();
+                                render_hotkey_binding_row(
+                                    ui,
+                                    "Lock / Unlock Profile",
+                                    "hk_lock",
+                                    &mut self.settings.hotkeys.toggle_lock,
+                                    "L",
+                                );
+                                ui.end_row();
+                                render_hotkey_binding_row(
+                                    ui,
+                                    "Start / Stop Input Lab",
+                                    "hk_lab",
+                                    &mut self.settings.hotkeys.toggle_input_lab,
+                                    "I",
+                                );
+                                ui.end_row();
+                            });
+                    });
+
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(primary_button("Save & Apply", p)).clicked() {
+                            save_hk = true;
+                        }
+                        if ui.add(secondary_button("Close", p)).clicked() {
+                            close_hk = true;
+                        }
+                    });
+                });
+
+            if save_hk {
+                let _ = self
+                    .settings
+                    .save_atomic(&AppPaths::default_user_dir().settings_path());
+                self.hotkey_manager
+                    .update_config(self.settings.hotkeys.clone());
+                self.status_message = Some(if self.settings.hotkeys.enabled {
+                    "Saved & registered global hotkeys.".to_string()
+                } else {
+                    "Disabled global hotkeys.".to_string()
+                });
+                self.hotkeys_modal_open = false;
+            } else if close_hk {
+                self.hotkeys_modal_open = false;
+            }
+        }
+
         if cancel_risky {
             self.pending_confirm = None;
         } else if confirm_risky {
@@ -1842,6 +1988,40 @@ impl eframe::App for PolledApp {
                 self.start_undo_check(ctx, check, false);
             }
         }
+    }
+}
+
+fn render_hotkey_binding_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    salt: &str,
+    slot: &mut Option<HotkeyBinding>,
+    default_key: &str,
+) {
+    let mut active = slot.is_some();
+    if ui.checkbox(&mut active, label).changed() {
+        if active {
+            *slot = Some(HotkeyBinding::new(true, true, false, default_key));
+        } else {
+            *slot = None;
+        }
+    }
+    if let Some(binding) = slot.as_mut() {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut binding.ctrl, "Ctrl");
+            ui.checkbox(&mut binding.alt, "Alt");
+            ui.checkbox(&mut binding.shift, "Shift");
+            egui::ComboBox::from_id_salt(salt)
+                .selected_text(&binding.key)
+                .width(56.0)
+                .show_ui(ui, |ui| {
+                    for &k in HotkeyBinding::PRESET_KEYS {
+                        ui.selectable_value(&mut binding.key, k.to_string(), k);
+                    }
+                });
+        });
+    } else {
+        ui.label(RichText::new("Disabled").size(11.5).weak());
     }
 }
 

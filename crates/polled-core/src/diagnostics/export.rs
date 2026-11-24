@@ -9,7 +9,9 @@
 use chrono::Local;
 
 use crate::checks::Severity;
-use crate::diagnostics::{DiagnosticsSnapshot, TimerJitterBenchmark, BOUNCE_THRESHOLD_MS};
+use crate::diagnostics::{
+    DiagnosticsSnapshot, PinnedBenchmark, TimerJitterBenchmark, BOUNCE_THRESHOLD_MS,
+};
 
 const IMG_W: usize = 960;
 const IMG_H: usize = 560;
@@ -318,6 +320,231 @@ pub fn render_report_png(
         &LIGHT_PALETTE
     };
     encode_indexed_4bit_png(&canvas.pixels, IMG_W, IMG_H, palette)
+}
+
+/// Renders a 960×560 monochrome Before (A) vs After (B) Input Lab comparison card PNG.
+pub fn render_ab_comparison_png(
+    baseline: &PinnedBenchmark,
+    current: &DiagnosticsSnapshot,
+    current_label: &str,
+    current_dpi: u32,
+    dark_mode: bool,
+) -> Vec<u8> {
+    let mut canvas = Canvas::new(IMG_W, IMG_H, C_BG);
+    canvas.stroke_rect(0, 0, IMG_W, IMG_H, C_BORDER);
+
+    // Header
+    canvas.draw_text_scaled(24, 18, "POLLED INPUT LAB · A/B DIFF", C_TEXT, 2);
+    let sub = format!(
+        "v{} · BEFORE (A) VS AFTER (B) BENCHMARK COMPARISON",
+        env!("CARGO_PKG_VERSION")
+    );
+    canvas.draw_text(24, 38, &sub, C_MUTED);
+    let ts = Local::now().format("%Y-%m-%d %H:%M").to_string();
+    canvas.draw_text(IMG_W - 24 - text_width(&ts, 1), 26, &ts, C_MUTED);
+    canvas.hline(24, IMG_W - 24, 54, C_BORDER);
+
+    // Comparison table panel (y: 66..318)
+    let tx = 24usize;
+    let ty = 66usize;
+    let tw = IMG_W - 48;
+    let th = 252usize;
+    canvas.fill_rect(tx, ty, tw, th, C_SURFACE);
+    canvas.stroke_rect(tx, ty, tw, th, C_BORDER);
+
+    let col_m = tx + 16;
+    let col_a = tx + 240;
+    let col_b = tx + 480;
+    let col_d = tx + 720;
+
+    canvas.fill_rect(tx + 1, ty + 1, tw - 2, 26, C_SURFACE_ALT);
+    canvas.hline(tx, tx + tw, ty + 27, C_BORDER);
+    canvas.draw_text(col_m, ty + 10, "METRIC", C_MUTED);
+    canvas.draw_text_clipped(
+        col_a,
+        ty + 10,
+        &format!("A: {}", baseline.label),
+        C_INFO,
+        224,
+    );
+    canvas.draw_text_clipped(col_b, ty + 10, &format!("B: {current_label}"), C_TEXT, 224);
+    canvas.draw_text(col_d, ty + 10, "DELTA (B - A)", C_MUTED);
+
+    let pa = &baseline.snapshot.polling;
+    let pb = &current.polling;
+    let ta = &baseline.snapshot.tracking;
+    let tb = &current.tracking;
+    let dpi_a = f64::from(baseline.configured_dpi.max(1));
+    let dpi_b = f64::from(current_dpi.max(1));
+
+    let sat_a = if pa.saturated_intervals > 0 {
+        pa.saturated_within_15_pct
+    } else {
+        pa.within_15_pct
+    };
+    let sat_b = if pb.saturated_intervals > 0 {
+        pb.saturated_within_15_pct
+    } else {
+        pb.within_15_pct
+    };
+
+    let delta_color = |diff: f64, higher_is_better: bool, eps: f64| -> u8 {
+        if diff.abs() <= eps {
+            C_MUTED
+        } else if (diff > 0.0) == higher_is_better {
+            C_OK
+        } else {
+            C_BAD
+        }
+    };
+
+    let rows: Vec<(&str, String, String, String, u8)> = vec![
+        (
+            "TARGET POLLING",
+            format!("{} Hz", pa.nominal_hz),
+            format!("{} Hz", pb.nominal_hz),
+            format!("{:+} Hz", pb.nominal_hz as i64 - pa.nominal_hz as i64),
+            C_MUTED,
+        ),
+        (
+            "EFFECTIVE RATE",
+            format!("{:.0} Hz", pa.effective_hz),
+            format!("{:.0} Hz", pb.effective_hz),
+            format!("{:+.0} Hz", pb.effective_hz - pa.effective_hz),
+            delta_color(pb.effective_hz - pa.effective_hz, true, 15.0),
+        ),
+        (
+            "SATURATED +/-15%",
+            format!("{:.1}%", sat_a),
+            format!("{:.1}%", sat_b),
+            format!("{:+.1}%", sat_b - sat_a),
+            delta_color(sat_b - sat_a, true, 0.5),
+        ),
+        (
+            "MEDIAN INTERVAL",
+            format!("{:.3} ms", pa.median_us / 1000.0),
+            format!("{:.3} ms", pb.median_us / 1000.0),
+            format!("{:+.3} ms", (pb.median_us - pa.median_us) / 1000.0),
+            delta_color(pb.median_us - pa.median_us, false, 5.0),
+        ),
+        (
+            "P99 INTERVAL",
+            format!("{:.3} ms", pa.p99_us / 1000.0),
+            format!("{:.3} ms", pb.p99_us / 1000.0),
+            format!("{:+.3} ms", (pb.p99_us - pa.p99_us) / 1000.0),
+            delta_color(pb.p99_us - pa.p99_us, false, 15.0),
+        ),
+        (
+            "JITTER SIGMA",
+            format!("{:.3} ms", pa.std_dev_us / 1000.0),
+            format!("{:.3} ms", pb.std_dev_us / 1000.0),
+            format!("{:+.3} ms", (pb.std_dev_us - pa.std_dev_us) / 1000.0),
+            delta_color(pb.std_dev_us - pa.std_dev_us, false, 8.0),
+        ),
+        (
+            "TRUE DROPOUTS",
+            pa.true_dropout_count.to_string(),
+            pb.true_dropout_count.to_string(),
+            format!(
+                "{:+}",
+                pb.true_dropout_count as i64 - pa.true_dropout_count as i64
+            ),
+            delta_color(
+                pb.true_dropout_count as f64 - pa.true_dropout_count as f64,
+                false,
+                0.0,
+            ),
+        ),
+        (
+            "BUNCHED BURSTS",
+            pa.bunch_count.to_string(),
+            pb.bunch_count.to_string(),
+            format!("{:+}", pb.bunch_count as i64 - pa.bunch_count as i64),
+            delta_color(pb.bunch_count as f64 - pa.bunch_count as f64, false, 0.0),
+        ),
+        (
+            "PEAK TRACKING",
+            format!(
+                "{:.1} IPS / {:.1} G",
+                ta.peak_ips(dpi_a),
+                ta.peak_accel_g(dpi_a)
+            ),
+            format!(
+                "{:.1} IPS / {:.1} G",
+                tb.peak_ips(dpi_b),
+                tb.peak_accel_g(dpi_b)
+            ),
+            format!("{:+.1} IPS", tb.peak_ips(dpi_b) - ta.peak_ips(dpi_a)),
+            C_MUTED,
+        ),
+    ];
+
+    for (idx, (metric, va, vb, vd, dcol)) in rows.iter().enumerate() {
+        let ry = ty + 36 + idx * 23;
+        if idx > 0 {
+            canvas.hline(tx + 10, tx + tw - 10, ry - 6, C_GRID);
+        }
+        canvas.draw_text(col_m, ry, metric, C_MUTED);
+        canvas.draw_text(col_a, ry, va, C_TEXT);
+        canvas.draw_text(col_b, ry, vb, C_TEXT);
+        canvas.draw_text(col_d, ry, vd, *dcol);
+    }
+
+    // Side-by-side Histograms (y: 330..514)
+    draw_labeled_histogram_panel(
+        &mut canvas,
+        24,
+        330,
+        450,
+        184,
+        &format!("HISTOGRAM A: {}", baseline.label),
+        &baseline.snapshot,
+    );
+    draw_labeled_histogram_panel(
+        &mut canvas,
+        486,
+        330,
+        450,
+        184,
+        &format!("HISTOGRAM B: {current_label}"),
+        current,
+    );
+
+    canvas.hline(24, IMG_W - 24, 524, C_BORDER);
+    canvas.draw_text(
+        24,
+        535,
+        "POLLED · OPEN-SOURCE WINDOWS INPUT DIAGNOSTICS (AGPL-3.0)",
+        C_DIM,
+    );
+    let right_foot = "github.com/k1jaa/polled";
+    canvas.draw_text(
+        IMG_W - 24 - text_width(right_foot, 1),
+        535,
+        right_foot,
+        C_DIM,
+    );
+
+    let palette = if dark_mode {
+        &DARK_PALETTE
+    } else {
+        &LIGHT_PALETTE
+    };
+    encode_indexed_4bit_png(&canvas.pixels, IMG_W, IMG_H, palette)
+}
+
+fn draw_labeled_histogram_panel(
+    c: &mut Canvas,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    title: &str,
+    snap: &DiagnosticsSnapshot,
+) {
+    draw_histogram_panel(c, x, y, w, h, snap);
+    c.fill_rect(x + 10, y + 8, w - 20, 12, C_SURFACE);
+    c.draw_text_clipped(x + 12, y + 10, title, C_TEXT, w - 24);
 }
 
 fn draw_intervals_panel(
@@ -1098,6 +1325,7 @@ mod tests {
             tracking: analyzer.tracking_snapshot(Some(t_ns)),
             dpi_measurement: Default::default(),
             clicks: Default::default(),
+            keyboard: Default::default(),
             error: None,
         }
     }
@@ -1155,5 +1383,20 @@ mod tests {
         }
         assert_eq!(offset, bytes.len());
         assert_eq!(seen, vec!["IHDR", "PLTE", "IDAT", "IEND"]);
+    }
+
+    #[test]
+    fn ab_comparison_png_renders_valid_960x560_png() {
+        let snap_a = sample_snapshot();
+        let snap_b = sample_snapshot();
+        let base = PinnedBenchmark {
+            label: "Front USB 4K".to_string(),
+            configured_dpi: 1600,
+            snapshot: snap_a,
+            timer: None,
+        };
+        let bytes = render_ab_comparison_png(&base, &snap_b, "Rear CPU USB 4K", 1600, false);
+        assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+        assert!(bytes.len() > 1000);
     }
 }

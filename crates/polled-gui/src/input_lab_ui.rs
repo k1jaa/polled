@@ -15,11 +15,12 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Stroke, TextFormat,
     Vec2,
 };
+use polled_core::win::{SystemEnv, UsbMouseTopology, WindowsEnv};
 use polled_core::{
-    format_diagnostic_report, format_intervals_csv, render_report_png, run_timer_jitter_benchmark,
-    AppPaths, DiagnosticsSnapshot, PollingStats, PollingTarget, RawInputCaptureSession, Severity,
-    TimerJitterBenchmark, TrackingStats, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS,
-    STANDARD_RATES_HZ,
+    format_diagnostic_report, format_intervals_csv, render_ab_comparison_png, render_report_png,
+    run_timer_jitter_benchmark, AppPaths, DiagnosticsSnapshot, PinnedBenchmark, PollingStats,
+    PollingTarget, RawInputCaptureSession, Severity, TimerJitterBenchmark, TrackingStats,
+    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
@@ -71,6 +72,10 @@ pub struct InputLabUiState {
     timer_benchmark: Option<TimerJitterBenchmark>,
     timer_running: bool,
     timer_rx: Option<Receiver<Result<TimerJitterBenchmark, String>>>,
+    pinned_baseline: Option<PinnedBenchmark>,
+    baseline_label: String,
+    current_label: String,
+    usb_topology: Option<Vec<UsbMouseTopology>>,
     pub notice: Option<(Severity, String)>,
 }
 
@@ -96,6 +101,10 @@ impl InputLabUiState {
             timer_benchmark: None,
             timer_running: false,
             timer_rx: None,
+            pinned_baseline: None,
+            baseline_label: "Baseline (A)".to_string(),
+            current_label: "Current (B)".to_string(),
+            usb_topology: None,
             notice: None,
         }
     }
@@ -272,6 +281,11 @@ impl InputLabUiState {
                     semantic_banner(ui, p, mode, scroll_w, sev, &msg);
                 }
 
+                if self.pinned_baseline.is_some() {
+                    ui.add_space(10.0);
+                    self.render_ab_comparison_card(ui, p, mode, scroll_w);
+                }
+
                 ui.add_space(10.0);
 
                 // --- 2. POLLING CONSISTENCY, HISTOGRAM, VELOCITY & XY TRACE CARD ---
@@ -311,6 +325,38 @@ impl InputLabUiState {
                     });
                 }
 
+                ui.add_space(10.0);
+
+                // --- 5. KEYBOARD SCAN-RATE & USB PORT/HUB TOPOLOGY ---
+                if self.usb_topology.is_none() {
+                    self.usb_topology = Some(WindowsEnv.list_usb_topology().unwrap_or_default());
+                }
+                if scroll_w < 720.0 {
+                    self.render_keyboard_scan_card(ui, p, mode, scroll_w);
+                    ui.add_space(10.0);
+                    self.render_usb_topology_card(ui, p, mode, scroll_w);
+                } else {
+                    let gap = 10.0;
+                    let half_w = ((scroll_w - gap) * 0.5).max(260.0);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(half_w, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                self.render_keyboard_scan_card(ui, p, mode, half_w);
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(half_w, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                self.render_usb_topology_card(ui, p, mode, half_w);
+                            },
+                        );
+                    });
+                }
+
                 ui.add_space(4.0);
             });
     }
@@ -332,6 +378,10 @@ impl InputLabUiState {
         let mut do_save_png = false;
         let mut do_save_csv = false;
         let mut do_open_exports = false;
+        let mut do_pin_a = false;
+        let mut do_clear_a = false;
+        let mut do_save_ab_png = false;
+        let has_pinned = self.pinned_baseline.is_some();
         let mut next_target = self.target;
         let mut dpi_val = self.configured_dpi;
         let mut dpi_changed = false;
@@ -367,7 +417,10 @@ impl InputLabUiState {
                  do_copy: &mut bool,
                  do_save_png: &mut bool,
                  do_save_csv: &mut bool,
-                 do_open_exports: &mut bool| {
+                 do_open_exports: &mut bool,
+                 do_pin_a: &mut bool,
+                 do_clear_a: &mut bool,
+                 do_save_ab_png: &mut bool| {
                     ui.label(RichText::new("Target:").color(p.text_muted).size(12.0));
                     egui::ComboBox::from_id_salt("input_lab_target_hz")
                         .selected_text(next_target.label())
@@ -400,6 +453,28 @@ impl InputLabUiState {
                     });
                     if dpi_resp.changed() {
                         *dpi_changed = true;
+                    }
+
+                    if ui
+                        .add_enabled(has_data, secondary_btn("Pin Baseline (A)", p))
+                        .on_hover_text(
+                            "Save this run as Baseline (A), then capture again to compare Before vs After",
+                        )
+                        .clicked()
+                    {
+                        *do_pin_a = true;
+                    }
+                    if has_pinned {
+                        if ui.add(secondary_btn("Clear A", p)).clicked() {
+                            *do_clear_a = true;
+                        }
+                        if ui
+                            .add_enabled(has_data, secondary_btn("Save A/B PNG", p))
+                            .on_hover_text("Export a side-by-side Before (A) vs After (B) PNG card")
+                            .clicked()
+                        {
+                            *do_save_ab_png = true;
+                        }
                     }
 
                     if ui
@@ -460,6 +535,9 @@ impl InputLabUiState {
                         &mut do_save_png,
                         &mut do_save_csv,
                         &mut do_open_exports,
+                        &mut do_pin_a,
+                        &mut do_clear_a,
+                        &mut do_save_ab_png,
                     );
                 });
             } else {
@@ -475,6 +553,9 @@ impl InputLabUiState {
                         &mut do_save_png,
                         &mut do_save_csv,
                         &mut do_open_exports,
+                        &mut do_pin_a,
+                        &mut do_clear_a,
+                        &mut do_save_ab_png,
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (status_text, status_col) = if capturing {
@@ -627,6 +708,51 @@ impl InputLabUiState {
                 }
             }
         }
+        if do_pin_a {
+            self.pinned_baseline = Some(PinnedBenchmark {
+                label: self.baseline_label.clone(),
+                configured_dpi: self.configured_dpi,
+                snapshot: self.last_snapshot.clone(),
+                timer: self.timer_benchmark.clone(),
+            });
+            self.notice = Some((
+                Severity::Ok,
+                "Pinned current run as Baseline (A). Click Reset and capture again to compare Before vs After."
+                    .to_string(),
+            ));
+        }
+        if do_clear_a {
+            self.pinned_baseline = None;
+            self.notice = Some((Severity::Info, "Cleared pinned Baseline (A).".to_string()));
+        }
+        if do_save_ab_png {
+            if let Some(mut base) = self.pinned_baseline.clone() {
+                base.label = self.baseline_label.clone();
+                let dir = AppPaths::default_user_dir().exports_dir();
+                let png = render_ab_comparison_png(
+                    &base,
+                    &self.last_snapshot,
+                    &self.current_label,
+                    self.configured_dpi,
+                    matches!(mode, ThemeMode::Dark),
+                );
+                let filename =
+                    format!("polled_lab_ab_{}.png", Local::now().format("%Y%m%d_%H%M%S"));
+                let path = dir.join(filename);
+                match fs::create_dir_all(&dir).and_then(|()| fs::write(&path, &png)) {
+                    Ok(()) => {
+                        self.notice = Some((
+                            Severity::Ok,
+                            format!("Saved A/B comparison PNG to {}", path.display()),
+                        ));
+                    }
+                    Err(err) => {
+                        self.notice =
+                            Some((Severity::Bad, format!("Failed to save A/B PNG: {err}")));
+                    }
+                }
+            }
+        }
         if do_open_exports {
             let dir = AppPaths::default_user_dir().exports_dir();
             if let Err(err) = fs::create_dir_all(&dir) {
@@ -645,6 +771,332 @@ impl InputLabUiState {
                     }
                 }
             }
+        }
+    }
+
+    fn render_ab_comparison_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        _mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let Some(base) = self.pinned_baseline.clone() else {
+            return;
+        };
+        let pa = &base.snapshot.polling;
+        let pb = &self.last_snapshot.polling;
+        let sat_a = if pa.saturated_intervals > 0 {
+            pa.saturated_within_15_pct
+        } else {
+            pa.within_15_pct
+        };
+        let sat_b = if pb.saturated_intervals > 0 {
+            pb.saturated_within_15_pct
+        } else {
+            pb.within_15_pct
+        };
+
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Before (A) vs After (B) Comparison")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("A:").size(11.5).color(p.info));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.baseline_label)
+                        .desired_width(130.0)
+                        .hint_text("Front USB 4K"),
+                );
+                ui.label(RichText::new("B:").size(11.5).color(p.text_muted));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.current_label)
+                        .desired_width(130.0)
+                        .hint_text("Rear CPU USB 4K"),
+                );
+            });
+            ui.add_space(6.0);
+
+            let delta_col = |diff: f64, higher_better: bool, eps: f64| -> Color32 {
+                if diff.abs() <= eps {
+                    p.text_muted
+                } else if (diff > 0.0) == higher_better {
+                    p.ok
+                } else {
+                    p.bad
+                }
+            };
+
+            let rows = [
+                (
+                    "Effective Rate",
+                    format!("{:.0} Hz", pa.effective_hz),
+                    format!("{:.0} Hz", pb.effective_hz),
+                    format!("{:+.0} Hz", pb.effective_hz - pa.effective_hz),
+                    delta_col(pb.effective_hz - pa.effective_hz, true, 15.0),
+                ),
+                (
+                    "Sat ±15% Consistency",
+                    format!("{:.1}%", sat_a),
+                    format!("{:.1}%", sat_b),
+                    format!("{:+.1}%", sat_b - sat_a),
+                    delta_col(sat_b - sat_a, true, 0.5),
+                ),
+                (
+                    "Median / p99 Interval",
+                    format!(
+                        "{:.3} / {:.3} ms",
+                        pa.median_us / 1000.0,
+                        pa.p99_us / 1000.0
+                    ),
+                    format!(
+                        "{:.3} / {:.3} ms",
+                        pb.median_us / 1000.0,
+                        pb.p99_us / 1000.0
+                    ),
+                    format!("{:+.3} ms p99", (pb.p99_us - pa.p99_us) / 1000.0),
+                    delta_col(pb.p99_us - pa.p99_us, false, 15.0),
+                ),
+                (
+                    "Jitter σ",
+                    format!("{:.3} ms", pa.std_dev_us / 1000.0),
+                    format!("{:.3} ms", pb.std_dev_us / 1000.0),
+                    format!("{:+.3} ms", (pb.std_dev_us - pa.std_dev_us) / 1000.0),
+                    delta_col(pb.std_dev_us - pa.std_dev_us, false, 8.0),
+                ),
+                (
+                    "True Dropouts / Bunched",
+                    format!("{} / {}", pa.true_dropout_count, pa.bunch_count),
+                    format!("{} / {}", pb.true_dropout_count, pb.bunch_count),
+                    format!(
+                        "{:+} drops",
+                        pb.true_dropout_count as i64 - pa.true_dropout_count as i64
+                    ),
+                    delta_col(
+                        pb.true_dropout_count as f64 - pa.true_dropout_count as f64,
+                        false,
+                        0.0,
+                    ),
+                ),
+            ];
+
+            egui::Grid::new("input_lab_ab_grid")
+                .num_columns(4)
+                .spacing([20.0, 5.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Metric")
+                            .size(11.0)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.label(
+                        RichText::new(format!("A: {}", self.baseline_label))
+                            .size(11.0)
+                            .strong()
+                            .color(p.info),
+                    );
+                    ui.label(
+                        RichText::new(format!("B: {}", self.current_label))
+                            .size(11.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.label(
+                        RichText::new("Delta (B - A)")
+                            .size(11.0)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.end_row();
+
+                    for (metric, va, vb, vd, col) in rows {
+                        ui.label(RichText::new(metric).size(12.0).color(p.text_muted));
+                        ui.label(RichText::new(va).size(12.0).monospace().color(p.text));
+                        ui.label(RichText::new(vb).size(12.0).monospace().color(p.text));
+                        ui.label(RichText::new(vd).size(12.0).strong().monospace().color(col));
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn render_keyboard_scan_card(
+        &self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(120.0);
+        let kb = &self.last_snapshot.keyboard;
+
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Keyboard Scan-Rate & Chatter Tester")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (lbl, col) = if kb.chatter_faults > 0 {
+                        ("CHATTER", p.bad)
+                    } else if let Some(hz) = kb.estimated_scan_hz {
+                        (
+                            if hz >= 1000 { "HIGH-RATE" } else { "MEASURED" },
+                            if hz >= 1000 { p.ok } else { p.info },
+                        )
+                    } else {
+                        ("PRIVACY SAFE", p.text_muted)
+                    };
+                    ui.label(RichText::new(lbl).size(11.0).strong().color(col));
+                });
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Roll two adjacent keys rapidly (e.g. A+D) while capturing to reveal your keyboard's USB scan-rate quantum (up to 8,000 Hz) and detect key chatter (< 25 ms). Anonymous QPC timing only — zero characters or key names are ever recorded.",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
+
+            let pills = vec![
+                (
+                    "SCAN CEILING".to_string(),
+                    kb.estimated_scan_hz
+                        .map(|hz| format!("~{hz} Hz"))
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+                (
+                    "MIN TRANSITION".to_string(),
+                    kb.min_interval_ms
+                        .map(|v| format!("{v:.2} ms"))
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+                (
+                    "MEDIAN".to_string(),
+                    kb.median_interval_ms
+                        .map(|v| format!("{v:.2} ms"))
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+                (
+                    "FASTEST HOLD".to_string(),
+                    kb.min_hold_ms
+                        .map(|v| format!("{v:.1} ms"))
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+                ("CHATTER (<25ms)".to_string(), kb.chatter_faults.to_string()),
+                ("EVENTS".to_string(), kb.total_events.to_string()),
+            ];
+            render_status_pill_rows(ui, p, inner_w, &pills);
+
+            if kb.total_events > 0 {
+                ui.add_space(6.0);
+                let sev = if kb.chatter_faults > 0 {
+                    Severity::Bad
+                } else if kb.estimated_scan_hz.is_some_and(|hz| hz >= 1000) {
+                    Severity::Ok
+                } else {
+                    Severity::Info
+                };
+                semantic_banner(ui, p, mode, inner_w, sev, &kb.health_summary);
+            } else {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Chatter threshold: < {:.0} ms same-key release -> press.",
+                        KEY_CHATTER_THRESHOLD_MS
+                    ))
+                    .size(11.0)
+                    .monospace()
+                    .color(p.text_muted),
+                );
+            }
+        });
+    }
+
+    fn render_usb_topology_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(120.0);
+        let mut do_refresh = false;
+        let topology = self.usb_topology.clone().unwrap_or_default();
+
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("USB Mouse Port & Hub Topology")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(secondary_btn("Refresh", p)).clicked() {
+                        do_refresh = true;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+
+            if topology.is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "No active USB HID mouse hub mapping reported. Plug in your mouse or click Refresh.",
+                        )
+                        .size(12.0)
+                        .color(p.text_muted),
+                    )
+                    .wrap(),
+                );
+            } else {
+                for m in &topology {
+                    let loc = match (m.port_number, m.hub_number) {
+                        (Some(port), Some(hub)) => format!("Port #{port} · Hub #{hub}"),
+                        (_, Some(hub)) => format!("Hub #{hub}"),
+                        _ => "Unknown port".to_string(),
+                    };
+                    let has_issue = m.behind_external_hub || !m.shared_heavy_devices.is_empty();
+                    let sev = if has_issue {
+                        Severity::Warn
+                    } else {
+                        Severity::Ok
+                    };
+                    let mut detail =
+                        format!("{} ({}) — {} [{}]", m.name, m.vid_pid, loc, m.hub_name);
+                    if !m.shared_heavy_devices.is_empty() {
+                        let peers: Vec<String> = m
+                            .shared_heavy_devices
+                            .iter()
+                            .map(|d| format!("{} ({})", d.name, d.kind.label()))
+                            .collect();
+                        detail.push_str(&format!(" · Shared with: {}", peers.join(", ")));
+                    } else if !m.behind_external_hub {
+                        detail.push_str(" · Direct root hub (no webcam/audio/storage contention)");
+                    }
+                    semantic_banner(ui, p, mode, inner_w, sev, &detail);
+                    ui.add_space(4.0);
+                }
+            }
+        });
+
+        if do_refresh {
+            self.usb_topology = Some(WindowsEnv.list_usb_topology().unwrap_or_default());
         }
     }
 

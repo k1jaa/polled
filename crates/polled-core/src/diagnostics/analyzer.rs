@@ -20,6 +20,9 @@ pub const PAUSE_THRESHOLD_US: f64 = 40_000.0;
 /// Unintentional switch contact bounce or too-low debounce typically fires in 1–30 ms.
 pub const BOUNCE_THRESHOLD_MS: f64 = 35.0;
 
+/// Minimum same-key release-to-press interval (ms) below which keyboard switch chatter is flagged.
+pub const KEY_CHATTER_THRESHOLD_MS: f64 = 25.0;
+
 /// Standard mouse polling rates used when snapping auto-detected nominal cadence.
 pub const STANDARD_RATES_HZ: [u32; 7] = [125, 250, 500, 1000, 2000, 4000, 8000];
 
@@ -402,6 +405,34 @@ pub struct TimerJitterBenchmark {
     pub severity: Severity,
 }
 
+/// Privacy-preserving keyboard USB scan-rate & switch chatter statistics.
+///
+/// Key characters and virtual key codes are NEVER recorded or exported — only anonymous
+/// high-resolution QPC timing intervals between non-repeat key transitions.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeyboardPollingStats {
+    pub total_events: u64,
+    pub key_down_count: u64,
+    pub key_up_count: u64,
+    pub min_interval_ms: Option<f64>,
+    pub median_interval_ms: Option<f64>,
+    pub min_hold_ms: Option<f64>,
+    pub min_release_to_press_ms: Option<f64>,
+    pub estimated_scan_hz: Option<u32>,
+    pub chatter_faults: u64,
+    pub recent_intervals_ms: Vec<f64>,
+    pub health_summary: String,
+}
+
+/// Pinned baseline Input Lab capture used for side-by-side Before (A) vs After (B) comparison.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PinnedBenchmark {
+    pub label: String,
+    pub configured_dpi: u32,
+    pub snapshot: DiagnosticsSnapshot,
+    pub timer: Option<TimerJitterBenchmark>,
+}
+
 /// Immutable snapshot published periodically (~30 Hz) from the capture thread to the GUI.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticsSnapshot {
@@ -411,6 +442,8 @@ pub struct DiagnosticsSnapshot {
     pub tracking: TrackingStats,
     pub dpi_measurement: DpiMeasurementSnapshot,
     pub clicks: ClickBounceSnapshot,
+    #[serde(default)]
+    pub keyboard: KeyboardPollingStats,
     pub error: Option<String>,
 }
 
@@ -1057,6 +1090,159 @@ impl ClickBounceAnalyzer {
     }
 }
 
+/// Privacy-preserving keyboard USB polling / scan-rate and switch chatter analyzer.
+///
+/// Tracks only anonymous timing intervals and ignores OS auto-repeat events; never stores
+/// or surfaces typed characters or key names.
+#[derive(Debug)]
+pub struct KeyboardPollingAnalyzer {
+    held: [bool; 256],
+    last_down_ns: [Option<u64>; 256],
+    last_up_ns: [Option<u64>; 256],
+    last_event_ns: Option<u64>,
+    total_events: u64,
+    key_down_count: u64,
+    key_up_count: u64,
+    min_interval_ms: Option<f64>,
+    min_hold_ms: Option<f64>,
+    min_release_to_press_ms: Option<f64>,
+    chatter_faults: u64,
+    recent_intervals_ms: VecDeque<f64>,
+}
+
+impl Default for KeyboardPollingAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyboardPollingAnalyzer {
+    pub fn new() -> Self {
+        Self {
+            held: [false; 256],
+            last_down_ns: [None; 256],
+            last_up_ns: [None; 256],
+            last_event_ns: None,
+            total_events: 0,
+            key_down_count: 0,
+            key_up_count: 0,
+            min_interval_ms: None,
+            min_hold_ms: None,
+            min_release_to_press_ms: None,
+            chatter_faults: 0,
+            recent_intervals_ms: VecDeque::with_capacity(64),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    pub fn record_key(&mut self, slot: u8, pressed: bool, timestamp_ns: u64) {
+        let idx = usize::from(slot);
+        if pressed {
+            // Ignore OS auto-repeat key-down events while key is already held.
+            if self.held[idx] {
+                return;
+            }
+            self.held[idx] = true;
+            self.key_down_count += 1;
+            if let Some(up_ns) = self.last_up_ns[idx] {
+                if timestamp_ns >= up_ns {
+                    let gap_ms = (timestamp_ns - up_ns) as f64 / 1_000_000.0;
+                    if gap_ms >= 0.05 {
+                        self.min_release_to_press_ms = Some(
+                            self.min_release_to_press_ms
+                                .map_or(gap_ms, |m| m.min(gap_ms)),
+                        );
+                        if gap_ms < KEY_CHATTER_THRESHOLD_MS {
+                            self.chatter_faults += 1;
+                        }
+                    }
+                }
+            }
+            self.last_down_ns[idx] = Some(timestamp_ns);
+        } else {
+            self.held[idx] = false;
+            self.key_up_count += 1;
+            if let Some(down_ns) = self.last_down_ns[idx] {
+                if timestamp_ns >= down_ns {
+                    let hold_ms = (timestamp_ns - down_ns) as f64 / 1_000_000.0;
+                    if hold_ms >= 0.05 {
+                        self.min_hold_ms =
+                            Some(self.min_hold_ms.map_or(hold_ms, |m| m.min(hold_ms)));
+                    }
+                }
+            }
+            self.last_up_ns[idx] = Some(timestamp_ns);
+        }
+
+        self.total_events += 1;
+        if let Some(prev_ns) = self.last_event_ns {
+            if timestamp_ns > prev_ns {
+                let dt_ms = (timestamp_ns - prev_ns) as f64 / 1_000_000.0;
+                // Keep rapid transitions (0.05 ms ..= 500 ms) so pauses don't skew scan stats.
+                if (0.05..=500.0).contains(&dt_ms) {
+                    self.min_interval_ms =
+                        Some(self.min_interval_ms.map_or(dt_ms, |m| m.min(dt_ms)));
+                    if self.recent_intervals_ms.len() >= 64 {
+                        self.recent_intervals_ms.pop_front();
+                    }
+                    self.recent_intervals_ms.push_back(dt_ms);
+                }
+            }
+        }
+        self.last_event_ns = Some(timestamp_ns);
+    }
+
+    pub fn snapshot(&self) -> KeyboardPollingStats {
+        let mut sorted: Vec<f64> = self.recent_intervals_ms.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let median_interval_ms = if sorted.is_empty() {
+            None
+        } else {
+            Some(percentile_sorted(&sorted, 0.50))
+        };
+
+        let estimated_scan_hz = self
+            .min_interval_ms
+            .filter(|&ms| ms <= 20.0)
+            .map(|ms| snap_nominal_hz(ms * 1000.0));
+
+        let health_summary = if self.total_events == 0 {
+            "Tap or roll adjacent keys while capturing to measure keyboard scan rate & chatter (zero keystrokes stored)."
+                .to_string()
+        } else if self.chatter_faults > 0 {
+            format!(
+                "Detected {} possible key chatter fault(s) (< {:.0} ms release->press).",
+                self.chatter_faults, KEY_CHATTER_THRESHOLD_MS
+            )
+        } else if let (Some(hz), Some(min_ms)) = (estimated_scan_hz, self.min_interval_ms) {
+            format!(
+                "Finest transition {:.2} ms (~{} Hz scan ceiling) with 0 chatter faults.",
+                min_ms, hz
+            )
+        } else {
+            "Roll adjacent keys rapidly (e.g. A+D) to resolve keyboard scan-rate quantum."
+                .to_string()
+        };
+
+        KeyboardPollingStats {
+            total_events: self.total_events,
+            key_down_count: self.key_down_count,
+            key_up_count: self.key_up_count,
+            min_interval_ms: self.min_interval_ms,
+            median_interval_ms,
+            min_hold_ms: self.min_hold_ms,
+            min_release_to_press_ms: self.min_release_to_press_ms,
+            estimated_scan_hz,
+            chatter_faults: self.chatter_faults,
+            recent_intervals_ms: self.recent_intervals_ms.iter().copied().collect(),
+            health_summary,
+        }
+    }
+}
+
 /// Formats a clean plain-text diagnostic report suitable for clipboard export or issue tickets.
 pub fn format_diagnostic_report(
     snap: &DiagnosticsSnapshot,
@@ -1134,6 +1320,23 @@ pub fn format_diagnostic_report(
                 btn.bounce_faults
             ));
         }
+    }
+
+    if snap.keyboard.total_events > 0 {
+        let min_str = snap
+            .keyboard
+            .min_interval_ms
+            .map(|v| format!("{v:.2} ms"))
+            .unwrap_or_else(|| "n/a".to_string());
+        let hz_str = snap
+            .keyboard
+            .estimated_scan_hz
+            .map(|hz| format!("~{hz} Hz"))
+            .unwrap_or_else(|| "n/a".to_string());
+        lines.push(format!(
+            "Keyboard Scan:  {} events | min transition {} ({}) | chatter faults: {}",
+            snap.keyboard.total_events, min_str, hz_str, snap.keyboard.chatter_faults
+        ));
     }
 
     if let Some(t) = timer {
@@ -1326,5 +1529,28 @@ mod tests {
         let left = &snap.buttons[MouseButtonKind::Left.index()];
         assert_eq!(left.bounce_faults, 1);
         assert!((left.min_release_to_press_ms.unwrap() - 12.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn keyboard_analyzer_ignores_repeats_detects_scan_rate_and_chatter() {
+        let mut kb = KeyboardPollingAnalyzer::new();
+        let mut t_ns = 1_000_000_000u64;
+
+        // Key A down, repeated OS auto-repeat (must be ignored), then Key D down 0.25 ms later (~4000 Hz)
+        kb.record_key(65, true, t_ns);
+        t_ns += 50_000;
+        kb.record_key(65, true, t_ns); // auto-repeat -> ignored
+        t_ns += 200_000; // 0.25 ms since first key-down
+        kb.record_key(68, true, t_ns);
+        t_ns += 15_000_000;
+        kb.record_key(65, false, t_ns);
+        t_ns += 10_000_000; // 10 ms release->press chatter fault (< 25 ms)
+        kb.record_key(65, true, t_ns);
+
+        let snap = kb.snapshot();
+        assert_eq!(snap.key_down_count, 3);
+        assert_eq!(snap.key_up_count, 1);
+        assert_eq!(snap.chatter_faults, 1);
+        assert_eq!(snap.estimated_scan_hz, Some(4000));
     }
 }

@@ -28,21 +28,23 @@ pub use devices::{
     VaxeeProtocolDriver, WriteMode,
 };
 pub use diagnostics::{
-    format_diagnostic_report, format_intervals_csv, render_report_png, run_timer_jitter_benchmark,
-    ButtonBounceStats, ClickBounceAnalyzer, ClickBounceSnapshot, ClickEventRecord,
-    DiagnosticsSnapshot, DpiCalibrationResult, DpiCalibrator, DpiMeasurementSnapshot, HistogramBin,
-    IntervalSample, MouseButtonKind, PollingAnalyzer, PollingStats, PollingTarget,
-    RawInputCaptureSession, TimerJitterBenchmark, TrackingStats, XyTracePoint, BOUNCE_THRESHOLD_MS,
-    HISTOGRAM_BASE_BINS, STANDARD_RATES_HZ,
+    format_diagnostic_report, format_intervals_csv, render_ab_comparison_png, render_report_png,
+    run_timer_jitter_benchmark, ButtonBounceStats, ClickBounceAnalyzer, ClickBounceSnapshot,
+    ClickEventRecord, DiagnosticsSnapshot, DpiCalibrationResult, DpiCalibrator,
+    DpiMeasurementSnapshot, HistogramBin, IntervalSample, KeyboardPollingAnalyzer,
+    KeyboardPollingStats, MouseButtonKind, PinnedBenchmark, PollingAnalyzer, PollingStats,
+    PollingTarget, RawInputCaptureSession, TimerJitterBenchmark, TrackingStats, XyTracePoint,
+    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, STANDARD_RATES_HZ,
 };
 pub use error::{PolledError, Result};
 pub use hid::{dump_hid_devices, HidDeviceDump, HidDumpReport};
 pub use paths::AppPaths;
 pub use profiles::{
-    export_profile_json, import_profile_json, match_profile, normalize_exe_name, FocusDebouncer,
-    FocusEvent, ForegroundWatcher, GameProfile, PowerPlanPreset, ProfileCardExport, ProfileStore,
+    discover_installed_games, discover_running_apps, export_profile_json, import_profile_json,
+    match_profile, normalize_exe_name, DiscoveredGame, FocusDebouncer, FocusEvent,
+    ForegroundWatcher, GameProfile, GameSource, PowerPlanPreset, ProfileCardExport, ProfileStore,
 };
 pub use settings::{
     format_autostart_command, is_autostart_enabled, set_autostart_enabled, AppSettings,
-    ThemePreference,
+    HotkeyBinding, HotkeyConfig, ThemePreference,
 };

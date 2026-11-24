@@ -708,6 +708,7 @@ impl MouseDevice for EndgameGearOp1Device {
             dpi_min: self.profile.cpi_min,
             dpi_max: self.profile.cpi_max,
             dpi_step: self.profile.cpi_step_high,
+            supports_xy_dpi: false,
             polling_rates_hz: self.profile.supported_polling_rates(),
             lod_options: self.profile.lod_options(),
             supports_debounce: false,
@@ -716,6 +717,9 @@ impl MouseDevice for EndgameGearOp1Device {
             supports_motion_sync: true,
             supports_angle_snapping: true,
             supports_ripple_control: true,
+            supports_sleep_timeout: false,
+            sleep_timeout_min_secs: 0,
+            sleep_timeout_max_secs: 0,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} stores settings in onboard flash. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -737,12 +741,14 @@ impl MouseDevice for EndgameGearOp1Device {
 
         Ok(MouseSettings {
             dpi: Some(dpi),
+            dpi_y: None,
             polling_rate_hz: Some(polling_rate_hz),
             lod,
             debounce_ms: None,
             motion_sync: Some(config[OFFSET_MOTION_SYNC] != 0),
             angle_snapping: Some(config[OFFSET_ANGLE_SNAPPING] != 0),
             ripple_control: Some(config[OFFSET_RIPPLE_CONTROL] != 0),
+            sleep_timeout_secs: None,
         })
     }
 

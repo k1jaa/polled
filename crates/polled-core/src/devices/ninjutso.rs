@@ -363,6 +363,7 @@ impl MouseDevice for NinjutsoDevice {
             dpi_min: 50,
             dpi_max: if direct { 45_000 } else { 30_000 },
             dpi_step: 50,
+            supports_xy_dpi: false,
             polling_rates_hz,
             lod_options,
             supports_debounce: false,
@@ -371,6 +372,9 @@ impl MouseDevice for NinjutsoDevice {
             supports_motion_sync: true,
             supports_angle_snapping: false,
             supports_ripple_control: false,
+            supports_sleep_timeout: false,
+            sleep_timeout_min_secs: 0,
+            sleep_timeout_max_secs: 0,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists profile settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -422,12 +426,14 @@ impl MouseDevice for NinjutsoDevice {
             let motion_sync = data.get(23).copied().map(|v| v == 1);
             return Ok(MouseSettings {
                 dpi: Some(dpi),
+                dpi_y: None,
                 polling_rate_hz: Some(rate),
                 lod,
                 debounce_ms: None,
                 motion_sync,
                 angle_snapping: None,
                 ripple_control: None,
+                sleep_timeout_secs: None,
             });
         }
 
@@ -464,12 +470,14 @@ impl MouseDevice for NinjutsoDevice {
 
         Ok(MouseSettings {
             dpi: Some(dpi),
+            dpi_y: None,
             polling_rate_hz: Some(polling_rate_hz),
             lod,
             debounce_ms: None,
             motion_sync,
             angle_snapping: None,
             ripple_control: None,
+            sleep_timeout_secs: None,
         })
     }
 

@@ -149,6 +149,9 @@ impl BatteryStatus {
 pub struct MouseSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dpi: Option<u16>,
+    /// Optional independent vertical (Y-axis) DPI. `None` means uniform (`Y == X`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpi_y: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub polling_rate_hz: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,23 +164,37 @@ pub struct MouseSettings {
     pub angle_snapping: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ripple_control: Option<bool>,
+    /// Optional wireless idle sleep timeout in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_timeout_secs: Option<u16>,
 }
 
 impl MouseSettings {
     pub fn is_empty(&self) -> bool {
         self.dpi.is_none()
+            && self.dpi_y.is_none()
             && self.polling_rate_hz.is_none()
             && self.lod.is_none()
             && self.debounce_ms.is_none()
             && self.motion_sync.is_none()
             && self.angle_snapping.is_none()
             && self.ripple_control.is_none()
+            && self.sleep_timeout_secs.is_none()
     }
 
     /// Returns `true` if every `Some(...)` field in `desired` matches `self`.
     pub fn matches_desired(&self, desired: &MouseSettings) -> bool {
         if let Some(dpi) = desired.dpi {
             if self.dpi != Some(dpi) {
+                return false;
+            }
+            if desired.dpi_y.is_none() && self.dpi_y.is_some_and(|y| y != dpi) {
+                return false;
+            }
+        }
+        if let Some(dpi_y) = desired.dpi_y {
+            let actual_y = self.dpi_y.or(self.dpi);
+            if actual_y != Some(dpi_y) {
                 return false;
             }
         }
@@ -211,26 +228,49 @@ impl MouseSettings {
                 return false;
             }
         }
+        if let Some(sleep) = desired.sleep_timeout_secs {
+            if self.sleep_timeout_secs != Some(sleep) {
+                return false;
+            }
+        }
         true
     }
 
     /// Produces a merged settings struct where `Some(...)` fields from `desired` override `self`.
     pub fn merged_with(&self, desired: &MouseSettings) -> MouseSettings {
+        let next_dpi = desired.dpi.or(self.dpi);
+        let next_dpi_y = if let Some(y) = desired.dpi_y {
+            if next_dpi == Some(y) {
+                None
+            } else {
+                Some(y)
+            }
+        } else if desired.dpi.is_some() {
+            // Setting a uniform DPI clears any previous separate Y DPI.
+            None
+        } else {
+            self.dpi_y
+        };
         MouseSettings {
-            dpi: desired.dpi.or(self.dpi),
+            dpi: next_dpi,
+            dpi_y: next_dpi_y,
             polling_rate_hz: desired.polling_rate_hz.or(self.polling_rate_hz),
             lod: desired.lod.or(self.lod),
             debounce_ms: desired.debounce_ms.or(self.debounce_ms),
             motion_sync: desired.motion_sync.or(self.motion_sync),
             angle_snapping: desired.angle_snapping.or(self.angle_snapping),
             ripple_control: desired.ripple_control.or(self.ripple_control),
+            sleep_timeout_secs: desired.sleep_timeout_secs.or(self.sleep_timeout_secs),
         }
     }
 
     pub fn summary_string(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(dpi) = self.dpi {
-            parts.push(format!("{dpi} DPI"));
+        match (self.dpi, self.dpi_y) {
+            (Some(x), Some(y)) if x != y => parts.push(format!("{x}x{y} DPI")),
+            (Some(x), _) => parts.push(format!("{x} DPI")),
+            (None, Some(y)) => parts.push(format!("Y {y} DPI")),
+            (None, None) => {}
         }
         if let Some(hz) = self.polling_rate_hz {
             parts.push(format!("{hz} Hz"));
@@ -249,6 +289,13 @@ impl MouseSettings {
         }
         if let Some(rip) = self.ripple_control {
             parts.push(format!("Ripple {}", if rip { "ON" } else { "OFF" }));
+        }
+        if let Some(secs) = self.sleep_timeout_secs {
+            if secs >= 60 && secs.is_multiple_of(60) {
+                parts.push(format!("Sleep {}m", secs / 60));
+            } else {
+                parts.push(format!("Sleep {secs}s"));
+            }
         }
         if parts.is_empty() {
             "(no mouse changes)".to_string()
@@ -273,6 +320,8 @@ pub struct DeviceCapabilities {
     pub dpi_min: u16,
     pub dpi_max: u16,
     pub dpi_step: u16,
+    #[serde(default)]
+    pub supports_xy_dpi: bool,
     pub polling_rates_hz: Vec<u16>,
     pub lod_options: Vec<LiftOffDistance>,
     pub supports_debounce: bool,
@@ -284,6 +333,12 @@ pub struct DeviceCapabilities {
     pub supports_angle_snapping: bool,
     #[serde(default)]
     pub supports_ripple_control: bool,
+    #[serde(default)]
+    pub supports_sleep_timeout: bool,
+    #[serde(default)]
+    pub sleep_timeout_min_secs: u16,
+    #[serde(default)]
+    pub sleep_timeout_max_secs: u16,
     /// If `false`, writes touch onboard flash and MUST be diffed and rate-limited.
     pub supports_volatile_writes: bool,
     pub flash_write_warning: Option<String>,
@@ -368,6 +423,51 @@ impl DeviceCapabilities {
                 device: device_name.to_string(),
                 detail: format!("Ripple Control is not configurable on {device_name}"),
             });
+        }
+
+        if let Some(dpi_y) = settings.dpi_y {
+            if !self.supports_xy_dpi {
+                return Err(PolledError::UnsupportedSetting {
+                    device: device_name.to_string(),
+                    detail: format!("Independent Y DPI is not configurable on {device_name}"),
+                });
+            }
+            if dpi_y < self.dpi_min || dpi_y > self.dpi_max {
+                return Err(PolledError::UnsupportedSetting {
+                    device: device_name.to_string(),
+                    detail: format!(
+                        "Y DPI {dpi_y} out of supported range {}..={}",
+                        self.dpi_min, self.dpi_max
+                    ),
+                });
+            }
+            if self.dpi_step > 1 && !(dpi_y - self.dpi_min).is_multiple_of(self.dpi_step) {
+                return Err(PolledError::UnsupportedSetting {
+                    device: device_name.to_string(),
+                    detail: format!(
+                        "Y DPI {dpi_y} must be in increments of {} starting from {}",
+                        self.dpi_step, self.dpi_min
+                    ),
+                });
+            }
+        }
+
+        if let Some(secs) = settings.sleep_timeout_secs {
+            if !self.supports_sleep_timeout {
+                return Err(PolledError::UnsupportedSetting {
+                    device: device_name.to_string(),
+                    detail: format!("Idle sleep timeout is not configurable on {device_name}"),
+                });
+            }
+            if secs < self.sleep_timeout_min_secs || secs > self.sleep_timeout_max_secs {
+                return Err(PolledError::UnsupportedSetting {
+                    device: device_name.to_string(),
+                    detail: format!(
+                        "Sleep timeout {secs}s out of supported range {}..={}s",
+                        self.sleep_timeout_min_secs, self.sleep_timeout_max_secs
+                    ),
+                });
+            }
         }
 
         Ok(())
@@ -458,6 +558,42 @@ impl DeviceCapabilities {
             out.ripple_control = None;
         }
 
+        if let Some(dpi_y) = desired.dpi_y {
+            if !self.supports_xy_dpi {
+                notes.push(format!("Y DPI {dpi_y} skipped"));
+                out.dpi_y = None;
+            } else {
+                let clamped = dpi_y.clamp(self.dpi_min, self.dpi_max);
+                let snapped = if self.dpi_step > 1 {
+                    let step = u32::from(self.dpi_step);
+                    let offset = u32::from(clamped - self.dpi_min);
+                    let rounded = ((offset + step / 2) / step) * step;
+                    let max_valid = u32::from(self.dpi_min)
+                        + (u32::from(self.dpi_max - self.dpi_min) / step) * step;
+                    (u32::from(self.dpi_min) + rounded).min(max_valid) as u16
+                } else {
+                    clamped
+                };
+                if snapped != dpi_y {
+                    notes.push(format!("Y DPI {dpi_y} -> {snapped}"));
+                }
+                out.dpi_y = Some(snapped);
+            }
+        }
+
+        if let Some(secs) = desired.sleep_timeout_secs {
+            if !self.supports_sleep_timeout {
+                notes.push(format!("Sleep {secs}s skipped"));
+                out.sleep_timeout_secs = None;
+            } else {
+                let clamped = secs.clamp(self.sleep_timeout_min_secs, self.sleep_timeout_max_secs);
+                if clamped != secs {
+                    notes.push(format!("Sleep {secs}s -> {clamped}s"));
+                }
+                out.sleep_timeout_secs = Some(clamped);
+            }
+        }
+
         (out, notes)
     }
 }
@@ -536,6 +672,7 @@ mod tests {
             dpi_min: 50,
             dpi_max: 26000,
             dpi_step: 50,
+            supports_xy_dpi: true,
             polling_rates_hz: vec![125, 250, 500, 1000, 2000, 4000],
             lod_options: vec![LiftOffDistance::Mm10, LiftOffDistance::Mm20],
             supports_debounce: true,
@@ -544,27 +681,34 @@ mod tests {
             supports_motion_sync: true,
             supports_angle_snapping: true,
             supports_ripple_control: true,
+            supports_sleep_timeout: true,
+            sleep_timeout_min_secs: 10,
+            sleep_timeout_max_secs: 1800,
             supports_volatile_writes: false,
             flash_write_warning: None,
         };
 
         let pulsar_profile = MouseSettings {
             dpi: Some(810),
+            dpi_y: Some(1010),
             polling_rate_hz: Some(8000),
             lod: Some(LiftOffDistance::Mm07),
             debounce_ms: Some(20),
             motion_sync: Some(true),
             angle_snapping: Some(false),
             ripple_control: Some(false),
+            sleep_timeout_secs: Some(300),
         };
 
         let (adapted, notes) = lamzu_caps.adapt_settings(&pulsar_profile);
         assert_eq!(adapted.dpi, Some(800));
+        assert_eq!(adapted.dpi_y, Some(1000));
         assert_eq!(adapted.polling_rate_hz, Some(4000));
         assert_eq!(adapted.lod, Some(LiftOffDistance::Mm10));
         assert_eq!(adapted.debounce_ms, Some(15));
         assert_eq!(adapted.motion_sync, Some(true));
-        assert_eq!(notes.len(), 4);
+        assert_eq!(adapted.sleep_timeout_secs, Some(300));
+        assert_eq!(notes.len(), 5);
         assert!(lamzu_caps.validate("LAMZU 4K", &adapted).is_ok());
     }
 
@@ -574,6 +718,7 @@ mod tests {
             dpi_min: 100,
             dpi_max: 25600,
             dpi_step: 50,
+            supports_xy_dpi: false,
             polling_rates_hz: vec![125, 250, 500, 1000],
             lod_options: Vec::new(),
             supports_debounce: false,
@@ -582,29 +727,36 @@ mod tests {
             supports_motion_sync: false,
             supports_angle_snapping: false,
             supports_ripple_control: false,
+            supports_sleep_timeout: false,
+            sleep_timeout_min_secs: 0,
+            sleep_timeout_max_secs: 0,
             supports_volatile_writes: true,
             flash_write_warning: None,
         };
 
         let desired = MouseSettings {
             dpi: Some(1600),
+            dpi_y: Some(1800),
             polling_rate_hz: Some(4000),
             lod: Some(LiftOffDistance::Mm07),
             debounce_ms: Some(4),
             motion_sync: Some(true),
             angle_snapping: Some(false),
             ripple_control: Some(false),
+            sleep_timeout_secs: Some(300),
         };
 
         let (adapted, notes) = logi_caps.adapt_settings(&desired);
         assert_eq!(adapted.dpi, Some(1600));
+        assert_eq!(adapted.dpi_y, None);
         assert_eq!(adapted.polling_rate_hz, Some(1000));
         assert_eq!(adapted.lod, None);
         assert_eq!(adapted.debounce_ms, None);
         assert_eq!(adapted.motion_sync, None);
         assert_eq!(adapted.angle_snapping, None);
         assert_eq!(adapted.ripple_control, None);
-        assert_eq!(notes.len(), 6);
+        assert_eq!(adapted.sleep_timeout_secs, None);
+        assert_eq!(notes.len(), 8);
         assert!(logi_caps.validate("PRO X SUPERLIGHT", &adapted).is_ok());
     }
 }

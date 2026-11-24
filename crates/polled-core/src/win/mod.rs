@@ -20,6 +20,8 @@ pub mod timer;
 pub mod usb_msi;
 #[cfg(windows)]
 pub mod usb_power;
+#[cfg(windows)]
+pub mod usb_topology;
 
 use serde::{Deserialize, Serialize};
 
@@ -137,6 +139,44 @@ pub struct UsbControllerInfo {
     pub msi_supported: Option<bool>,
 }
 
+/// High-bandwidth USB device class that can contend with 4K/8K mouse polling on a shared hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsbSharedDeviceKind {
+    CameraOrCapture,
+    UsbAudio,
+    UsbStorage,
+}
+
+impl UsbSharedDeviceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            UsbSharedDeviceKind::CameraOrCapture => "Webcam / Capture",
+            UsbSharedDeviceKind::UsbAudio => "USB Audio",
+            UsbSharedDeviceKind::UsbStorage => "USB Storage",
+        }
+    }
+}
+
+/// High-bandwidth USB device sharing the same hub as a connected mouse or receiver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbSharedDevice {
+    pub name: String,
+    pub kind: UsbSharedDeviceKind,
+}
+
+/// Active USB hub & port placement for one connected HID mouse or wireless dongle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbMouseTopology {
+    pub name: String,
+    pub vid_pid: String,
+    pub port_number: Option<u32>,
+    pub hub_number: Option<u32>,
+    pub hub_name: String,
+    pub behind_external_hub: bool,
+    pub shared_heavy_devices: Vec<UsbSharedDevice>,
+}
+
 /// Abstraction over all Windows system APIs used by Polled.
 ///
 /// Production code passes `WindowsEnv` (real `windows-rs` + `sysinfo` calls);
@@ -191,6 +231,7 @@ pub trait SystemEnv: Send + Sync {
     fn measure_timer_resolution(&self) -> Result<TimerResolutionSample>;
     fn list_usb_power_devices(&self) -> Result<Vec<UsbPowerDevice>>;
     fn list_usb_controllers(&self) -> Result<Vec<UsbControllerInfo>>;
+    fn list_usb_topology(&self) -> Result<Vec<UsbMouseTopology>>;
 }
 
 /// Real Windows implementation backed by `windows-rs` and `sysinfo`.
@@ -305,5 +346,9 @@ impl SystemEnv for WindowsEnv {
 
     fn list_usb_controllers(&self) -> Result<Vec<UsbControllerInfo>> {
         usb_msi::list_usb_controllers()
+    }
+
+    fn list_usb_topology(&self) -> Result<Vec<UsbMouseTopology>> {
+        usb_topology::list_usb_topology()
     }
 }

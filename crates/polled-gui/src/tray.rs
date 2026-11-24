@@ -10,7 +10,7 @@ use std::time::Duration;
 use eframe::egui;
 use polled_core::win::WindowsEnv;
 use polled_core::{AppPaths, AppSettings, HealthEngine};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::app::WorkerMsg;
@@ -18,9 +18,12 @@ use crate::icon::tray_icon_image;
 use crate::notifications::notify_if_regressed;
 use crate::profile_runtime::ProfileRuntimeCmd;
 
+const ID_STATUS: &str = "status_info";
 const ID_OPEN: &str = "open";
 const ID_SCAN: &str = "scan";
 const ID_AUTO_SWITCH: &str = "auto_switch";
+const ID_LOCK_PROFILE: &str = "lock_profile";
+const ID_PROFILE_PREFIX: &str = "profile::";
 const ID_QUIT: &str = "quit";
 
 /// Finds Polled's own top-level `HWND` on the current Win32 UI thread (including when hidden).
@@ -87,7 +90,12 @@ pub(crate) fn find_own_main_hwnd() -> isize {
 /// Holds the active Windows system tray icon and dynamic menu items alive for the lifetime of the app.
 pub struct TrayController {
     tray: Option<TrayIcon>,
+    status_item: MenuItem,
+    profiles_submenu: Submenu,
+    profile_menu_items: Vec<MenuItem>,
+    last_profile_key: (String, Vec<(String, String)>),
     auto_switch_item: CheckMenuItem,
+    lock_profile_item: CheckMenuItem,
 }
 
 impl TrayController {
@@ -99,13 +107,19 @@ impl TrayController {
         profile_cmd_tx: Sender<ProfileRuntimeCmd>,
         main_hwnd: Arc<AtomicIsize>,
         auto_switch_state: Arc<AtomicBool>,
+        profile_locked_state: Arc<AtomicBool>,
         quit_requested: Arc<AtomicBool>,
     ) -> Self {
         let initial_auto_switch = auto_switch_state.load(Ordering::SeqCst);
         let menu = Menu::new();
+        let status_item = MenuItem::with_id(ID_STATUS, "Polled · Initializing...", false, None);
+        let sep_status = PredefinedMenuItem::separator();
         let open_item = MenuItem::with_id(ID_OPEN, "Open Polled", true, None);
         let scan_item = MenuItem::with_id(ID_SCAN, "Scan Now", true, None);
         let sep_top = PredefinedMenuItem::separator();
+        let profiles_submenu = Submenu::new("Switch Profile", true);
+        let lock_profile_item =
+            CheckMenuItem::with_id(ID_LOCK_PROFILE, "Lock Current Profile", true, false, None);
         let auto_switch_item = CheckMenuItem::with_id(
             ID_AUTO_SWITCH,
             "Auto-Switch Profiles",
@@ -115,9 +129,13 @@ impl TrayController {
         );
         let sep_bottom = PredefinedMenuItem::separator();
         let quit_item = MenuItem::with_id(ID_QUIT, "Quit", true, None);
+        let _ = menu.append(&status_item);
+        let _ = menu.append(&sep_status);
         let _ = menu.append(&open_item);
         let _ = menu.append(&scan_item);
         let _ = menu.append(&sep_top);
+        let _ = menu.append(&profiles_submenu);
+        let _ = menu.append(&lock_profile_item);
         let _ = menu.append(&auto_switch_item);
         let _ = menu.append(&sep_bottom);
         let _ = menu.append(&quit_item);
@@ -161,7 +179,14 @@ impl TrayController {
                     }
 
                     while let Ok(event) = menu_rx.try_recv() {
-                        match event.id.0.as_str() {
+                        let id_str = event.id.0.as_str();
+                        if let Some(prof_id) = id_str.strip_prefix(ID_PROFILE_PREFIX) {
+                            let _ = profile_cmd_tx
+                                .send(ProfileRuntimeCmd::ApplyProfileNow(prof_id.to_string()));
+                            ctx.request_repaint();
+                            continue;
+                        }
+                        match id_str {
                             ID_OPEN => show_and_focus(&main_hwnd, &ctx),
                             ID_SCAN => {
                                 // Run directly on a background thread so tray scans work even
@@ -184,6 +209,13 @@ impl TrayController {
                                     });
                                     ctx_scan.request_repaint();
                                 });
+                            }
+                            ID_LOCK_PROFILE => {
+                                let next = !profile_locked_state.load(Ordering::SeqCst);
+                                profile_locked_state.store(next, Ordering::SeqCst);
+                                let _ =
+                                    profile_cmd_tx.send(ProfileRuntimeCmd::SetProfileLock(next));
+                                ctx.request_repaint();
                             }
                             ID_AUTO_SWITCH => {
                                 // Toggle runtime directly so it works even while window is hidden.
@@ -216,20 +248,57 @@ impl TrayController {
 
         Self {
             tray,
+            status_item,
+            profiles_submenu,
+            profile_menu_items: Vec::new(),
+            last_profile_key: (String::new(), Vec::new()),
             auto_switch_item,
+            lock_profile_item,
         }
     }
 
-    /// Synchronizes the tray menu checkmark and hover tooltip with the live profile runtime.
+    /// Synchronizes the tray menu status header, profile quick-switch submenu, checkmarks, and tooltip.
     pub fn update_status(
-        &self,
+        &mut self,
         auto_switch_enabled: bool,
+        profile_locked: bool,
+        active_profile_id: &str,
         active_profile_name: &str,
+        available_profiles: &[(String, String)],
         battery_summary: Option<&str>,
     ) {
         self.auto_switch_item.set_checked(auto_switch_enabled);
+        self.lock_profile_item.set_checked(profile_locked);
+
+        let lock_tag = if profile_locked { " [LOCKED]" } else { "" };
+        let header_text = match battery_summary.filter(|s| !s.is_empty()) {
+            Some(batt) => format!("{active_profile_name}{lock_tag} · {batt}"),
+            None => format!("Profile: {active_profile_name}{lock_tag}"),
+        };
+        self.status_item.set_text(header_text);
+
+        let next_key = (active_profile_id.to_string(), available_profiles.to_vec());
+        if next_key != self.last_profile_key {
+            for old in self.profile_menu_items.drain(..) {
+                let _ = self.profiles_submenu.remove(&old);
+            }
+            for (id, name) in available_profiles {
+                let label = if id == active_profile_id {
+                    format!("● {name}")
+                } else {
+                    format!("   {name}")
+                };
+                let item = MenuItem::with_id(format!("{ID_PROFILE_PREFIX}{id}"), label, true, None);
+                let _ = self.profiles_submenu.append(&item);
+                self.profile_menu_items.push(item);
+            }
+            self.last_profile_key = next_key;
+        }
+
         if let Some(tray) = &self.tray {
-            let mut tooltip = if auto_switch_enabled {
+            let mut tooltip = if profile_locked {
+                format!("Polled — LOCKED · {active_profile_name}")
+            } else if auto_switch_enabled {
                 format!("Polled — Auto-Switch ON · {active_profile_name}")
             } else {
                 "Polled — Auto-Switch OFF".to_string()

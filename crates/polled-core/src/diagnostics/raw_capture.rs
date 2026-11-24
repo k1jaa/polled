@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::diagnostics::analyzer::{
-    ClickBounceAnalyzer, DiagnosticsSnapshot, DpiCalibrator, MouseButtonKind, PollingAnalyzer,
-    PollingTarget,
+    ClickBounceAnalyzer, DiagnosticsSnapshot, DpiCalibrator, KeyboardPollingAnalyzer,
+    MouseButtonKind, PollingAnalyzer, PollingTarget,
 };
 
 const TARGET_AUTO_SENTINEL: u32 = 0;
@@ -222,16 +222,16 @@ fn run_win32_capture_loop<F>(
     };
     use windows::Win32::UI::Input::{
         GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
-        RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEMOUSE,
+        RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
         PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage, UnregisterClassW,
-        HWND_MESSAGE, MSG, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN,
-        RI_MOUSE_BUTTON_5_UP, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
-        RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN,
-        RI_MOUSE_RIGHT_BUTTON_UP, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_INPUT,
-        WM_TIMER, WNDCLASSW,
+        HWND_MESSAGE, MSG, RI_KEY_BREAK, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP,
+        RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, RI_MOUSE_LEFT_BUTTON_DOWN,
+        RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP,
+        RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WM_CLOSE, WM_DESTROY, WM_INPUT, WM_TIMER, WNDCLASSW,
     };
 
     struct CaptureThreadState {
@@ -239,6 +239,7 @@ fn run_win32_capture_loop<F>(
         polling: PollingAnalyzer,
         dpi_cal: DpiCalibrator,
         clicks: ClickBounceAnalyzer,
+        keyboard: KeyboardPollingAnalyzer,
         last_target_raw: u32,
         snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
         reset_requested: Arc<AtomicBool>,
@@ -264,6 +265,7 @@ fn run_win32_capture_loop<F>(
                 self.polling.reset();
                 self.clicks.reset();
                 self.dpi_cal.reset();
+                self.keyboard.reset();
             }
             self.sync_dpi_flags();
             let target_raw = self.target_hz_atomic.load(Ordering::SeqCst);
@@ -279,6 +281,7 @@ fn run_win32_capture_loop<F>(
                 tracking: self.polling.tracking_snapshot(Some(now_ns)),
                 dpi_measurement: self.dpi_cal.snapshot(),
                 clicks: self.clicks.snapshot(),
+                keyboard: self.keyboard.snapshot(),
                 error: None,
             };
             if let Ok(mut guard) = self.snapshot.lock() {
@@ -332,7 +335,18 @@ fn run_win32_capture_loop<F>(
                             size_of::<RAWINPUTHEADER>() as u32,
                         )
                     };
-                    if copied == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE.0 {
+                    if copied == u32::MAX {
+                        return;
+                    }
+                    if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
+                        // SAFETY: `dwType == RIM_TYPEKEYBOARD` guarantees `raw.data.keyboard` is active.
+                        let kb = unsafe { raw.data.keyboard };
+                        let pressed = (u32::from(kb.Flags) & RI_KEY_BREAK) == 0;
+                        let slot = (kb.VKey & 0xFF) as u8;
+                        state.keyboard.record_key(slot, pressed, ts_ns);
+                        return;
+                    }
+                    if raw.header.dwType != RIM_TYPEMOUSE.0 {
                         return;
                     }
 
@@ -510,14 +524,22 @@ fn run_win32_capture_loop<F>(
         }
     };
 
-    let rid = RAWINPUTDEVICE {
-        usUsagePage: 0x01, // Generic Desktop Controls
-        usUsage: 0x02,     // Mouse
-        dwFlags: RIDEV_INPUTSINK,
-        hwndTarget: hwnd,
-    };
-    // SAFETY: `rid` is a valid single-element array matching `size_of::<RAWINPUTDEVICE>()`.
-    if unsafe { RegisterRawInputDevices(&[rid], size_of::<RAWINPUTDEVICE>() as u32) }.is_err() {
+    let rids = [
+        RAWINPUTDEVICE {
+            usUsagePage: 0x01, // Generic Desktop Controls
+            usUsage: 0x02,     // Mouse
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd,
+        },
+        RAWINPUTDEVICE {
+            usUsagePage: 0x01, // Generic Desktop Controls
+            usUsage: 0x06,     // Keyboard (anonymous QPC timing only)
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd,
+        },
+    ];
+    // SAFETY: `rids` is a valid array matching `size_of::<RAWINPUTDEVICE>()`.
+    if unsafe { RegisterRawInputDevices(&rids, size_of::<RAWINPUTDEVICE>() as u32) }.is_err() {
         // SAFETY: Clean up window & class on registration failure.
         unsafe {
             let _ = DestroyWindow(hwnd);
@@ -525,7 +547,7 @@ fn run_win32_capture_loop<F>(
         }
         publish_error(
             &snapshot,
-            "Windows denied RegisterRawInputDevices for mouse input.",
+            "Windows denied RegisterRawInputDevices for mouse/keyboard input.",
             &on_update,
         );
         return;
@@ -537,6 +559,7 @@ fn run_win32_capture_loop<F>(
             polling: PollingAnalyzer::new(initial_target),
             dpi_cal: DpiCalibrator::default(),
             clicks: ClickBounceAnalyzer::new(),
+            keyboard: KeyboardPollingAnalyzer::new(),
             last_target_raw: initial_target_raw,
             snapshot: Arc::clone(&snapshot),
             reset_requested,
@@ -574,15 +597,23 @@ fn run_win32_capture_loop<F>(
     }
 
     // Unregister Raw Input and destroy window cleanly.
-    let rid_remove = RAWINPUTDEVICE {
-        usUsagePage: 0x01,
-        usUsage: 0x02,
-        dwFlags: RIDEV_REMOVE,
-        hwndTarget: HWND::default(),
-    };
+    let rid_remove = [
+        RAWINPUTDEVICE {
+            usUsagePage: 0x01,
+            usUsage: 0x02,
+            dwFlags: RIDEV_REMOVE,
+            hwndTarget: HWND::default(),
+        },
+        RAWINPUTDEVICE {
+            usUsagePage: 0x01,
+            usUsage: 0x06,
+            dwFlags: RIDEV_REMOVE,
+            hwndTarget: HWND::default(),
+        },
+    ];
     // SAFETY: Standard cleanup matching `RegisterRawInputDevices` above.
     unsafe {
-        let _ = RegisterRawInputDevices(&[rid_remove], size_of::<RAWINPUTDEVICE>() as u32);
+        let _ = RegisterRawInputDevices(&rid_remove, size_of::<RAWINPUTDEVICE>() as u32);
         let _ = DestroyWindow(hwnd);
         let _ = UnregisterClassW(PCWSTR(class_w.as_ptr()), Some(hinstance));
     }

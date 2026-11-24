@@ -26,6 +26,7 @@ pub mod timer_resolution;
 pub mod usb_msi_mode;
 pub mod usb_power_management;
 pub mod usb_selective_suspend;
+pub mod usb_topology;
 pub mod vbs_memory_integrity;
 pub mod vendor_software;
 pub mod windowed_optimizations;
@@ -138,7 +139,7 @@ pub trait HealthCheck: Send + Sync {
     }
 }
 
-/// Returns all 25 registered built-in input health checks and optional tweaks in display order.
+/// Returns all 26 registered built-in input health checks and optional tweaks in display order.
 pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
     vec![
         // --- Core Mouse & Cursor Input ---
@@ -151,6 +152,7 @@ pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
         Box::new(usb_selective_suspend::UsbSelectiveSuspendCheck),
         Box::new(usb_power_management::UsbPowerManagementCheck),
         Box::new(usb_msi_mode::UsbXhciMsiCheck),
+        Box::new(usb_topology::UsbTopologyCheck),
         Box::new(pcie_aspm::PcieAspmCheck),
         Box::new(power_plan::PowerPlanCheck),
         Box::new(cpu_throttle::CpuProcessorStateCheck),

@@ -609,6 +609,32 @@ pub fn cmd_read_v4_polling() -> RazerCommand {
     }
 }
 
+pub fn cmd_read_sleep_timeout() -> RazerCommand {
+    RazerCommand {
+        command_class: 0x07,
+        command_id: 0x83,
+        data_size: 0x02,
+        args: Vec::new(),
+    }
+}
+
+pub fn cmd_set_sleep_timeout(seconds: u16) -> RazerCommand {
+    RazerCommand {
+        command_class: 0x07,
+        command_id: 0x03,
+        data_size: 0x02,
+        args: seconds.to_be_bytes().to_vec(),
+    }
+}
+
+pub fn decode_razer_sleep_timeout(args: &[u8]) -> Option<u16> {
+    if args.len() < 2 {
+        return None;
+    }
+    let secs = u16::from_be_bytes([args[0], args[1]]);
+    (secs > 0).then_some(secs)
+}
+
 pub fn decode_razer_battery(
     level_args: &[u8],
     charging_args: Option<&[u8]>,
@@ -887,6 +913,7 @@ impl MouseDevice for RazerDevice {
             dpi_min: DPI_MIN,
             dpi_max: self.spec.max_dpi,
             dpi_step: DPI_STEP,
+            supports_xy_dpi: true,
             polling_rates_hz,
             lod_options,
             supports_debounce: false,
@@ -895,6 +922,9 @@ impl MouseDevice for RazerDevice {
             supports_motion_sync: false,
             supports_angle_snapping: false,
             supports_ripple_control: false,
+            supports_sleep_timeout: self.spec.wireless,
+            sleep_timeout_min_secs: if self.spec.wireless { 60 } else { 0 },
+            sleep_timeout_max_secs: if self.spec.wireless { 900 } else { 0 },
             supports_volatile_writes: volatile,
             flash_write_warning: (!volatile).then(|| {
                 format!(
@@ -915,6 +945,14 @@ impl MouseDevice for RazerDevice {
     }
 
     fn read_settings(&mut self) -> Result<MouseSettings> {
+        let sleep_timeout_secs = if self.spec.wireless {
+            self.request(&cmd_read_sleep_timeout(), None)
+                .ok()
+                .and_then(|a| decode_razer_sleep_timeout(&a))
+        } else {
+            None
+        };
+
         if self.spec.v4_dpi_protocol {
             let dpi_reply = self.request(&cmd_read_v4_dpi_stages(), None)?;
             let (active, stages) = decode_razer_v4_dpi_stages(&dpi_reply)
@@ -922,15 +960,18 @@ impl MouseDevice for RazerDevice {
             let poll_reply = self.request(&cmd_read_v4_polling(), None)?;
             let polling_rate_hz = decode_extended_polling_rate(&poll_reply)
                 .ok_or_else(|| self.dev_err("Could not decode Razer V4 polling rate"))?;
+            let (dpi_x, dpi_y) = stages[active];
             return Ok(MouseSettings {
-                dpi: Some(stages[active].0),
+                dpi: Some(dpi_x),
+                dpi_y: (dpi_y != dpi_x).then_some(dpi_y),
                 polling_rate_hz: Some(polling_rate_hz),
+                sleep_timeout_secs,
                 ..Default::default()
             });
         }
 
         let dpi_reply = self.request(&cmd_read_dpi(self.spec.dpi_storage_byte), None)?;
-        let (dpi_x, _) = decode_dpi(&dpi_reply)
+        let (dpi_x, dpi_y) = decode_dpi(&dpi_reply)
             .ok_or_else(|| self.dev_err("Could not decode Razer DPI reply"))?;
         let polling_rate_hz = self.read_polling_rate()?;
         let lod = if self.spec.lift_off {
@@ -943,8 +984,10 @@ impl MouseDevice for RazerDevice {
 
         Ok(MouseSettings {
             dpi: Some(dpi_x),
+            dpi_y: (dpi_y != dpi_x).then_some(dpi_y),
             polling_rate_hz: Some(polling_rate_hz),
             lod,
+            sleep_timeout_secs,
             ..Default::default()
         })
     }
@@ -953,12 +996,16 @@ impl MouseDevice for RazerDevice {
         let current = self.read_settings()?;
 
         if self.spec.v4_dpi_protocol {
-            if let Some(target_dpi) = settings.dpi {
-                if current.dpi != Some(target_dpi) {
+            if settings.dpi.is_some() || settings.dpi_y.is_some() {
+                let cur_x = current.dpi.unwrap_or(800);
+                let cur_y = current.dpi_y.unwrap_or(cur_x);
+                let target_x = settings.dpi.unwrap_or(cur_x);
+                let target_y = settings.dpi_y.or(settings.dpi).unwrap_or(cur_y);
+                if target_x != cur_x || target_y != cur_y {
                     let dpi_reply = self.request(&cmd_read_v4_dpi_stages(), None)?;
                     let (active, mut stages) = decode_razer_v4_dpi_stages(&dpi_reply)
                         .ok_or_else(|| self.dev_err("Could not decode Razer V4 DPI stages"))?;
-                    stages[active] = (target_dpi, target_dpi);
+                    stages[active] = (target_x, target_y);
                     self.request(&cmd_set_v4_dpi_stages(active, &stages), None)?;
                 }
             }
@@ -976,12 +1023,21 @@ impl MouseDevice for RazerDevice {
                     }
                 }
             }
+            if let Some(target_sleep) = settings.sleep_timeout_secs {
+                if self.spec.wireless && current.sleep_timeout_secs != Some(target_sleep) {
+                    self.request(&cmd_set_sleep_timeout(target_sleep), None)?;
+                }
+            }
             return Ok(());
         }
 
-        if let Some(target_dpi) = settings.dpi {
-            if current.dpi != Some(target_dpi) {
-                let cmd = cmd_set_dpi(target_dpi, target_dpi, self.spec.dpi_storage_byte);
+        if settings.dpi.is_some() || settings.dpi_y.is_some() {
+            let cur_x = current.dpi.unwrap_or(800);
+            let cur_y = current.dpi_y.unwrap_or(cur_x);
+            let target_x = settings.dpi.unwrap_or(cur_x);
+            let target_y = settings.dpi_y.or(settings.dpi).unwrap_or(cur_y);
+            if target_x != cur_x || target_y != cur_y {
+                let cmd = cmd_set_dpi(target_x, target_y, self.spec.dpi_storage_byte);
                 self.request(&cmd, None)?;
             }
         }
@@ -1016,6 +1072,12 @@ impl MouseDevice for RazerDevice {
         if let Some(target_lod) = settings.lod {
             if self.spec.lift_off && current.lod != Some(target_lod) {
                 self.request(&cmd_set_tracking_distance(target_lod), None)?;
+            }
+        }
+
+        if let Some(target_sleep) = settings.sleep_timeout_secs {
+            if self.spec.wireless && current.sleep_timeout_secs != Some(target_sleep) {
+                self.request(&cmd_set_sleep_timeout(target_sleep), None)?;
             }
         }
 

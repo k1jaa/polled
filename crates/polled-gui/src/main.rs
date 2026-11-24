@@ -7,6 +7,7 @@
 
 mod app;
 mod elevation;
+mod hotkeys;
 mod icon;
 mod input_lab_ui;
 mod notifications;

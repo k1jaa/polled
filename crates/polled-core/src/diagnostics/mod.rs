@@ -14,12 +14,13 @@ pub mod raw_capture;
 pub use analyzer::{
     format_diagnostic_report, snap_nominal_hz, ButtonBounceStats, ClickBounceAnalyzer,
     ClickBounceSnapshot, ClickEventRecord, DiagnosticsSnapshot, DpiCalibrationResult,
-    DpiCalibrator, DpiMeasurementSnapshot, HistogramBin, IntervalSample, MouseButtonKind,
-    PollingAnalyzer, PollingStats, PollingTarget, TimerJitterBenchmark, TrackingStats,
-    XyTracePoint, BOUNCE_THRESHOLD_MS, GRAVITY_MPS2, HISTOGRAM_BASE_BINS, PAUSE_THRESHOLD_US,
+    DpiCalibrator, DpiMeasurementSnapshot, HistogramBin, IntervalSample, KeyboardPollingAnalyzer,
+    KeyboardPollingStats, MouseButtonKind, PinnedBenchmark, PollingAnalyzer, PollingStats,
+    PollingTarget, TimerJitterBenchmark, TrackingStats, XyTracePoint, BOUNCE_THRESHOLD_MS,
+    GRAVITY_MPS2, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, PAUSE_THRESHOLD_US,
     STANDARD_RATES_HZ,
 };
-pub use export::{format_intervals_csv, render_report_png};
+pub use export::{format_intervals_csv, render_ab_comparison_png, render_report_png};
 pub use raw_capture::RawInputCaptureSession;
 
 use crate::error::Result;

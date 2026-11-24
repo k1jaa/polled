@@ -37,12 +37,14 @@ impl DryRunDevice {
             supports_volatile_writes,
             current: MouseSettings {
                 dpi: Some(800),
+                dpi_y: None,
                 polling_rate_hz: Some(1000),
                 lod: Some(LiftOffDistance::Mm10),
                 debounce_ms: Some(4),
                 motion_sync: Some(false),
                 angle_snapping: Some(false),
                 ripple_control: Some(false),
+                sleep_timeout_secs: Some(300),
             },
             simulate_next_mismatch: false,
             write_count: Arc::new(AtomicU64::new(0)),
@@ -93,6 +95,7 @@ impl MouseDevice for DryRunDevice {
             dpi_min: 50,
             dpi_max: 32000,
             dpi_step: 50,
+            supports_xy_dpi: true,
             polling_rates_hz: vec![125, 250, 500, 1000, 2000, 4000, 8000],
             lod_options: LiftOffDistance::ALL.to_vec(),
             supports_debounce: true,
@@ -101,6 +104,9 @@ impl MouseDevice for DryRunDevice {
             supports_motion_sync: true,
             supports_angle_snapping: true,
             supports_ripple_control: true,
+            supports_sleep_timeout: true,
+            sleep_timeout_min_secs: 10,
+            sleep_timeout_max_secs: 1800,
             supports_volatile_writes: self.supports_volatile_writes,
             flash_write_warning: if self.supports_volatile_writes {
                 None

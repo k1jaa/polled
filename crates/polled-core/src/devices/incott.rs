@@ -55,6 +55,7 @@ const SUB_RIPPLE: u8 = 0x02;
 const SUB_ANGLE_SNAP: u8 = 0x03;
 const SUB_MOTION_SYNC: u8 = 0x04;
 const SUB_DEBOUNCE: u8 = 0x01;
+const SUB_SLEEP: u8 = 0x03;
 
 const DPI_MIN: u16 = 50;
 const DPI_STEP: u16 = 50;
@@ -272,6 +273,7 @@ impl MouseDevice for IncottDevice {
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
+        let wireless = !self.is_wired();
         DeviceCapabilities {
             dpi_min: DPI_MIN,
             dpi_max: if self.is_paw3395 {
@@ -280,6 +282,7 @@ impl MouseDevice for IncottDevice {
                 DPI_MAX_PAW3950
             },
             dpi_step: DPI_STEP,
+            supports_xy_dpi: false,
             polling_rates_hz: if self.is_wired() {
                 RATES_WIRED.to_vec()
             } else {
@@ -296,6 +299,9 @@ impl MouseDevice for IncottDevice {
             supports_motion_sync: true,
             supports_angle_snapping: true,
             supports_ripple_control: true,
+            supports_sleep_timeout: wireless,
+            sleep_timeout_min_secs: if wireless { 10 } else { 0 },
+            sleep_timeout_max_secs: if wireless { 900 } else { 0 },
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -339,15 +345,31 @@ impl MouseDevice for IncottDevice {
         let motion_sync = read_toggle(SUB_MOTION_SYNC);
         let angle_snapping = read_toggle(SUB_ANGLE_SNAP);
         let ripple_control = read_toggle(SUB_RIPPLE);
+        let sleep_timeout_secs = if !self.is_wired() {
+            self.query(CMD_QUERY_TIMING, SUB_SLEEP, Some(SUB_SLEEP))
+                .ok()
+                .and_then(|f| {
+                    if f.len() >= 5 {
+                        let secs = u16::from_le_bytes([f[3], f[4]]);
+                        (1..=900).contains(&secs).then_some(secs)
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        };
 
         Ok(MouseSettings {
             dpi,
+            dpi_y: None,
             polling_rate_hz,
             lod,
             debounce_ms,
             motion_sync,
             angle_snapping,
             ripple_control,
+            sleep_timeout_secs,
         })
     }
 
@@ -412,6 +434,12 @@ impl MouseDevice for IncottDevice {
         if let Some(target_rip) = settings.ripple_control {
             if current.ripple_control != Some(target_rip) {
                 self.send_write(CMD_SET_SENSOR, SUB_RIPPLE, &[u8::from(target_rip)])?;
+            }
+        }
+
+        if let Some(target_sleep) = settings.sleep_timeout_secs {
+            if !self.is_wired() && current.sleep_timeout_secs != Some(target_sleep) {
+                self.send_write(CMD_SET_TIMING, SUB_SLEEP, &target_sleep.to_le_bytes())?;
             }
         }
 

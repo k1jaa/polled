@@ -207,6 +207,7 @@ impl MouseDevice for VaxeeDevice {
             dpi_min: 100,
             dpi_max: 26_000,
             dpi_step: 50,
+            supports_xy_dpi: false,
             polling_rates_hz: self.supported_polling_rates(),
             // VAXEE exposes Low (1 -> 1.0 mm) and High (2 -> 2.0 mm).
             lod_options: vec![LiftOffDistance::Mm10, LiftOffDistance::Mm20],
@@ -216,6 +217,9 @@ impl MouseDevice for VaxeeDevice {
             supports_motion_sync: false,
             supports_angle_snapping: false,
             supports_ripple_control: false,
+            supports_sleep_timeout: false,
+            sleep_timeout_min_secs: 0,
+            sleep_timeout_max_secs: 0,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",

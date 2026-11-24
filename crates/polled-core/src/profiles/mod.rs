@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 pub mod debouncer;
+pub mod game_discovery;
 pub mod matcher;
 pub mod watcher;
 
@@ -20,6 +21,9 @@ use crate::error::{PolledError, Result};
 use crate::win::PowerSchemeInfo;
 
 pub use debouncer::FocusDebouncer;
+pub use game_discovery::{
+    discover_installed_games, discover_running_apps, DiscoveredGame, GameSource,
+};
 pub use matcher::{match_profile, normalize_exe_name};
 pub use watcher::{FocusEvent, ForegroundWatcher};
 
@@ -283,12 +287,14 @@ mod tests {
             executables: vec![r"C:\Steam\cs2.exe".to_string()],
             mouse: MouseSettings {
                 dpi: Some(800),
+                dpi_y: Some(1000),
                 polling_rate_hz: Some(4000),
                 lod: Some(LiftOffDistance::Mm07),
                 debounce_ms: Some(1),
                 motion_sync: Some(false),
                 angle_snapping: Some(false),
                 ripple_control: Some(false),
+                sleep_timeout_secs: Some(300),
             },
             device_overrides: BTreeMap::from([(
                 "lamzu_compx_4k".to_string(),

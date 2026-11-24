@@ -25,6 +25,117 @@ pub enum ThemePreference {
     Light,
 }
 
+/// Global Windows hotkey combination (`RegisterHotKey`, zero keyboard hooks).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeyBinding {
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(default)]
+    pub shift: bool,
+    /// Key name: `"A"`..=`"Z"`, `"0"`..=`"9"`, or `"F1"`..=`"F12"`.
+    pub key: String,
+}
+
+impl HotkeyBinding {
+    pub const PRESET_KEYS: &'static [&'static str] = &[
+        "P", "L", "I", "K", "M", "1", "2", "3", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    ];
+
+    pub fn new(ctrl: bool, alt: bool, shift: bool, key: &str) -> Self {
+        Self {
+            ctrl,
+            alt,
+            shift,
+            key: key.to_ascii_uppercase(),
+        }
+    }
+
+    pub fn display_label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.alt {
+            parts.push("Alt");
+        }
+        if self.shift {
+            parts.push("Shift");
+        }
+        parts.push(self.key.as_str());
+        parts.join("+")
+    }
+
+    /// Maps `key` to its Win32 virtual-key code (`VK_*`).
+    pub fn win32_vk(&self) -> Option<u32> {
+        let k = self.key.trim().to_ascii_uppercase();
+        if k.len() == 1 {
+            let b = k.as_bytes()[0];
+            if b.is_ascii_uppercase() || b.is_ascii_digit() {
+                return Some(u32::from(b));
+            }
+        }
+        if let Some(num) = k.strip_prefix('F').and_then(|s| s.parse::<u32>().ok()) {
+            if (1..=12).contains(&num) {
+                return Some(0x70 + (num - 1));
+            }
+        }
+        None
+    }
+
+    /// Win32 `MOD_*` bitmask (`MOD_ALT=1`, `MOD_CONTROL=2`, `MOD_SHIFT=4`, `MOD_NOREPEAT=0x4000`).
+    pub fn win32_modifiers(&self) -> u32 {
+        let mut m = 0x4000u32; // MOD_NOREPEAT
+        if self.alt {
+            m |= 0x0001;
+        }
+        if self.ctrl {
+            m |= 0x0002;
+        }
+        if self.shift {
+            m |= 0x0004;
+        }
+        m
+    }
+}
+
+/// Optional global desktop hotkeys (disabled by default so Polled never intercepts keys unexpectedly).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_hotkey_cycle")]
+    pub cycle_profile: Option<HotkeyBinding>,
+    #[serde(default = "default_hotkey_lock")]
+    pub toggle_lock: Option<HotkeyBinding>,
+    #[serde(default = "default_hotkey_lab")]
+    pub toggle_input_lab: Option<HotkeyBinding>,
+}
+
+fn default_hotkey_cycle() -> Option<HotkeyBinding> {
+    Some(HotkeyBinding::new(true, true, false, "P"))
+}
+
+fn default_hotkey_lock() -> Option<HotkeyBinding> {
+    Some(HotkeyBinding::new(true, true, false, "L"))
+}
+
+fn default_hotkey_lab() -> Option<HotkeyBinding> {
+    Some(HotkeyBinding::new(true, true, false, "I"))
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cycle_profile: default_hotkey_cycle(),
+            toggle_lock: default_hotkey_lock(),
+            toggle_input_lab: default_hotkey_lab(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_schema_version")]
@@ -33,6 +144,8 @@ pub struct AppSettings {
     pub theme: ThemePreference,
     #[serde(default)]
     pub auto_switch_on_startup: bool,
+    #[serde(default)]
+    pub hotkeys: HotkeyConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -45,6 +158,7 @@ impl Default for AppSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             theme: ThemePreference::Dark,
             auto_switch_on_startup: false,
+            hotkeys: HotkeyConfig::default(),
         }
     }
 }
@@ -128,9 +242,28 @@ mod tests {
             schema_version: SETTINGS_SCHEMA_VERSION,
             theme: ThemePreference::Light,
             auto_switch_on_startup: true,
+            hotkeys: HotkeyConfig {
+                enabled: true,
+                cycle_profile: Some(HotkeyBinding::new(true, true, false, "F8")),
+                toggle_lock: Some(HotkeyBinding::new(true, true, false, "L")),
+                toggle_input_lab: None,
+            },
         };
         custom.save_atomic(&path).unwrap();
         assert_eq!(AppSettings::load_or_default(&path), custom);
+        assert_eq!(
+            custom.hotkeys.cycle_profile.as_ref().unwrap().win32_vk(),
+            Some(0x77)
+        );
+        assert_eq!(
+            custom
+                .hotkeys
+                .cycle_profile
+                .as_ref()
+                .unwrap()
+                .display_label(),
+            "Ctrl+Alt+F8"
+        );
     }
 
     #[test]

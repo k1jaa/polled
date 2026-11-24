@@ -16,6 +16,26 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.5.0] - 2026-11-24
+
+### Added
+- **Smart Game Picker (`profiles/game_discovery.rs` + GUI modal):**
+  - One-click `.exe` discovery from installed **Steam** libraries (`libraryfolders.vdf` + `appmanifest_*.acf`), **Riot Games** (`VALORANT`, `League of Legends`), **Epic Games Launcher** (`Manifests\*.item`), and currently running user apps (filtered free of Windows OS background services).
+- **Richer System Tray Menu & Profile Lock:**
+  - Added read-only active profile & live wireless battery % status header, dynamic **Switch Profile** submenu, and **Lock Current Profile** toggle (pauses automatic focus switches while holding the active profile) directly in the system tray and Profiles card.
+- **Anti-Cheat-Safe Global Hotkeys (`hotkeys.rs` + `settings.rs`):**
+  - Optional Win32 `RegisterHotKey` desktop shortcuts (zero keyboard hooks, off by default) for **Cycle Next Profile**, **Lock / Unlock Profile**, and **Start / Stop Input Lab Capture**, persisted in `settings.json` with a monochrome GUI configuration modal.
+- **Independent X/Y DPI & Wireless Idle Sleep Timeout:**
+  - Extended `MouseSettings`, `DeviceCapabilities`, `ProfilesUiState`, and verified drivers with independent vertical `dpi_y` (CompX 17B, CompX 64B, Razer Standard & V4, Keychron 8K XY, Dry-Run) and wireless `sleep_timeout_secs` (CompX 17B `0x00AD`, CompX 64B `0x87/0x07`, Razer `0x07/0x83 & 0x03`, MCHOSE `0x0A`, Incott `0x85/0x05 sub 0x03`, Keychron `0x0A`, Dry-Run).
+- **USB Mouse Port & Hub Topology Inspector (Health Check #26 + Input Lab card):**
+  - Read-only inspection of active Windows USB hubs and high-bandwidth sibling devices (`usbvideo` webcams/capture cards, `usbaudio`/`usbaudio2` DACs/mics, `USBSTOR`/`UASPStor` drives) that warns when a mouse or 4K/8K dongle sits behind an external/monitor hub or shares a hub with bandwidth-heavy peripherals.
+- **Input Lab Before (A) vs After (B) Comparison & A/B PNG Export:**
+  - Pin any Input Lab run as **Baseline (A)** with custom labels (e.g. `Front USB 4K` vs `Rear CPU USB 4K`), view live metric deltas (`Effective Hz`, `Sat ±15%`, `Median/p99`, `σ`, `Dropouts`, `Bunched`), and export a 960×560 side-by-side monochrome **A/B Diff PNG** card with paired histograms.
+- **Privacy-Safe Keyboard Scan-Rate & Chatter Tester in Input Lab:**
+  - Extends active Input Lab Raw Input capture (`RIM_TYPEKEYBOARD`) to measure keyboard scan-rate ceiling up to 8,000 Hz, fastest hold, and switch chatter (`< 25 ms`) using anonymous QPC transition timing only — zero characters or key names are ever recorded or exported.
+
+---
+
 ## [0.4.0] - 2026-11-24
 
 ### Added

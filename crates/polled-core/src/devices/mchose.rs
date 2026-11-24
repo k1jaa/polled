@@ -50,6 +50,7 @@ const MCHOSE_V3_PIDS: &[u16] = &[
 ];
 
 const CMD_BATTERY: u8 = 0x06;
+const CMD_SET_SLEEP: u8 = 0x0A;
 const CMD_SET_PERFORMANCE: u8 = 0x42;
 const CMD_WRITE_CONFIG: u8 = 0x57;
 const CMD_READ_CONFIG: u8 = 0x67;
@@ -203,6 +204,7 @@ pub struct MchoseConfig {
     pub angle_snapping: bool,
     pub ripple_control: bool,
     pub debounce_ms: u8,
+    pub sleep_minutes: u8,
 }
 
 pub fn decode_mchose_config(payload: &[u8]) -> Option<MchoseConfig> {
@@ -230,6 +232,7 @@ pub fn decode_mchose_config(payload: &[u8]) -> Option<MchoseConfig> {
         angle_snapping: (sensor & SENSOR_LINEAR) != 0,
         motion_sync: (sensor & SENSOR_MOTION_SYNC) != 0,
         debounce_ms: payload[18],
+        sleep_minutes: payload[19],
     })
 }
 
@@ -479,6 +482,7 @@ impl MouseDevice for MchoseDevice {
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
+        let wireless = !self.is_wired();
         let lod_options = if self.product.is_none_or(|p| p.has_07mm_lod) {
             LiftOffDistance::ALL.to_vec()
         } else {
@@ -488,6 +492,7 @@ impl MouseDevice for MchoseDevice {
             dpi_min: DPI_MIN,
             dpi_max: self.product.map_or(26_000, |p| p.dpi_max),
             dpi_step: DPI_STEP,
+            supports_xy_dpi: false,
             polling_rates_hz: self.supported_rates().to_vec(),
             lod_options,
             supports_debounce: true,
@@ -496,6 +501,9 @@ impl MouseDevice for MchoseDevice {
             supports_motion_sync: true,
             supports_angle_snapping: true,
             supports_ripple_control: true,
+            supports_sleep_timeout: wireless,
+            sleep_timeout_min_secs: if wireless { 60 } else { 0 },
+            sleep_timeout_max_secs: if wireless { 1800 } else { 0 },
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists profile settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -533,12 +541,15 @@ impl MouseDevice for MchoseDevice {
 
         Ok(MouseSettings {
             dpi: Some(cfg.dpi_stages[stage_idx]),
+            dpi_y: None,
             polling_rate_hz,
             lod,
             debounce_ms: Some(cfg.debounce_ms),
             motion_sync: Some(cfg.motion_sync),
             angle_snapping: Some(cfg.angle_snapping),
             ripple_control: Some(cfg.ripple_control),
+            sleep_timeout_secs: (!wired && cfg.sleep_minutes > 0)
+                .then(|| u16::from(cfg.sleep_minutes) * 60),
         })
     }
 
@@ -631,6 +642,20 @@ impl MouseDevice for MchoseDevice {
             );
             self.send_report(MCHOSE_SHORT_REPORT_ID, &perf, MCHOSE_SHORT_TOKENS)?;
             thread::sleep(Duration::from_millis(PERFORMANCE_SETTLE_MS));
+        }
+
+        if let Some(target_sleep) = settings.sleep_timeout_secs {
+            if !wired {
+                let target_mins = ((target_sleep.saturating_add(30)) / 60).clamp(1, 255) as u8;
+                if target_mins != cfg.sleep_minutes {
+                    self.send_report(
+                        MCHOSE_SHORT_REPORT_ID,
+                        &[CMD_SET_SLEEP, 1, target_mins],
+                        MCHOSE_SHORT_TOKENS,
+                    )?;
+                    thread::sleep(Duration::from_millis(WRITE_SETTLE_MS));
+                }
+            }
         }
 
         Ok(())

@@ -552,6 +552,7 @@ impl MouseDevice for Hidpp20Device {
             dpi_min: self.dpi_range.dpi_min,
             dpi_max: self.dpi_range.dpi_max,
             dpi_step: self.dpi_range.dpi_step,
+            supports_xy_dpi: false,
             polling_rates_hz: self.polling_rates_hz.clone(),
             lod_options: self.lod_options.clone(),
             supports_debounce: false,
@@ -560,6 +561,9 @@ impl MouseDevice for Hidpp20Device {
             supports_motion_sync: false,
             supports_angle_snapping: false,
             supports_ripple_control: false,
+            supports_sleep_timeout: false,
+            sleep_timeout_min_secs: 0,
+            sleep_timeout_max_secs: 0,
             supports_volatile_writes: true,
             flash_write_warning: None,
         }

@@ -8,8 +8,8 @@ use std::sync::Mutex;
 use crate::error::{PolledError, Result};
 use crate::win::{
     AccessibilityKind, DisplayModeInfo, MouseAccelParams, PowerSchemeInfo, PowerValueIndex,
-    ProcessSample, RegHive, SystemEnv, TimerResolutionSample, UsbControllerInfo, UsbPowerDevice,
-    WindowsVersion,
+    ProcessSample, RegHive, SystemEnv, TimerResolutionSample, UsbControllerInfo, UsbMouseTopology,
+    UsbPowerDevice, WindowsVersion,
 };
 
 #[derive(Debug, Clone)]
@@ -34,6 +34,7 @@ struct MockState {
     timer_sample: TimerResolutionSample,
     usb_power_devices: Vec<UsbPowerDevice>,
     usb_controllers: Vec<UsbControllerInfo>,
+    usb_topology: Vec<UsbMouseTopology>,
     require_elevation_for_power_writes: bool,
 }
 
@@ -95,6 +96,7 @@ impl Default for MockState {
                 name: "USB xHCI Compliant Host Controller".to_string(),
                 msi_supported: Some(true),
             }],
+            usb_topology: Vec::new(),
             require_elevation_for_power_writes: false,
         }
     }
@@ -147,6 +149,10 @@ impl MockEnv {
 
     pub fn set_usb_controllers(&self, controllers: Vec<UsbControllerInfo>) {
         self.state.lock().unwrap().usb_controllers = controllers;
+    }
+
+    pub fn set_usb_topology(&self, topology: Vec<UsbMouseTopology>) {
+        self.state.lock().unwrap().usb_topology = topology;
     }
 
     pub fn set_require_elevation_for_power_writes(&self, required: bool) {
@@ -389,5 +395,9 @@ impl SystemEnv for MockEnv {
 
     fn list_usb_controllers(&self) -> Result<Vec<UsbControllerInfo>> {
         Ok(self.state.lock().unwrap().usb_controllers.clone())
+    }
+
+    fn list_usb_topology(&self) -> Result<Vec<UsbMouseTopology>> {
+        Ok(self.state.lock().unwrap().usb_topology.clone())
     }
 }

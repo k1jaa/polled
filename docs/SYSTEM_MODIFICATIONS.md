@@ -7,7 +7,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 
 ---
 
-## 1. Built-In Health Checks & Optional Tweaks (25 Total)
+## 1. Built-In Health Checks & Optional Tweaks (26 Total)
 
 ### 1.1 Core Mouse & Cursor Input
 
@@ -26,6 +26,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 | `usb_selective_suspend` | Fixable | `powrprof.dll` active scheme → Subgroup `2a737441-1930-4402-8d77-b2bebba308a3` → Setting `48e6b7a6-50f5-4782-a5d4-53bb8f07e226` | AC index = `0` (Disabled); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
 | `usb_power_management` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_...` & `ROOT_HUB20/30` (`EnhancedPowerManagementEnabled`, `SelectiveSuspendEnabled`, `AllowIdleIrpInD3`, `WDF\IdleInWorkingState`) | *None (never modifies)* | No admin | N/A |
 | `usb_xhci_msi` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\...\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties\MSISupported` where `Service == USBXHCI` | *None (never modifies)* | No admin | N/A |
+| `usb_topology` | **Report-Only** | Reads active `HKLM\SYSTEM\CurrentControlSet\Services\{USBHUB3,usbhub,usbccgp,hidusb,usbvideo,usbaudio,usbaudio2,USBSTOR,UASPStor}\Enum` + `Enum\USB\*\LocationInformation` & `ParentIdPrefix` to map connected mice to hubs & sibling heavy devices | *None (never modifies)* | No admin | N/A |
 | `pcie_aspm` | Fixable | `powrprof.dll` active scheme → Subgroup `501a4d13-42af-4429-9fd1-a8218c268e20` → Setting `ee12f906-d277-404b-b6da-e5fa1a576df5` | AC index = `0` (Off); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
 | `power_plan` | Fixable | `powrprof.dll` `PowerSetActiveScheme` | Switches active scheme to High Performance (`8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c`) / Ultimate Performance / Balanced (if on Power Saver) | No admin / Immediate | Calls `PowerSetActiveScheme` with original scheme GUID |
 | `cpu_processor_state` | Fixable | `powrprof.dll` active scheme → Subgroup `54533251-82be-4824-96c1-47b60b740d00` → Setting `bc5038f7-23e0-4960-96da-33abaf5935ec` (`PROCTHROTTLEMAX`) | AC index = `100` (%); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
@@ -91,7 +92,7 @@ All persistent files created by Polled live under **`%LOCALAPPDATA%\Polled\`**:
 | `baseline_snapshot.json` | Atomic pre-change backup of every Windows setting modified by Polled, used by **Undo** / **Undo All**. |
 | `state.json` | Last scanned Windows build number and previous check severities for Windows Update regression alerts. |
 | `profiles.json` | User-created per-game mouse profiles, per-mouse overrides, and focus debounce delay. |
-| `settings.json` | UI theme (`dark` / `light`) and whether Auto-Switch starts enabled on launch. |
+| `settings.json` | UI theme (`dark` / `light`), Auto-Switch startup toggle, and optional global hotkey bindings (`RegisterHotKey`, disabled by default). |
 | `custom_tweaks.json` | User-defined custom reversible registry tweaks. |
 | `exports/` | Optional user-triggered Input Lab PNG benchmark cards (`polled_lab_*.png`) and CSV raw interval exports (`polled_lab_*.csv`). |
 

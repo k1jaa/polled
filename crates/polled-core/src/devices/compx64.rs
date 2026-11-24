@@ -60,6 +60,7 @@ const PAGE_PROFILE: u8 = 0x01;
 const CMD_READ_FIRMWARE: u8 = 0x81;
 const CMD_READ_BATTERY: u8 = 0x83;
 const CMD_READ_ACTIVE_PROFILE: u8 = 0x85;
+const CMD_READ_SLEEP: u8 = 0x87;
 const CMD_READ_DEBOUNCE: u8 = 0x88;
 const CMD_READ_PAIRED_PRODUCT: u8 = 0x8B;
 
@@ -74,9 +75,11 @@ const CMD_READ_RIPPLE_CONTROL: u8 = 0x8A;
 const CMD_WRITE_POLLING: u8 = 0x00;
 const CMD_WRITE_DPI_STAGES: u8 = 0x01;
 const CMD_WRITE_ANGLE_SNAPPING: u8 = 0x04;
+const CMD_WRITE_SLEEP: u8 = 0x07;
 const CMD_WRITE_LOD: u8 = 0x08;
 const CMD_WRITE_MOTION_SYNC: u8 = 0x09;
 const CMD_WRITE_RIPPLE_CONTROL: u8 = 0x0A;
+const CMD_WRITE_SEPARATE_AXES: u8 = 0x0D;
 const CMD_WRITE_DEBOUNCE: u8 = 0x08;
 
 const DPI_STEP: u16 = 50;
@@ -672,6 +675,7 @@ impl MouseDevice for Compx64Device {
             dpi_min: DPI_STEP,
             dpi_max: self.spec.max_dpi,
             dpi_step: DPI_STEP,
+            supports_xy_dpi: true,
             polling_rates_hz: self.spec.polling_rates.to_vec(),
             lod_options: LiftOffDistance::ALL.to_vec(),
             supports_debounce: true,
@@ -680,6 +684,9 @@ impl MouseDevice for Compx64Device {
             supports_motion_sync: true,
             supports_angle_snapping: true,
             supports_ripple_control: true,
+            supports_sleep_timeout: self.spec.wireless,
+            sleep_timeout_min_secs: if self.spec.wireless { 10 } else { 0 },
+            sleep_timeout_max_secs: if self.spec.wireless { 3600 } else { 0 },
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} writes profile settings to onboard flash. Polled diffs unchanged fields and rate-limits rapid writes.",
@@ -731,6 +738,9 @@ impl MouseDevice for Compx64Device {
             .saturating_sub(1)
             .min(stages.len().saturating_sub(1));
         let dpi = stages.get(active_idx).map(|s| s.x);
+        let dpi_y = stages
+            .get(active_idx)
+            .and_then(|s| (s.y != s.x).then_some(s.y));
 
         let poll_reply = self.request(
             self.spec.mouse_target,
@@ -803,14 +813,36 @@ impl MouseDevice for Compx64Device {
             .and_then(|r| r.get(1).copied())
             .map(|v| v != 0);
 
+        let sleep_timeout_secs = if self.spec.wireless {
+            self.request(
+                self.spec.mouse_target,
+                PAGE_DEVICE,
+                CMD_READ_SLEEP,
+                0x03,
+                &[profile],
+            )
+            .ok()
+            .and_then(|r| {
+                if r.len() < 3 {
+                    return None;
+                }
+                let secs = u16::from_be_bytes([r[1], r[2]]);
+                (secs > 0 && secs < 0xFF00).then_some(secs)
+            })
+        } else {
+            None
+        };
+
         Ok(MouseSettings {
             dpi,
+            dpi_y,
             polling_rate_hz,
             lod,
             debounce_ms,
             motion_sync,
             angle_snapping,
             ripple_control,
+            sleep_timeout_secs,
         })
     }
 
@@ -818,8 +850,12 @@ impl MouseDevice for Compx64Device {
         let current = self.read_settings()?;
         let profile = self.read_active_profile();
 
-        if let Some(target_dpi) = settings.dpi {
-            if current.dpi != Some(target_dpi) {
+        if settings.dpi.is_some() || settings.dpi_y.is_some() {
+            let cur_x = current.dpi.unwrap_or(800);
+            let cur_y = current.dpi_y.unwrap_or(cur_x);
+            let target_x = settings.dpi.unwrap_or(cur_x);
+            let target_y = settings.dpi_y.or(settings.dpi).unwrap_or(cur_y);
+            if target_x != cur_x || target_y != cur_y {
                 let stages_reply = self.request(
                     self.spec.mouse_target,
                     PAGE_PROFILE,
@@ -842,9 +878,16 @@ impl MouseDevice for Compx64Device {
                     .saturating_sub(1)
                     .min(stages.len() - 1);
                 stages[active_idx] = Compx64DpiStage {
-                    x: target_dpi,
-                    y: target_dpi,
+                    x: target_x,
+                    y: target_y,
                 };
+
+                let _ = self.write_profile_cmd(
+                    PAGE_PROFILE,
+                    CMD_WRITE_SEPARATE_AXES,
+                    profile,
+                    &[u8::from(target_x != target_y)],
+                );
 
                 let mut payload = Vec::with_capacity(1 + stages.len() * 4);
                 payload.push(stages.len() as u8);
@@ -910,6 +953,17 @@ impl MouseDevice for Compx64Device {
                     CMD_WRITE_RIPPLE_CONTROL,
                     profile,
                     &[u8::from(target_rip)],
+                )?;
+            }
+        }
+
+        if let Some(target_sleep) = settings.sleep_timeout_secs {
+            if self.spec.wireless && current.sleep_timeout_secs != Some(target_sleep) {
+                self.write_profile_cmd(
+                    PAGE_DEVICE,
+                    CMD_WRITE_SLEEP,
+                    profile,
+                    &target_sleep.to_be_bytes(),
                 )?;
             }
         }

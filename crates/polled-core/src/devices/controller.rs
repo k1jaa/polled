@@ -203,12 +203,14 @@ mod tests {
 
         let desired = MouseSettings {
             dpi: Some(1600),
+            dpi_y: None,
             polling_rate_hz: Some(4000),
             lod: Some(LiftOffDistance::Mm07),
             debounce_ms: Some(2),
             motion_sync: Some(true),
             angle_snapping: Some(false),
             ripple_control: Some(false),
+            sleep_timeout_secs: Some(300),
         };
         let outcome = ctrl.apply_profile_settings(&desired).unwrap();
         assert_eq!(

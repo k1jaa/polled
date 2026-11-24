@@ -47,6 +47,7 @@ const CMD_READ_XY: u8 = 0x49;
 
 const SET_VERSION: u8 = 0x02;
 const SET_RECEIVER_STATE: u8 = 0x03;
+const SET_SLEEP: u8 = 0x0A;
 const SET_DPI: u8 = 0x40;
 const SET_POLLING: u8 = 0x41;
 const SET_SENSOR: u8 = 0x42;
@@ -181,6 +182,7 @@ pub struct KeychronStatus {
     pub motion_sync: bool,
     pub scroll_reversed: bool,
     pub debounce_ms: u8,
+    pub sleep_minutes: u8,
     pub battery_percent: u8,
     pub charging: bool,
     pub polling_table: [u8; POLLING_GEARS],
@@ -243,6 +245,7 @@ pub fn decode_keychron_status(
         motion_sync: (flags_byte & 0x10) != 0,
         scroll_reversed: (flags_byte & 0x40) != 0,
         debounce_ms: bytes[17],
+        sleep_minutes: bytes[18],
         battery_percent: bytes[19] & 0x7F,
         charging: (bytes[19] & 0x80) != 0,
         polling_table,
@@ -530,10 +533,15 @@ impl MouseDevice for KeychronDevice {
             vec![LiftOffDistance::Mm10, LiftOffDistance::Mm20]
         };
 
+        let wireless = self.work_mode != 0;
+        let supports_xy_dpi =
+            (self.ver_flags[2] & 0x01) != 0 || self.proto_version < FLAGS_IN_VERSION_REPLY;
+
         DeviceCapabilities {
             dpi_min: self.model.map_or(100, |m| m.dpi_min),
             dpi_max: self.cached_dpi_max,
             dpi_step: self.cached_dpi_step,
+            supports_xy_dpi,
             polling_rates_hz,
             lod_options,
             supports_debounce: true,
@@ -542,6 +550,9 @@ impl MouseDevice for KeychronDevice {
             supports_motion_sync: !no_sensor,
             supports_angle_snapping: !no_sensor,
             supports_ripple_control: !no_sensor,
+            supports_sleep_timeout: wireless,
+            sleep_timeout_min_secs: if wireless { 60 } else { 0 },
+            sleep_timeout_max_secs: if wireless { 14_400 } else { 0 },
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists profile settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -567,6 +578,7 @@ impl MouseDevice for KeychronDevice {
         let level = self.active_level_byte(&st);
         let mut active_stage = usize::from(level & 0x0F).min(usize::from(st.stage_count) - 1);
         let mut dpi = st.dpi_stages[active_stage];
+        let mut dpi_y = None;
 
         if st.feature_separate_dpi {
             if let Ok(xy) = self.query_cmd(&[CMD_READ_XY], |b| b.first() == Some(&CMD_READ_XY)) {
@@ -576,6 +588,13 @@ impl MouseDevice for KeychronDevice {
                     active_stage = usize::from(xy[mode_idx] & 0x0F).min(count - 1);
                     let off = 5 + active_stage * 2;
                     dpi = u16::from_le_bytes([xy[off], xy[off + 1]]);
+                    let y_off = 21 + active_stage * 2;
+                    if xy.len() >= y_off + 2 {
+                        let y = u16::from_le_bytes([xy[y_off], xy[y_off + 1]]);
+                        if y > 0 && y != dpi {
+                            dpi_y = Some(y);
+                        }
+                    }
                 }
             }
         }
@@ -604,15 +623,20 @@ impl MouseDevice for KeychronDevice {
         } else {
             decode_keychron_lod_code(st.lod_code)
         };
+        let sleep_timeout_secs =
+            (self.work_mode != 0 && st.sleep_minutes > 0 && st.sleep_minutes < 0xFF)
+                .then(|| u16::from(st.sleep_minutes) * 60);
 
         Ok(MouseSettings {
             dpi: Some(dpi),
+            dpi_y,
             polling_rate_hz,
             lod,
             debounce_ms: Some(st.debounce_ms),
             motion_sync: (!no_sensor).then_some(st.motion_sync),
             angle_snapping: (!no_sensor).then_some(st.angle_snapping),
             ripple_control: (!no_sensor).then_some(st.ripple_control),
+            sleep_timeout_secs,
         })
     }
 
@@ -620,41 +644,48 @@ impl MouseDevice for KeychronDevice {
         let st = self.read_status()?;
         let level = self.active_level_byte(&st);
 
-        if let Some(target_dpi) = settings.dpi {
+        if settings.dpi.is_some() || settings.dpi_y.is_some() {
             if st.feature_separate_dpi {
                 let xy = self.query_cmd(&[CMD_READ_XY], |b| b.first() == Some(&CMD_READ_XY))?;
                 if xy.len() >= 38 {
                     let count = if xy[4] == 0 { 5 } else { xy[4].min(5) };
                     let mode_idx = 1 + usize::from(self.work_mode).min(2);
                     let active = (xy[mode_idx] & 0x0F).min(count - 1);
-                    let mut pkt = [0u8; CMD_PACKET_LEN];
-                    let copy_n = xy.len().min(CMD_PACKET_LEN);
-                    pkt[..copy_n].copy_from_slice(&xy[..copy_n]);
-                    pkt[0] = CMD_WRITE_XY;
-                    let stage_byte = if self.proto_version >= FLAGS_IN_VERSION_REPLY {
-                        active
-                    } else {
-                        (active << 4) | active
-                    };
-                    pkt[1] = stage_byte;
-                    pkt[2] = stage_byte;
-                    pkt[3] = stage_byte;
-                    pkt[4] = count;
-                    let le = target_dpi.to_le_bytes();
                     let x_off = 5 + usize::from(active) * 2;
                     let y_off = 21 + usize::from(active) * 2;
-                    pkt[x_off] = le[0];
-                    pkt[x_off + 1] = le[1];
-                    pkt[y_off] = le[0];
-                    pkt[y_off + 1] = le[1];
-                    let ack = self.query_cmd(&pkt, |b| {
-                        b.first() == Some(&ACK_BYTE) && b.get(2) == Some(&CMD_WRITE_XY)
-                    })?;
-                    if ack.get(1).copied().unwrap_or(0) != 0 {
-                        return Err(self.dev_err("Keychron rejected 0x48 XY DPI write"));
+                    let cur_x = u16::from_le_bytes([xy[x_off], xy[x_off + 1]]);
+                    let cur_y = u16::from_le_bytes([xy[y_off], xy[y_off + 1]]);
+                    let target_x = settings.dpi.unwrap_or(cur_x);
+                    let target_y = settings.dpi_y.or(settings.dpi).unwrap_or(cur_y);
+                    if target_x != cur_x || target_y != cur_y {
+                        let mut pkt = [0u8; CMD_PACKET_LEN];
+                        let copy_n = xy.len().min(CMD_PACKET_LEN);
+                        pkt[..copy_n].copy_from_slice(&xy[..copy_n]);
+                        pkt[0] = CMD_WRITE_XY;
+                        let stage_byte = if self.proto_version >= FLAGS_IN_VERSION_REPLY {
+                            active
+                        } else {
+                            (active << 4) | active
+                        };
+                        pkt[1] = stage_byte;
+                        pkt[2] = stage_byte;
+                        pkt[3] = stage_byte;
+                        pkt[4] = count;
+                        let x_le = target_x.to_le_bytes();
+                        let y_le = target_y.to_le_bytes();
+                        pkt[x_off] = x_le[0];
+                        pkt[x_off + 1] = x_le[1];
+                        pkt[y_off] = y_le[0];
+                        pkt[y_off + 1] = y_le[1];
+                        let ack = self.query_cmd(&pkt, |b| {
+                            b.first() == Some(&ACK_BYTE) && b.get(2) == Some(&CMD_WRITE_XY)
+                        })?;
+                        if ack.get(1).copied().unwrap_or(0) != 0 {
+                            return Err(self.dev_err("Keychron rejected 0x48 XY DPI write"));
+                        }
                     }
                 }
-            } else {
+            } else if let Some(target_dpi) = settings.dpi {
                 let active = (level & 0x0F).min(st.stage_count - 1);
                 let mut stages = st.dpi_stages;
                 if stages[usize::from(active)] != target_dpi {
@@ -719,6 +750,24 @@ impl MouseDevice for KeychronDevice {
                 pkt[0] = SET_DEBOUNCE;
                 pkt[1] = target_db;
                 self.write_settings(&pkt)?;
+            }
+        }
+
+        if let Some(target_sleep) = settings.sleep_timeout_secs {
+            if self.work_mode != 0 {
+                const STOPS_MIN: [u8; 9] = [1, 3, 5, 10, 15, 30, 60, 120, 240];
+                let raw_mins = ((target_sleep.saturating_add(30)) / 60).clamp(1, 240) as u8;
+                let snapped_mins = STOPS_MIN
+                    .into_iter()
+                    .min_by_key(|&m| m.abs_diff(raw_mins))
+                    .unwrap_or(5);
+                if snapped_mins != st.sleep_minutes {
+                    let mut pkt = [0u8; SET_PACKET_LEN];
+                    pkt[0] = SET_SLEEP;
+                    pkt[1] = 1;
+                    pkt[2] = snapped_mins;
+                    self.write_settings(&pkt)?;
+                }
             }
         }
 

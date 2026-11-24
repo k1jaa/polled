@@ -280,9 +280,13 @@ impl MouseDevice for FinalmouseDevice {
             supports_debounce: false,
             debounce_min_ms: 0,
             debounce_max_ms: 0,
+            supports_xy_dpi: false,
             supports_motion_sync: true,
             supports_angle_snapping: false,
             supports_ripple_control: false,
+            supports_sleep_timeout: false,
+            sleep_timeout_min_secs: 0,
+            sleep_timeout_max_secs: 0,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -315,12 +319,14 @@ impl MouseDevice for FinalmouseDevice {
         };
         Ok(MouseSettings {
             dpi: t.dpi,
+            dpi_y: None,
             polling_rate_hz: t.polling_rate_hz,
             lod,
             debounce_ms: None,
             motion_sync: t.motion_sync,
             angle_snapping: None,
             ripple_control: None,
+            sleep_timeout_secs: None,
         })
     }
 
