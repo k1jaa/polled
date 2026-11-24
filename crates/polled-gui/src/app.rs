@@ -17,7 +17,7 @@ use polled_core::{
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
 use crate::hotkeys::{HotkeyAction, HotkeyManager};
-use crate::input_lab_ui::InputLabUiState;
+use crate::input_lab_ui::{InputLabNavAction, InputLabUiState};
 use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
 use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::profiles_ui::ProfilesUiState;
@@ -1031,7 +1031,25 @@ impl eframe::App for PolledApp {
                         .and_then(|s| s.active_devices.first())
                         .and_then(|d| d.settings.as_ref())
                         .and_then(|st| st.dpi);
-                    self.input_lab_ui.render(ctx, ui, p, mode, detected_dpi);
+                    let health_checks: &[CheckReport] = self
+                        .summary
+                        .as_ref()
+                        .map(|s| s.checks.as_slice())
+                        .unwrap_or(&[]);
+                    if let Some(nav) =
+                        self.input_lab_ui
+                            .render(ctx, ui, p, mode, detected_dpi, health_checks)
+                    {
+                        match nav {
+                            InputLabNavAction::OpenHealthCheck => {
+                                self.active_view = ActiveView::HealthCheck;
+                                self.filter = FilterMode::Issues;
+                            }
+                            InputLabNavAction::OpenProfiles => {
+                                self.active_view = ActiveView::Profiles;
+                            }
+                        }
+                    }
                     return;
                 }
 

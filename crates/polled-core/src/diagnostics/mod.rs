@@ -12,9 +12,10 @@ pub mod export;
 pub mod raw_capture;
 
 pub use analyzer::{
-    format_diagnostic_report, snap_nominal_hz, ButtonBounceStats, ClickBounceAnalyzer,
-    ClickBounceSnapshot, ClickEventRecord, DiagnosticsSnapshot, DpiCalibrationResult,
-    DpiCalibrator, DpiMeasurementSnapshot, HistogramBin, IntervalSample, KeyboardPollingAnalyzer,
+    build_diagnostic_advice, format_advice_summary, format_diagnostic_report, snap_nominal_hz,
+    ButtonBounceStats, ClickBounceAnalyzer, ClickBounceSnapshot, ClickEventRecord,
+    DiagnosticAdvice, DiagnosticsSnapshot, DpiCalibrationResult, DpiCalibrator,
+    DpiMeasurementSnapshot, HistogramBin, IntervalSample, KeyboardPollingAnalyzer,
     KeyboardPollingStats, MouseButtonKind, PinnedBenchmark, PollingAnalyzer, PollingStats,
     PollingTarget, TimerJitterBenchmark, TrackingStats, XyTracePoint, BOUNCE_THRESHOLD_MS,
     GRAVITY_MPS2, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, PAUSE_THRESHOLD_US,

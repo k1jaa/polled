@@ -18,15 +18,22 @@ use eframe::egui::{
 };
 use polled_core::win::{SystemEnv, UsbMouseTopology, WindowsEnv};
 use polled_core::{
-    format_audio_benchmark_summary, format_diagnostic_report, format_intervals_csv,
-    render_ab_comparison_png, render_report_png, run_audio_latency_benchmark,
-    run_timer_jitter_benchmark, AppPaths, AudioLatencyBenchmark, DiagnosticsSnapshot,
-    PinnedBenchmark, PollingStats, PollingTarget, RawInputCaptureSession, Severity,
-    TimerJitterBenchmark, TrackingStats, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS,
-    KEY_CHATTER_THRESHOLD_MS, STANDARD_RATES_HZ,
+    build_diagnostic_advice, format_advice_summary, format_audio_benchmark_summary,
+    format_diagnostic_report, format_intervals_csv, render_ab_comparison_png, render_report_png,
+    run_audio_latency_benchmark, run_timer_jitter_benchmark, AppPaths, AudioLatencyBenchmark,
+    CheckReport, DiagnosticAdvice, DiagnosticsSnapshot, PinnedBenchmark, PollingStats,
+    PollingTarget, RawInputCaptureSession, Severity, TimerJitterBenchmark, TrackingStats,
+    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
+
+/// Optional 1-click navigation emitted from Input Lab's Recommended Fixes card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputLabNavAction {
+    OpenHealthCheck,
+    OpenProfiles,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ChartViewMode {
@@ -407,9 +414,14 @@ impl InputLabUiState {
         p: Palette,
         mode: ThemeMode,
         detected_dpi: Option<u16>,
-    ) {
+        health_checks: &[CheckReport],
+    ) -> Option<InputLabNavAction> {
         self.poll_background();
         self.tick_timers(ctx);
+
+        if self.usb_topology.is_none() {
+            self.usb_topology = Some(WindowsEnv.list_usb_topology().unwrap_or_default());
+        }
 
         // Auto-sync configured DPI from the active detected mouse until the user edits it manually.
         if !self.dpi_manually_edited {
@@ -446,6 +458,16 @@ impl InputLabUiState {
             self.toggle_dpi_measurement(ctx);
         }
 
+        let advice = build_diagnostic_advice(
+            &self.last_snapshot,
+            self.configured_dpi,
+            self.timer_benchmark.as_ref(),
+            self.audio_benchmark.as_ref(),
+            self.usb_topology.as_deref().unwrap_or(&[]),
+            health_checks,
+        );
+        let mut nav_action: Option<InputLabNavAction> = None;
+
         // Live viewport-driven width so resizing smaller/larger immediately reflows every chart and card.
         let content_w = (ctx.screen_rect().width() - 36.0).max(320.0);
         ui.set_max_width(content_w);
@@ -458,7 +480,7 @@ impl InputLabUiState {
                 ui.set_max_width(scroll_w);
 
                 // --- 1. CONTROL & LIVE SUMMARY CARD ---
-                self.render_controls_card(ctx, ui, p, mode, scroll_w, detected_dpi);
+                self.render_controls_card(ctx, ui, p, mode, scroll_w, detected_dpi, &advice);
 
                 if let Some((sev, msg)) = self.notice.clone() {
                     ui.add_space(8.0);
@@ -474,6 +496,13 @@ impl InputLabUiState {
 
                 // --- 2. POLLING CONSISTENCY, HISTOGRAM, VELOCITY & XY TRACE CARD ---
                 self.render_polling_chart_card(ui, p, mode, scroll_w);
+
+                if !advice.is_empty() {
+                    ui.add_space(10.0);
+                    if let Some(act) = render_advice_card(ui, p, mode, scroll_w, &advice) {
+                        nav_action = Some(act);
+                    }
+                }
 
                 ui.add_space(10.0);
 
@@ -548,8 +577,11 @@ impl InputLabUiState {
 
                 ui.add_space(4.0);
             });
+
+        nav_action
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_controls_card(
         &mut self,
         ctx: &egui::Context,
@@ -558,6 +590,7 @@ impl InputLabUiState {
         mode: ThemeMode,
         card_w: f32,
         detected_dpi: Option<u16>,
+        advice: &[DiagnosticAdvice],
     ) {
         let inner_w = (card_w - 24.0).max(120.0);
         let capturing = self.is_live_capturing();
@@ -918,6 +951,10 @@ impl InputLabUiState {
             if let Some(ab) = &self.audio_benchmark {
                 report.push_str("\n\n");
                 report.push_str(&format_audio_benchmark_summary(ab));
+            }
+            if !advice.is_empty() {
+                report.push_str("\n\n");
+                report.push_str(&format_advice_summary(advice));
             }
             ctx.copy_text(report);
             self.notice = Some((
@@ -3190,6 +3227,122 @@ fn render_status_pill_rows(
             }
         });
     }
+}
+
+fn render_advice_card(
+    ui: &mut egui::Ui,
+    p: Palette,
+    mode: ThemeMode,
+    card_w: f32,
+    advice: &[DiagnosticAdvice],
+) -> Option<InputLabNavAction> {
+    let mut action: Option<InputLabNavAction> = None;
+    let inner_w = (card_w - 24.0).max(160.0);
+
+    card_frame(ui, p, card_w, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Recommended Fixes")
+                    .size(14.0)
+                    .strong()
+                    .color(p.text),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let worst = advice
+                    .iter()
+                    .map(|a| a.severity)
+                    .max()
+                    .unwrap_or(Severity::Info);
+                ui.label(
+                    RichText::new(format!(
+                        "{} ACTIONABLE TIP{}",
+                        advice.len(),
+                        if advice.len() == 1 { "" } else { "S" }
+                    ))
+                    .size(11.0)
+                    .strong()
+                    .color(p.severity_fg(worst)),
+                );
+            });
+        });
+        ui.add_space(6.0);
+
+        let item_inner_w = (inner_w - 20.0).max(140.0);
+        for (idx, item) in advice.iter().enumerate() {
+            if idx > 0 {
+                ui.add_space(6.0);
+            }
+            let fg = p.severity_fg(item.severity);
+            let bg = p.severity_bg(item.severity, mode);
+            let border = Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 110);
+
+            egui::Frame::NONE
+                .fill(bg)
+                .stroke(Stroke::new(1.0_f32, border))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_min_width(item_inner_w);
+                    ui.set_max_width(item_inner_w);
+
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(target) = item.action_target.as_deref() {
+                                let (btn_lbl, nav) = match target {
+                                    "health_check" => (
+                                        "Open Health Check",
+                                        Some(InputLabNavAction::OpenHealthCheck),
+                                    ),
+                                    "profiles" => {
+                                        ("Open Profiles", Some(InputLabNavAction::OpenProfiles))
+                                    }
+                                    _ => ("", None),
+                                };
+                                if let Some(nav_target) = nav {
+                                    if ui.add(secondary_btn(btn_lbl, p)).clicked() {
+                                        action = Some(nav_target);
+                                    }
+                                }
+                            }
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · {}",
+                                            item.severity.as_str().to_uppercase(),
+                                            item.category.to_uppercase()
+                                        ))
+                                        .size(10.5)
+                                        .strong()
+                                        .monospace()
+                                        .color(fg),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&item.title)
+                                                .size(12.5)
+                                                .strong()
+                                                .color(p.text),
+                                        )
+                                        .wrap(),
+                                    );
+                                },
+                            );
+                        });
+                    });
+                    ui.add_space(3.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&item.detail).size(11.8).color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                });
+        }
+    });
+
+    action
 }
 
 fn render_timed_progress_bar(

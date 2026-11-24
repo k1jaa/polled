@@ -10,7 +10,8 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use crate::checks::Severity;
+use crate::checks::{CheckReport, Severity};
+use crate::win::{AudioLatencyBenchmark, UsbMouseTopology};
 
 /// Maximum interval (in microseconds) treated as continuous mouse motion rather than a user pause.
 /// Any gap longer than 40 ms resets the continuous streak instead of counting as a dropout.
@@ -433,6 +434,308 @@ pub struct PinnedBenchmark {
     pub timer: Option<TimerJitterBenchmark>,
 }
 
+/// Actionable troubleshooting recommendation derived from Input Lab telemetry
+/// cross-referenced with live Windows USB topology and Health Check findings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticAdvice {
+    pub severity: Severity,
+    pub category: String,
+    pub title: String,
+    pub detail: String,
+    /// Optional Polled tab target (`"health_check"` or `"profiles"`) for 1-click navigation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_target: Option<String>,
+}
+
+/// Builds prioritized, actionable fix suggestions whenever Input Lab detects degraded polling,
+/// switch bounce, keyboard chatter, USB hub contention, timer spikes, or WASAPI audio glitches.
+pub fn build_diagnostic_advice(
+    snap: &DiagnosticsSnapshot,
+    configured_dpi: u32,
+    timer: Option<&TimerJitterBenchmark>,
+    audio: Option<&AudioLatencyBenchmark>,
+    usb_topology: &[UsbMouseTopology],
+    health_checks: &[CheckReport],
+) -> Vec<DiagnosticAdvice> {
+    let mut advice: Vec<DiagnosticAdvice> = Vec::new();
+    let p = &snap.polling;
+    let polling_bad = matches!(p.health_severity, Some(Severity::Warn | Severity::Bad));
+    let timer_bad = timer.is_some_and(|t| t.severity >= Severity::Warn);
+    let audio_bad = audio.is_some_and(|a| a.severity >= Severity::Warn);
+    let any_latency_issue = polling_bad || timer_bad || audio_bad;
+
+    // 1. Live USB Port & Hub Topology cross-check (highest impact for 2K/4K/8K mice).
+    if p.total_motion_packets > 0 || any_latency_issue {
+        for dev in usb_topology {
+            if dev.behind_external_hub {
+                advice.push(DiagnosticAdvice {
+                    severity: if polling_bad {
+                        Severity::Bad
+                    } else {
+                        Severity::Warn
+                    },
+                    category: "USB Hub".to_string(),
+                    title: format!("Move {} off external hub '{}'", dev.name, dev.hub_name),
+                    detail: "External/monitor USB hubs add transaction-translator scheduling jitter and packet bunching at 2K–8K Hz. Plug your mouse or wireless dongle directly into a rear motherboard USB port (prefer CPU-lane USB ports listed in your motherboard manual).".to_string(),
+                    action_target: None,
+                });
+            }
+            if !dev.shared_heavy_devices.is_empty() {
+                let peers: Vec<String> = dev
+                    .shared_heavy_devices
+                    .iter()
+                    .map(|d| format!("{} ({})", d.name, d.kind.label()))
+                    .collect();
+                advice.push(DiagnosticAdvice {
+                    severity: if polling_bad {
+                        Severity::Bad
+                    } else {
+                        Severity::Warn
+                    },
+                    category: "USB Bandwidth".to_string(),
+                    title: format!(
+                        "Separate {} from shared isochronous USB devices",
+                        dev.name
+                    ),
+                    detail: format!(
+                        "{} currently shares {} with {}. Isochronous audio/webcam streams contend for USB microframes and cause bunched mouse packets — move your mouse dongle to a different rear USB controller/root hub.",
+                        dev.name,
+                        dev.hub_name,
+                        peers.join(", ")
+                    ),
+                    action_target: None,
+                });
+            }
+        }
+    }
+
+    // 2. Cross-reference active Polled Health Check warnings that directly affect polling/timer/audio.
+    if any_latency_issue && !health_checks.is_empty() {
+        const LATENCY_CHECK_IDS: &[&str] = &[
+            "usb_selective_suspend",
+            "usb_power_management",
+            "usb_xhci_msi",
+            "pcie_aspm",
+            "power_plan",
+            "cpu_processor_state",
+            "mouse_data_queue_size",
+            "vendor_software",
+            "audio_enhancements",
+            "audio_format",
+        ];
+        let mut fixable_names: Vec<&str> = Vec::new();
+        let mut manual_names: Vec<&str> = Vec::new();
+        for c in health_checks {
+            if c.severity >= Severity::Warn && LATENCY_CHECK_IDS.contains(&c.id.as_str()) {
+                if c.can_fix {
+                    fixable_names.push(&c.name);
+                } else {
+                    manual_names.push(&c.name);
+                }
+            }
+        }
+        if !fixable_names.is_empty() {
+            advice.push(DiagnosticAdvice {
+                severity: Severity::Warn,
+                category: "Health Check".to_string(),
+                title: format!(
+                    "Fix {} Windows latency issue{} found in Health Check",
+                    fixable_names.len(),
+                    if fixable_names.len() == 1 { "" } else { "s" }
+                ),
+                detail: format!(
+                    "Active warnings: {}. Open the Health Check tab and apply these reversible fixes (full undo snapshot saved automatically), then re-test with Pin Baseline (A).",
+                    fixable_names.join(", ")
+                ),
+                action_target: Some("health_check".to_string()),
+            });
+        }
+        if !manual_names.is_empty() {
+            advice.push(DiagnosticAdvice {
+                severity: Severity::Info,
+                category: "Health Check".to_string(),
+                title: "Review report-only latency warnings in Health Check".to_string(),
+                detail: format!(
+                    "Detected: {}. Closing heavy background vendor suites (G HUB, Synapse, iCUE) after saving to onboard memory or disabling USB device power saving in Device Manager can reduce polling spikes.",
+                    manual_names.join(", ")
+                ),
+                action_target: Some("health_check".to_string()),
+            });
+        }
+    }
+
+    // 3. Polling-pattern-specific advice (only when polling itself is Warn or Bad).
+    if polling_bad {
+        let sev = p.health_severity.unwrap_or(Severity::Warn);
+        let nominal_hz = p.nominal_hz;
+        let nominal_us = p.nominal_interval_us.max(125.0);
+
+        let paired_coalescing =
+            p.bunch_count > 0 && (p.bunch_count as f64) >= (p.true_dropout_count as f64) * 0.4;
+        if paired_coalescing {
+            advice.push(DiagnosticAdvice {
+                severity: sev,
+                category: "USB / DPC".to_string(),
+                title: "Fix USB interrupt coalescing & bunched packets".to_string(),
+                detail: format!(
+                    "Observed {} bunched packets alongside {} delayed polls (min {:.3} ms, max {:.3} ms). Paired late + rapid-fire packets usually mean USB host-controller contention, CPU C-state wake latency, or background DPC spikes (overlays, RGB software, virtual audio/Voicemod). Try a direct rear motherboard USB port, close background overlays/RGB apps, and run the 1s OS Timer Jitter test below.",
+                    p.bunch_count,
+                    p.true_dropout_count,
+                    p.min_us / 1000.0,
+                    p.max_us / 1000.0,
+                ),
+                action_target: None,
+            });
+        }
+
+        let rf_dropout_pattern = p.true_dropout_count > 0
+            && (p.true_dropout_count > p.bunch_count || p.max_us > nominal_us * 2.5);
+        if rf_dropout_pattern {
+            advice.push(DiagnosticAdvice {
+                severity: sev,
+                category: "Wireless RF".to_string(),
+                title: "Reduce 2.4 GHz wireless interference & dongle distance".to_string(),
+                detail: "Place your wireless dongle on its USB extender cable within 15–20 cm of your mousepad with clear line-of-sight. Keep it away from 2.4 GHz Wi-Fi routers, Bluetooth adapters, and active USB 3.0 ports/drives (unshielded USB 3.0 emits strong 2.4 GHz radio noise). Also check mouse battery level (> 20%).".to_string(),
+                action_target: None,
+            });
+        }
+
+        if nominal_hz >= 4000 && (configured_dpi < 1600 || p.saturated_pct < 65.0) {
+            advice.push(DiagnosticAdvice {
+                severity: Severity::Info,
+                category: "Sensor DPI".to_string(),
+                title: format!("Use 1600–3200 DPI to saturate {nominal_hz} Hz cleanly"),
+                detail: format!(
+                    "Only {:.0}% of polls saturated {nominal_hz} Hz (at {configured_dpi} DPI). Raising DPI to 1600–3200 and lowering in-game sensitivity proportionally gives smoother {nominal_hz} Hz saturation and lower motion-initiation delay.",
+                    p.saturated_pct
+                ),
+                action_target: Some("profiles".to_string()),
+            });
+        }
+
+        if nominal_hz >= 4000 {
+            advice.push(DiagnosticAdvice {
+                severity: Severity::Info,
+                category: "Polling Rate".to_string(),
+                title: format!("Compare 2000 Hz vs {nominal_hz} Hz using Pin Baseline (A)"),
+                detail: format!(
+                    "At {nominal_hz} Hz ({:.3} ms intervals), normal Windows user-mode Raw Input scheduling (~50–70 µs) is a large fraction of a single poll slot. Pin this run as Baseline (A), switch to 2000 Hz in Profiles, and re-run — 2000 Hz often delivers tighter frame pacing and battery life with only +0.125 ms average latency.",
+                    nominal_us / 1000.0
+                ),
+                action_target: Some("profiles".to_string()),
+            });
+        }
+    }
+
+    // 4. Switch bounce / double-click faults.
+    if snap.clicks.total_bounce_faults > 0 {
+        let affected: Vec<String> = snap
+            .clicks
+            .buttons
+            .iter()
+            .filter(|b| b.bounce_faults > 0)
+            .map(|b| {
+                let min_s = b
+                    .min_release_to_press_ms
+                    .map(|v| format!(" ({v:.1} ms)"))
+                    .unwrap_or_default();
+                format!("{}{min_s}", b.button.label())
+            })
+            .collect();
+        advice.push(DiagnosticAdvice {
+            severity: Severity::Bad,
+            category: "Mouse Debounce".to_string(),
+            title: format!(
+                "Increase mouse Debounce by +2 ms ({} bounce fault{})",
+                snap.clicks.total_bounce_faults,
+                if snap.clicks.total_bounce_faults == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            detail: format!(
+                "Detected unintended rapid double-triggers on: {}. Open the Profiles tab and raise Debounce by +2 ms (e.g. 0 ms -> 2 ms or 2 ms -> 4 ms), apply, and click rapidly to confirm 0 bounce faults.",
+                affected.join(", ")
+            ),
+            action_target: Some("profiles".to_string()),
+        });
+    }
+
+    // 5. Keyboard chatter faults.
+    if snap.keyboard.chatter_faults > 0 {
+        advice.push(DiagnosticAdvice {
+            severity: Severity::Bad,
+            category: "Keyboard".to_string(),
+            title: format!(
+                "Fix keyboard switch chatter ({} fault{})",
+                snap.keyboard.chatter_faults,
+                if snap.keyboard.chatter_faults == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            detail: "A key registered a release -> press rebound faster than 25 ms. Increase keyboard debounce / Rapid Trigger release deadzone in your keyboard firmware, or clean/swap the chattering switch.".to_string(),
+            action_target: None,
+        });
+    }
+
+    // 6. OS Timer Jitter benchmark spikes.
+    if let Some(t) = timer {
+        if t.severity >= Severity::Warn {
+            advice.push(DiagnosticAdvice {
+                severity: t.severity,
+                category: "OS Timer / DPC".to_string(),
+                title: format!(
+                    "Reduce Windows timer wake spikes ({} spikes > 3 ms, max {:.2} ms)",
+                    t.spike_count_over_3ms, t.max_ms
+                ),
+                detail: "Elevated 1 ms sleep wake jitter points to background CPU/DPC load (monitoring widgets, RGB controllers, Wi-Fi/audio drivers) or aggressive power saving. Check Power Plan & PCIe ASPM in Health Check and consider testing optional Win32 Priority Separation / Global Timer Requests.".to_string(),
+                action_target: Some("health_check".to_string()),
+            });
+        }
+    }
+
+    // 7. WASAPI Audio glitches.
+    if let Some(a) = audio {
+        if a.severity >= Severity::Warn {
+            advice.push(DiagnosticAdvice {
+                severity: a.severity,
+                category: "WASAPI Audio".to_string(),
+                title: format!(
+                    "Fix WASAPI audio wake glitches ({} late callbacks, max {:.2} ms)",
+                    a.glitch_count, a.max_ms
+                ),
+                detail: "Disable Windows Audio Enhancements (APO), set both playback and microphone to 48000 Hz, avoid Bluetooth Hands-Free (HFP), and keep USB audio DACs on a separate USB root hub from 4K/8K mice or webcams.".to_string(),
+                action_target: Some("health_check".to_string()),
+            });
+        }
+    }
+
+    // Sort highest severity first (`Bad` > `Warn` > `Info`) while preserving insertion order within ties.
+    advice.sort_by_key(|a| std::cmp::Reverse(a.severity));
+    advice
+}
+
+/// Formats actionable fix recommendations as a clean plain-text block for clipboard reports.
+pub fn format_advice_summary(advice: &[DiagnosticAdvice]) -> String {
+    if advice.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["Recommended Fixes:".to_string()];
+    for item in advice {
+        lines.push(format!(
+            "  - [{}] {}: {} — {}",
+            item.severity.as_str().to_uppercase(),
+            item.category,
+            item.title,
+            item.detail
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Immutable snapshot published periodically (~30 Hz) from the capture thread to the GUI.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticsSnapshot {
@@ -832,13 +1135,22 @@ impl PollingAnalyzer {
 
         let lo_ok = nominal_interval_us * 0.85;
         let hi_ok = nominal_interval_us * 1.15;
+        // At 4K (250 us) and 8K (125 us), +/-15% is only 19-38 us — tighter than Windows'
+        // normal ~50-75 us user-mode WM_INPUT RIT scheduling floor. Grade health using a
+        // floor of +/-80 us while still reporting exact +/-15% consistency and catching every
+        // true dropout (> 1.85x) and bunched burst (< 0.35x).
+        let grade_tol_us = (nominal_interval_us * 0.15).max(80.0);
+        let grade_lo = nominal_interval_us - grade_tol_us;
+        let grade_hi = nominal_interval_us + grade_tol_us;
 
         let mut within_all = 0usize;
         let mut sat_total = 0usize;
         let mut sat_within = 0usize;
+        let mut sat_within_grade = 0usize;
         let mut rolling_true_dropouts = 0usize;
         let mut rolling_slow_slots = 0usize;
         let mut rolling_bunches = 0usize;
+        let mut sat_dts: Vec<f64> = Vec::with_capacity(n);
 
         let bin_width = (nominal_interval_us * 0.10).max(5.0);
         let mut histogram_bins: Vec<HistogramBin> = (0..=HISTOGRAM_BASE_BINS)
@@ -862,14 +1174,19 @@ impl PollingAnalyzer {
             let d = rec.dt_us;
             let sat = rec.is_saturated(nominal_hz, nominal_interval_us);
             let in_band = d >= lo_ok && d <= hi_ok;
+            let in_grade = d >= grade_lo && d <= grade_hi;
 
             if in_band {
                 within_all += 1;
             }
             if sat {
                 sat_total += 1;
+                sat_dts.push(d);
                 if in_band {
                     sat_within += 1;
+                }
+                if in_grade {
+                    sat_within_grade += 1;
                 }
             }
 
@@ -898,6 +1215,25 @@ impl PollingAnalyzer {
         } else {
             0.0
         };
+        let sat_grade_pct = if sat_total > 0 {
+            (sat_within_grade as f64) * 100.0 / (sat_total as f64)
+        } else {
+            0.0
+        };
+        let sat_std_dev_us = if !sat_dts.is_empty() {
+            let sat_mean = sat_dts.iter().sum::<f64>() / (sat_dts.len() as f64);
+            let sat_var = sat_dts
+                .iter()
+                .map(|&v| {
+                    let diff = v - sat_mean;
+                    diff * diff
+                })
+                .sum::<f64>()
+                / (sat_dts.len() as f64);
+            sat_var.sqrt()
+        } else {
+            std_dev_us
+        };
 
         let (health_severity, health_summary) = if n < 40 {
             (
@@ -915,26 +1251,44 @@ impl PollingAnalyzer {
         } else {
             let sat_anomaly_pct =
                 ((rolling_true_dropouts + rolling_bunches) as f64) * 100.0 / (sat_total as f64);
-            if saturated_within_15_pct >= 88.0 && sat_anomaly_pct < 1.5 {
+            let window_note = if self.active_intervals > n as u64 {
+                format!(" in last {n} polls")
+            } else {
+                String::new()
+            };
+            let spread_ok = sat_std_dev_us <= grade_tol_us * 1.25;
+            if sat_grade_pct >= 85.0 && sat_anomaly_pct < 1.5 && spread_ok {
+                let extra = if nominal_hz >= 4000 {
+                    format!(
+                        "{sat_grade_pct:.1}% within ±{:.0} µs Windows floor ({saturated_within_15_pct:.1}% strict ±15%)",
+                        grade_tol_us
+                    )
+                } else {
+                    format!(
+                        "{saturated_within_15_pct:.1}% within ±15% of {:.2} ms",
+                        nominal_interval_us / 1000.0
+                    )
+                };
                 (
                     Some(Severity::Ok),
                     format!(
-                        "Clean {nominal_hz} Hz link — {saturated_within_15_pct:.1}% of {sat_total} saturated polls within ±15% of {:.2} ms ({rolling_true_dropouts} true dropouts, {rolling_bunches} bunched; {rolling_slow_slots} slow slots ignored).",
-                        nominal_interval_us / 1000.0,
+                        "Clean {nominal_hz} Hz link — {extra} ({rolling_true_dropouts} dropouts, {rolling_bunches} bunched{window_note}; {rolling_slow_slots} slow slots ignored)."
                     ),
                 )
-            } else if saturated_within_15_pct >= 70.0 && sat_anomaly_pct < 5.0 {
+            } else if sat_grade_pct >= 65.0 && sat_anomaly_pct < 5.0 {
                 (
                     Some(Severity::Warn),
                     format!(
-                        "Mild jitter at {nominal_hz} Hz — {saturated_within_15_pct:.1}% saturated consistency ({rolling_true_dropouts} true dropouts, {rolling_bunches} bunched). Try moving your wireless dongle closer or using a direct motherboard USB port."
+                        "Mild jitter at {nominal_hz} Hz — σ {:.3} ms, {sat_grade_pct:.1}% on-cadence ({rolling_true_dropouts} dropouts, {rolling_bunches} bunched{window_note}). See Recommended Fixes below.",
+                        std_dev_us / 1000.0
                     ),
                 )
             } else {
                 (
                     Some(Severity::Bad),
                     format!(
-                        "Unstable {nominal_hz} Hz delivery — {saturated_within_15_pct:.1}% saturated consistency ({rolling_true_dropouts} true dropouts, {rolling_bunches} bunched). Check 2.4 GHz interference, dongle distance, USB hub contention, or background DPC load."
+                        "Unstable {nominal_hz} Hz delivery — σ {:.3} ms, {sat_grade_pct:.1}% on-cadence ({rolling_true_dropouts} dropouts, {rolling_bunches} bunched{window_note}). See Recommended Fixes below.",
+                        std_dev_us / 1000.0
                     ),
                 )
             }
@@ -1552,5 +1906,64 @@ mod tests {
         assert_eq!(snap.key_up_count, 1);
         assert_eq!(snap.chatter_faults, 1);
         assert_eq!(snap.estimated_scan_hz, Some(4000));
+    }
+
+    #[test]
+    fn builds_targeted_advice_for_bad_polling_usb_contention_and_click_bounce() {
+        use crate::win::{UsbSharedDevice, UsbSharedDeviceKind};
+
+        let mut snap = DiagnosticsSnapshot::default();
+        snap.polling.total_motion_packets = 12_000;
+        snap.polling.nominal_hz = 4000;
+        snap.polling.nominal_interval_us = 250.0;
+        snap.polling.saturated_pct = 55.0;
+        snap.polling.true_dropout_count = 40;
+        snap.polling.bunch_count = 35;
+        snap.polling.min_us = 50.0;
+        snap.polling.max_us = 620.0;
+        snap.polling.health_severity = Some(Severity::Bad);
+        snap.clicks.total_bounce_faults = 2;
+        snap.clicks.buttons[MouseButtonKind::Left.index()].bounce_faults = 2;
+        snap.clicks.buttons[MouseButtonKind::Left.index()].min_release_to_press_ms = Some(14.0);
+
+        let topo = vec![UsbMouseTopology {
+            name: "LAMZU 4K".to_string(),
+            vid_pid: "3554:f510".to_string(),
+            port_number: Some(2),
+            hub_number: Some(1),
+            hub_name: "USB Root Hub #1".to_string(),
+            behind_external_hub: false,
+            shared_heavy_devices: vec![UsbSharedDevice {
+                name: "Focusrite USB Audio".to_string(),
+                kind: UsbSharedDeviceKind::UsbAudio,
+            }],
+        }];
+        let checks = vec![CheckReport {
+            id: "usb_selective_suspend".to_string(),
+            name: "USB Selective Suspend".to_string(),
+            current_value: "Enabled".to_string(),
+            recommended_value: "Disabled".to_string(),
+            reason: "Power saving".to_string(),
+            severity: Severity::Warn,
+            can_fix: true,
+            is_optional_tweak: false,
+            requires_elevation: true,
+            elevation_reason: None,
+            requires_relogin: false,
+            requires_reboot: false,
+        }];
+
+        let advice = build_diagnostic_advice(&snap, 800, None, None, &topo, &checks);
+        assert!(advice
+            .iter()
+            .any(|a| a.detail.contains("Focusrite USB Audio")));
+        assert!(advice
+            .iter()
+            .any(|a| a.action_target.as_deref() == Some("health_check")));
+        assert!(advice.iter().any(|a| a.category == "USB / DPC"));
+        assert!(advice.iter().any(|a| a.category == "Mouse Debounce"));
+        assert!(advice.iter().any(|a| a.category == "Polling Rate"));
+        // Verify sorted highest severity first.
+        assert_eq!(advice[0].severity, Severity::Bad);
     }
 }

@@ -5,16 +5,22 @@
 //! Dedicated Win32 Raw Input (`WM_INPUT` + `RIDEV_INPUTSINK`) capture thread using
 //! `QueryPerformanceCounter` timestamps so GUI framerate never skews 4K/8K measurements.
 //!
-//! Uses a kernel-blocking `GetMessageW` loop with a 33 ms `SetTimer` publish tick so:
-//! - Every `WM_INPUT` packet wakes the thread immediately on arrival (zero `sleep()` bunching)
-//! - Idle capture uses ~0% CPU
-//! - Stopping capture unregisters Raw Input and joins the thread cleanly (0% CPU when idle)
+//! Architecture (zero self-inflicted measurement jitter):
+//! - **Capture thread (`GetMessageW`, `THREAD_PRIORITY_HIGHEST`)**: strictly timestamps each
+//!   `WM_INPUT` arrival via `QueryPerformanceCounter`, decodes `RAWINPUT`, and pushes a tiny
+//!   `Copy` `RawEvent` into a pre-allocated buffer. Performs zero sorting, zero histogram
+//!   computation, zero `WM_TIMER` callbacks, and zero UI wakeups.
+//! - **Analyzer thread (~30 Hz)**: performs a ~50 ns `Vec` swap to drain queued events,
+//!   updates all statistical analyzers, publishes `DiagnosticsSnapshot`, and wakes the GUI.
+//! - Stopping capture unregisters Raw Input, joins the capture thread, drains remaining
+//!   events, and joins the analyzer thread cleanly (0% CPU when idle).
 //!
 //! 100% anti-cheat safe: standard Win32 Raw Input API, zero hooks, zero DLL injection, no admin.
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::diagnostics::analyzer::{
     ClickBounceAnalyzer, DiagnosticsSnapshot, DpiCalibrator, KeyboardPollingAnalyzer,
@@ -22,33 +28,51 @@ use crate::diagnostics::analyzer::{
 };
 
 const TARGET_AUTO_SENTINEL: u32 = 0;
+const INITIAL_QUEUE_CAPACITY: usize = 4_096;
+const PUBLISH_INTERVAL_MS: u64 = 33;
 
-#[cfg(windows)]
-const WM_POLLED_SYNC: u32 = 0x8001; // WM_APP + 1
-#[cfg(windows)]
-const TIMER_PUBLISH_ID: usize = 1;
-#[cfg(windows)]
-const TIMER_PUBLISH_MS: u32 = 33;
+#[derive(Debug, Clone, Copy)]
+enum RawEvent {
+    MouseMotion {
+        ts_ns: u64,
+        dx: i32,
+        dy: i32,
+    },
+    MouseButton {
+        ts_ns: u64,
+        button: MouseButtonKind,
+        pressed: bool,
+    },
+    Key {
+        ts_ns: u64,
+        slot: u8,
+        pressed: bool,
+    },
+}
 
 /// Live handle controlling an active background Win32 Raw Input capture session.
 pub struct RawInputCaptureSession {
     snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
     running: Arc<AtomicBool>,
+    analyzer_stop: Arc<AtomicBool>,
     reset_requested: Arc<AtomicBool>,
     dpi_measuring: Arc<AtomicBool>,
     dpi_reset_requested: Arc<AtomicBool>,
     target_hz_atomic: Arc<AtomicU32>,
     msg_hwnd: Arc<AtomicIsize>,
-    join_handle: Option<JoinHandle<()>>,
+    wake_signal: Arc<(Mutex<u64>, Condvar)>,
+    capture_handle: Option<JoinHandle<()>>,
+    analyzer_handle: Option<JoinHandle<()>>,
 }
 
 impl RawInputCaptureSession {
-    /// Starts capturing raw mouse motion and button events on a dedicated Win32 message thread.
+    /// Starts capturing raw mouse motion, button, and keyboard timing events on a dedicated
+    /// Win32 message thread decoupled from snapshot analysis.
     ///
     /// `on_update` is called at ~30 Hz whenever a fresh snapshot is published (e.g. `ctx.request_repaint()`).
     pub fn start<F>(target: PollingTarget, on_update: F) -> Self
     where
-        F: Fn() + Send + 'static,
+        F: Fn() + Send + Sync + 'static,
     {
         let initial_target_raw = match target {
             PollingTarget::Auto => TARGET_AUTO_SENTINEL,
@@ -60,61 +84,89 @@ impl RawInputCaptureSession {
             ..Default::default()
         }));
         let running = Arc::new(AtomicBool::new(true));
+        let analyzer_stop = Arc::new(AtomicBool::new(false));
         let reset_requested = Arc::new(AtomicBool::new(false));
         let dpi_measuring = Arc::new(AtomicBool::new(false));
         let dpi_reset_requested = Arc::new(AtomicBool::new(false));
         let target_hz_atomic = Arc::new(AtomicU32::new(initial_target_raw));
         let msg_hwnd = Arc::new(AtomicIsize::new(0));
+        let event_queue = Arc::new(Mutex::new(Vec::<RawEvent>::with_capacity(
+            INITIAL_QUEUE_CAPACITY,
+        )));
+        let wake_signal = Arc::new((Mutex::new(0u64), Condvar::new()));
+        let on_update: Arc<dyn Fn() + Send + Sync> = Arc::new(on_update);
 
-        let snap_bg = Arc::clone(&snapshot);
-        let run_bg = Arc::clone(&running);
-        let reset_bg = Arc::clone(&reset_requested);
-        let dpi_meas_bg = Arc::clone(&dpi_measuring);
-        let dpi_reset_bg = Arc::clone(&dpi_reset_requested);
-        let target_bg = Arc::clone(&target_hz_atomic);
-        let hwnd_bg = Arc::clone(&msg_hwnd);
+        let snap_cap = Arc::clone(&snapshot);
+        let run_cap = Arc::clone(&running);
+        let stop_cap = Arc::clone(&analyzer_stop);
+        let hwnd_cap = Arc::clone(&msg_hwnd);
+        let queue_cap = Arc::clone(&event_queue);
+        let wake_cap = Arc::clone(&wake_signal);
+        let update_cap = Arc::clone(&on_update);
 
-        let handle = std::thread::spawn(move || {
-            #[cfg(windows)]
-            run_win32_capture_loop(
-                snap_bg,
-                run_bg,
-                reset_bg,
-                dpi_meas_bg,
-                dpi_reset_bg,
-                target_bg,
-                hwnd_bg,
-                on_update,
-            );
-
-            #[cfg(not(windows))]
-            {
-                let _ = (
-                    run_bg,
-                    reset_bg,
-                    dpi_meas_bg,
-                    dpi_reset_bg,
-                    target_bg,
-                    hwnd_bg,
+        let capture_handle = std::thread::Builder::new()
+            .name("polled-raw-capture".to_string())
+            .spawn(move || {
+                #[cfg(windows)]
+                run_win32_capture_loop(
+                    snap_cap, run_cap, stop_cap, hwnd_cap, queue_cap, wake_cap, update_cap,
                 );
-                if let Ok(mut guard) = snap_bg.lock() {
-                    guard.capturing = false;
-                    guard.error =
-                        Some("Raw Input capture is only available on Windows.".to_string());
+
+                #[cfg(not(windows))]
+                {
+                    let _ = (run_cap, hwnd_cap, queue_cap);
+                    if let Ok(mut guard) = snap_cap.lock() {
+                        guard.capturing = false;
+                        guard.error =
+                            Some("Raw Input capture is only available on Windows.".to_string());
+                    }
+                    stop_cap.store(true, Ordering::SeqCst);
+                    notify_condvar(&wake_cap);
+                    (update_cap)();
                 }
-                on_update();
-            }
-        });
+            })
+            .ok();
+
+        let snap_ana = Arc::clone(&snapshot);
+        let stop_ana = Arc::clone(&analyzer_stop);
+        let reset_ana = Arc::clone(&reset_requested);
+        let dpi_meas_ana = Arc::clone(&dpi_measuring);
+        let dpi_reset_ana = Arc::clone(&dpi_reset_requested);
+        let target_ana = Arc::clone(&target_hz_atomic);
+        let queue_ana = Arc::clone(&event_queue);
+        let wake_ana = Arc::clone(&wake_signal);
+        let update_ana = Arc::clone(&on_update);
+
+        let analyzer_handle = std::thread::Builder::new()
+            .name("polled-raw-analyzer".to_string())
+            .spawn(move || {
+                run_analyzer_loop(
+                    initial_target_raw,
+                    snap_ana,
+                    stop_ana,
+                    reset_ana,
+                    dpi_meas_ana,
+                    dpi_reset_ana,
+                    target_ana,
+                    queue_ana,
+                    wake_ana,
+                    update_ana,
+                );
+            })
+            .ok();
 
         Self {
             snapshot,
             running,
+            analyzer_stop,
             reset_requested,
             dpi_measuring,
             dpi_reset_requested,
             target_hz_atomic,
             msg_hwnd,
-            join_handle: Some(handle),
+            wake_signal,
+            capture_handle,
+            analyzer_handle,
         }
     }
 
@@ -128,39 +180,22 @@ impl RawInputCaptureSession {
             PollingTarget::FixedHz(hz) => hz,
         };
         self.target_hz_atomic.store(raw, Ordering::SeqCst);
-        self.post_sync_wakeup();
+        notify_condvar(&self.wake_signal);
     }
 
     pub fn set_dpi_measuring(&self, active: bool) {
         self.dpi_measuring.store(active, Ordering::SeqCst);
-        self.post_sync_wakeup();
+        notify_condvar(&self.wake_signal);
     }
 
     pub fn request_dpi_reset(&self) {
         self.dpi_reset_requested.store(true, Ordering::SeqCst);
-        self.post_sync_wakeup();
+        notify_condvar(&self.wake_signal);
     }
 
     pub fn request_reset(&self) {
         self.reset_requested.store(true, Ordering::SeqCst);
-        self.post_sync_wakeup();
-    }
-
-    fn post_sync_wakeup(&self) {
-        #[cfg(windows)]
-        {
-            use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-            use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-
-            let raw = self.msg_hwnd.load(Ordering::SeqCst);
-            if raw != 0 {
-                let hwnd = HWND(raw as *mut core::ffi::c_void);
-                // SAFETY: Posting `WM_POLLED_SYNC` to our own message-only window wakes `GetMessageW`.
-                unsafe {
-                    let _ = PostMessageW(Some(hwnd), WM_POLLED_SYNC, WPARAM(0), LPARAM(0));
-                }
-            }
-        }
+        notify_condvar(&self.wake_signal);
     }
 
     pub fn stop(&mut self) {
@@ -179,7 +214,13 @@ impl RawInputCaptureSession {
                 }
             }
         }
-        if let Some(handle) = self.join_handle.take() {
+        // Join capture thread first so no further events can be queued, then flush analyzer.
+        if let Some(handle) = self.capture_handle.take() {
+            let _ = handle.join();
+        }
+        self.analyzer_stop.store(true, Ordering::SeqCst);
+        notify_condvar(&self.wake_signal);
+        if let Some(handle) = self.analyzer_handle.take() {
             let _ = handle.join();
         }
         if let Ok(mut guard) = self.snapshot.lock() {
@@ -194,20 +235,174 @@ impl Drop for RawInputCaptureSession {
     }
 }
 
+fn notify_condvar(signal: &(Mutex<u64>, Condvar)) {
+    if let Ok(mut seq) = signal.0.lock() {
+        *seq = seq.wrapping_add(1);
+        signal.1.notify_one();
+    }
+}
+
+fn decode_target(raw: u32) -> PollingTarget {
+    if raw == TARGET_AUTO_SENTINEL {
+        PollingTarget::Auto
+    } else {
+        PollingTarget::FixedHz(raw)
+    }
+}
+
 #[cfg(windows)]
+fn qpc_now_ns(freq: u64) -> u64 {
+    use windows::Win32::System::Performance::QueryPerformanceCounter;
+
+    let mut count = 0i64;
+    // SAFETY: `count` is valid writable storage for `QueryPerformanceCounter`.
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut count);
+    }
+    if count <= 0 || freq == 0 {
+        return 0;
+    }
+    ((count as u128) * 1_000_000_000u128 / (freq as u128)) as u64
+}
+
+#[cfg(windows)]
+fn qpc_frequency() -> u64 {
+    use windows::Win32::System::Performance::QueryPerformanceFrequency;
+
+    let mut freq = 0i64;
+    // SAFETY: `freq` is valid writable storage.
+    unsafe {
+        let _ = QueryPerformanceFrequency(&mut freq);
+    }
+    freq.max(1) as u64
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_win32_capture_loop<F>(
+fn run_analyzer_loop(
+    initial_target_raw: u32,
     snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
-    running: Arc<AtomicBool>,
+    analyzer_stop: Arc<AtomicBool>,
     reset_requested: Arc<AtomicBool>,
     dpi_measuring: Arc<AtomicBool>,
     dpi_reset_requested: Arc<AtomicBool>,
     target_hz_atomic: Arc<AtomicU32>,
+    event_queue: Arc<Mutex<Vec<RawEvent>>>,
+    wake_signal: Arc<(Mutex<u64>, Condvar)>,
+    on_update: Arc<dyn Fn() + Send + Sync>,
+) {
+    #[cfg(windows)]
+    let qpc_freq = qpc_frequency();
+
+    let mut polling = PollingAnalyzer::new(decode_target(initial_target_raw));
+    let mut dpi_cal = DpiCalibrator::default();
+    let mut clicks = ClickBounceAnalyzer::new();
+    let mut keyboard = KeyboardPollingAnalyzer::new();
+    let mut last_target_raw = initial_target_raw;
+    let mut local_batch = Vec::<RawEvent>::with_capacity(INITIAL_QUEUE_CAPACITY);
+    let mut last_seq = 0u64;
+
+    loop {
+        let stopping = analyzer_stop.load(Ordering::SeqCst);
+
+        // ~50 ns pointer swap under lock so the WM_INPUT capture thread never waits on analysis.
+        local_batch.clear();
+        if let Ok(mut shared) = event_queue.lock() {
+            std::mem::swap(&mut *shared, &mut local_batch);
+        }
+
+        if reset_requested.swap(false, Ordering::SeqCst) {
+            polling.reset();
+            clicks.reset();
+            dpi_cal.reset();
+            keyboard.reset();
+            local_batch.clear();
+        }
+        if dpi_reset_requested.swap(false, Ordering::SeqCst) {
+            dpi_cal.reset();
+        }
+        let want_dpi = dpi_measuring.load(Ordering::SeqCst);
+        if want_dpi != dpi_cal.is_active() {
+            dpi_cal.set_active(want_dpi);
+        }
+
+        let target_raw = target_hz_atomic.load(Ordering::SeqCst);
+        if target_raw != last_target_raw {
+            polling.set_target(decode_target(target_raw));
+            last_target_raw = target_raw;
+        }
+
+        for ev in &local_batch {
+            match *ev {
+                RawEvent::MouseMotion { ts_ns, dx, dy } => {
+                    polling.record_motion(ts_ns, dx, dy);
+                    dpi_cal.record_motion(dx, dy);
+                }
+                RawEvent::MouseButton {
+                    ts_ns,
+                    button,
+                    pressed,
+                } => {
+                    clicks.record_button(button, pressed, ts_ns);
+                }
+                RawEvent::Key {
+                    ts_ns,
+                    slot,
+                    pressed,
+                } => {
+                    keyboard.record_key(slot, pressed, ts_ns);
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        let now_ns = Some(qpc_now_ns(qpc_freq));
+        #[cfg(not(windows))]
+        let now_ns = None;
+
+        let prev_err = snapshot.lock().ok().and_then(|g| g.error.clone());
+        let next_snap = DiagnosticsSnapshot {
+            capturing: !stopping && prev_err.is_none(),
+            target: polling.target(),
+            polling: polling.snapshot(now_ns),
+            tracking: polling.tracking_snapshot(now_ns),
+            dpi_measurement: dpi_cal.snapshot(),
+            clicks: clicks.snapshot(),
+            keyboard: keyboard.snapshot(),
+            error: prev_err,
+        };
+        if let Ok(mut guard) = snapshot.lock() {
+            *guard = next_snap;
+        }
+        (on_update)();
+
+        if stopping {
+            break;
+        }
+
+        if let Ok(guard) = wake_signal.0.lock() {
+            if *guard == last_seq {
+                let (guard_after, _) = wake_signal
+                    .1
+                    .wait_timeout(guard, Duration::from_millis(PUBLISH_INTERVAL_MS))
+                    .unwrap_or_else(|e| e.into_inner());
+                last_seq = *guard_after;
+            } else {
+                last_seq = *guard;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_win32_capture_loop(
+    snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
+    running: Arc<AtomicBool>,
+    analyzer_stop: Arc<AtomicBool>,
     msg_hwnd: Arc<AtomicIsize>,
-    on_update: F,
-) where
-    F: Fn() + Send + 'static,
-{
+    event_queue: Arc<Mutex<Vec<RawEvent>>>,
+    wake_signal: Arc<(Mutex<u64>, Condvar)>,
+    on_update: Arc<dyn Fn() + Send + Sync>,
+) {
     use std::cell::RefCell;
     use std::ffi::OsStr;
     use std::mem::size_of;
@@ -216,7 +411,6 @@ fn run_win32_capture_loop<F>(
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
     use windows::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
     };
@@ -225,86 +419,22 @@ fn run_win32_capture_loop<F>(
         RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
-        PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage, UnregisterClassW,
-        HWND_MESSAGE, MSG, RI_KEY_BREAK, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP,
-        RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, RI_MOUSE_LEFT_BUTTON_DOWN,
-        RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP,
-        RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_CLOSE, WM_DESTROY, WM_INPUT, WM_TIMER, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+        PostQuitMessage, RegisterClassW, TranslateMessage, UnregisterClassW, HWND_MESSAGE, MSG,
+        RI_KEY_BREAK, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN,
+        RI_MOUSE_BUTTON_5_UP, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
+        RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN,
+        RI_MOUSE_RIGHT_BUTTON_UP, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_INPUT,
+        WNDCLASSW,
     };
 
     struct CaptureThreadState {
         qpc_freq: u64,
-        polling: PollingAnalyzer,
-        dpi_cal: DpiCalibrator,
-        clicks: ClickBounceAnalyzer,
-        keyboard: KeyboardPollingAnalyzer,
-        last_target_raw: u32,
-        snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
-        reset_requested: Arc<AtomicBool>,
-        dpi_measuring: Arc<AtomicBool>,
-        dpi_reset_requested: Arc<AtomicBool>,
-        target_hz_atomic: Arc<AtomicU32>,
-        on_update: Box<dyn Fn() + Send>,
-    }
-
-    impl CaptureThreadState {
-        fn sync_dpi_flags(&mut self) {
-            if self.dpi_reset_requested.swap(false, Ordering::SeqCst) {
-                self.dpi_cal.reset();
-            }
-            let want_active = self.dpi_measuring.load(Ordering::SeqCst);
-            if want_active != self.dpi_cal.is_active() {
-                self.dpi_cal.set_active(want_active);
-            }
-        }
-
-        fn sync_and_publish(&mut self) {
-            if self.reset_requested.swap(false, Ordering::SeqCst) {
-                self.polling.reset();
-                self.clicks.reset();
-                self.dpi_cal.reset();
-                self.keyboard.reset();
-            }
-            self.sync_dpi_flags();
-            let target_raw = self.target_hz_atomic.load(Ordering::SeqCst);
-            if target_raw != self.last_target_raw {
-                self.polling.set_target(decode_target(target_raw));
-                self.last_target_raw = target_raw;
-            }
-            let now_ns = qpc_now_ns(self.qpc_freq);
-            let next_snap = DiagnosticsSnapshot {
-                capturing: true,
-                target: self.polling.target(),
-                polling: self.polling.snapshot(Some(now_ns)),
-                tracking: self.polling.tracking_snapshot(Some(now_ns)),
-                dpi_measurement: self.dpi_cal.snapshot(),
-                clicks: self.clicks.snapshot(),
-                keyboard: self.keyboard.snapshot(),
-                error: None,
-            };
-            if let Ok(mut guard) = self.snapshot.lock() {
-                *guard = next_snap;
-            }
-            (self.on_update)();
-        }
+        queue: Arc<Mutex<Vec<RawEvent>>>,
     }
 
     thread_local! {
         static STATE: RefCell<Option<CaptureThreadState>> = const { RefCell::new(None) };
-    }
-
-    fn qpc_now_ns(freq: u64) -> u64 {
-        let mut count = 0i64;
-        // SAFETY: `count` is valid writable storage for `QueryPerformanceCounter`.
-        unsafe {
-            let _ = QueryPerformanceCounter(&mut count);
-        }
-        if count <= 0 || freq == 0 {
-            return 0;
-        }
-        ((count as u128) * 1_000_000_000u128 / (freq as u128)) as u64
     }
 
     unsafe extern "system" fn wnd_proc(
@@ -316,8 +446,8 @@ fn run_win32_capture_loop<F>(
         match msg {
             WM_INPUT => {
                 STATE.with(|cell| {
-                    let mut borrow = cell.borrow_mut();
-                    let Some(state) = borrow.as_mut() else {
+                    let borrow = cell.borrow();
+                    let Some(state) = borrow.as_ref() else {
                         return;
                     };
                     // Timestamp immediately on message arrival before decoding the payload.
@@ -343,7 +473,13 @@ fn run_win32_capture_loop<F>(
                         let kb = unsafe { raw.data.keyboard };
                         let pressed = (u32::from(kb.Flags) & RI_KEY_BREAK) == 0;
                         let slot = (kb.VKey & 0xFF) as u8;
-                        state.keyboard.record_key(slot, pressed, ts_ns);
+                        if let Ok(mut q) = state.queue.lock() {
+                            q.push(RawEvent::Key {
+                                ts_ns,
+                                slot,
+                                pressed,
+                            });
+                        }
                         return;
                     }
                     if raw.header.dwType != RIM_TYPEMOUSE.0 {
@@ -352,74 +488,92 @@ fn run_win32_capture_loop<F>(
 
                     // SAFETY: `dwType == RIM_TYPEMOUSE` guarantees `raw.data.mouse` is active.
                     let mouse = unsafe { raw.data.mouse };
-                    state
-                        .polling
-                        .record_motion(ts_ns, mouse.lLastX, mouse.lLastY);
-                    state.sync_dpi_flags();
-                    state.dpi_cal.record_motion(mouse.lLastX, mouse.lLastY);
-
+                    let dx = mouse.lLastX;
+                    let dy = mouse.lLastY;
                     // SAFETY: Standard Windows `RAWMOUSE` button flags union access.
                     let flags = u32::from(unsafe { mouse.Anonymous.Anonymous.usButtonFlags });
-                    if flags != 0 {
-                        if (flags & RI_MOUSE_LEFT_BUTTON_DOWN) != 0 {
-                            state
-                                .clicks
-                                .record_button(MouseButtonKind::Left, true, ts_ns);
-                        }
-                        if (flags & RI_MOUSE_LEFT_BUTTON_UP) != 0 {
-                            state
-                                .clicks
-                                .record_button(MouseButtonKind::Left, false, ts_ns);
-                        }
-                        if (flags & RI_MOUSE_RIGHT_BUTTON_DOWN) != 0 {
-                            state
-                                .clicks
-                                .record_button(MouseButtonKind::Right, true, ts_ns);
-                        }
-                        if (flags & RI_MOUSE_RIGHT_BUTTON_UP) != 0 {
-                            state
-                                .clicks
-                                .record_button(MouseButtonKind::Right, false, ts_ns);
-                        }
-                        if (flags & RI_MOUSE_MIDDLE_BUTTON_DOWN) != 0 {
-                            state
-                                .clicks
-                                .record_button(MouseButtonKind::Middle, true, ts_ns);
-                        }
-                        if (flags & RI_MOUSE_MIDDLE_BUTTON_UP) != 0 {
-                            state
-                                .clicks
-                                .record_button(MouseButtonKind::Middle, false, ts_ns);
-                        }
-                        if (flags & RI_MOUSE_BUTTON_4_DOWN) != 0 {
-                            state
-                                .clicks
-                                .record_button(MouseButtonKind::SideBack, true, ts_ns);
-                        }
-                        if (flags & RI_MOUSE_BUTTON_4_UP) != 0 {
-                            state
-                                .clicks
-                                .record_button(MouseButtonKind::SideBack, false, ts_ns);
-                        }
-                        if (flags & RI_MOUSE_BUTTON_5_DOWN) != 0 {
-                            state
-                                .clicks
-                                .record_button(MouseButtonKind::SideForward, true, ts_ns);
-                        }
-                        if (flags & RI_MOUSE_BUTTON_5_UP) != 0 {
-                            state
-                                .clicks
-                                .record_button(MouseButtonKind::SideForward, false, ts_ns);
-                        }
+
+                    if dx == 0 && dy == 0 && flags == 0 {
+                        return;
                     }
-                });
-                LRESULT(0)
-            }
-            WM_TIMER | WM_POLLED_SYNC => {
-                STATE.with(|cell| {
-                    if let Some(state) = cell.borrow_mut().as_mut() {
-                        state.sync_and_publish();
-                    }
+
+                    if let Ok(mut q) = state.queue.lock() {
+                        if dx != 0 || dy != 0 {
+                            q.push(RawEvent::MouseMotion { ts_ns, dx, dy });
+                        }
+                        if flags != 0 {
+                            if (flags & RI_MOUSE_LEFT_BUTTON_DOWN) != 0 {
+                                q.push(RawEvent::MouseButton {
+                                    ts_ns,
+                                    button: MouseButtonKind::Left,
+                                    pressed: true,
+                                });
+                            }
+                            if (flags & RI_MOUSE_LEFT_BUTTON_UP) != 0 {
+                                q.push(RawEvent::MouseButton {
+                                    ts_ns,
+                                    button: MouseButtonKind::Left,
+                                    pressed: false,
+                                });
+                            }
+                            if (flags & RI_MOUSE_RIGHT_BUTTON_DOWN) != 0 {
+                                q.push(RawEvent::MouseButton {
+                                    ts_ns,
+                                    button: MouseButtonKind::Right,
+                                    pressed: true,
+                                });
+                            }
+                            if (flags & RI_MOUSE_RIGHT_BUTTON_UP) != 0 {
+                                q.push(RawEvent::MouseButton {
+                                    ts_ns,
+                                    button: MouseButtonKind::Right,
+                                    pressed: false,
+                                });
+                            }
+                            if (flags & RI_MOUSE_MIDDLE_BUTTON_DOWN) != 0 {
+                                q.push(RawEvent::MouseButton {
+                                    ts_ns,
+                                    button: MouseButtonKind::Middle,
+                                    pressed: true,
+                                });
+                            }
+                            if (flags & RI_MOUSE_MIDDLE_BUTTON_UP) != 0 {
+                                q.push(RawEvent::MouseButton {
+                                    ts_ns,
+                                    button: MouseButtonKind::Middle,
+                                    pressed: false,
+                                });
+                            }
+                            if (flags & RI_MOUSE_BUTTON_4_DOWN) != 0 {
+                                q.push(RawEvent::MouseButton {
+                                    ts_ns,
+                                    button: MouseButtonKind::SideBack,
+                                    pressed: true,
+                                });
+                            }
+                            if (flags & RI_MOUSE_BUTTON_4_UP) != 0 {
+                                q.push(RawEvent::MouseButton {
+                                    ts_ns,
+                                    button: MouseButtonKind::SideBack,
+                                    pressed: false,
+                                });
+                            }
+                            if (flags & RI_MOUSE_BUTTON_5_DOWN) != 0 {
+                                q.push(RawEvent::MouseButton {
+                                    ts_ns,
+                                    button: MouseButtonKind::SideForward,
+                                    pressed: true,
+                                });
+                            }
+                            if (flags & RI_MOUSE_BUTTON_5_UP) != 0 {
+                                q.push(RawEvent::MouseButton {
+                                    ts_ns,
+                                    button: MouseButtonKind::SideForward,
+                                    pressed: false,
+                                });
+                            }
+                        }
+                    };
                 });
                 LRESULT(0)
             }
@@ -441,21 +595,13 @@ fn run_win32_capture_loop<F>(
         }
     }
 
-    // Elevate only this tiny message-draining thread while actively recording for clean 8K timestamps.
+    // Elevate only this ultra-lightweight WM_INPUT timestamping thread while actively recording.
     // SAFETY: Setting priority on our own current thread has no memory preconditions.
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     }
 
-    let mut freq = 0i64;
-    // SAFETY: `freq` is valid writable storage.
-    unsafe {
-        let _ = QueryPerformanceFrequency(&mut freq);
-    }
-    let qpc_freq = freq.max(1) as u64;
-
-    let initial_target_raw = target_hz_atomic.load(Ordering::SeqCst);
-    let initial_target = decode_target(initial_target_raw);
+    let qpc_freq = qpc_frequency();
 
     // Unique per-session class name so repeated Start/Stop cycles never collide.
     let class_str = format!(
@@ -485,6 +631,8 @@ fn run_win32_capture_loop<F>(
         publish_error(
             &snapshot,
             "Failed to register Win32 Raw Input window class.",
+            &analyzer_stop,
+            &wake_signal,
             &on_update,
         );
         return;
@@ -518,6 +666,8 @@ fn run_win32_capture_loop<F>(
             publish_error(
                 &snapshot,
                 "Failed to create Win32 Raw Input message window.",
+                &analyzer_stop,
+                &wake_signal,
                 &on_update,
             );
             return;
@@ -548,6 +698,8 @@ fn run_win32_capture_loop<F>(
         publish_error(
             &snapshot,
             "Windows denied RegisterRawInputDevices for mouse/keyboard input.",
+            &analyzer_stop,
+            &wake_signal,
             &on_update,
         );
         return;
@@ -556,17 +708,7 @@ fn run_win32_capture_loop<F>(
     STATE.with(|cell| {
         *cell.borrow_mut() = Some(CaptureThreadState {
             qpc_freq,
-            polling: PollingAnalyzer::new(initial_target),
-            dpi_cal: DpiCalibrator::default(),
-            clicks: ClickBounceAnalyzer::new(),
-            keyboard: KeyboardPollingAnalyzer::new(),
-            last_target_raw: initial_target_raw,
-            snapshot: Arc::clone(&snapshot),
-            reset_requested,
-            dpi_measuring,
-            dpi_reset_requested,
-            target_hz_atomic,
-            on_update: Box::new(on_update),
+            queue: event_queue,
         });
     });
 
@@ -574,25 +716,15 @@ fn run_win32_capture_loop<F>(
 
     // If `stop()` raced before `msg_hwnd` was published, exit immediately without entering GetMessageW.
     if running.load(Ordering::SeqCst) {
-        // SAFETY: `hwnd` is our own valid window on this thread.
-        unsafe {
-            let _ = SetTimer(Some(hwnd), TIMER_PUBLISH_ID, TIMER_PUBLISH_MS, None);
-        }
-
         let mut msg = MSG::default();
         // Kernel-blocking message pump: wakes immediately on every `WM_INPUT` arrival (even 8K Hz)
-        // and publishes snapshots every 33 ms on `WM_TIMER` without busy-waiting or sleep bunching.
+        // with zero timers, zero sorting, and zero allocations on this thread.
         // SAFETY: Standard Win32 thread message loop.
         while running.load(Ordering::SeqCst) && unsafe { GetMessageW(&mut msg, None, 0, 0).0 > 0 } {
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-        }
-
-        // SAFETY: Clean up timer on our own window before tearing it down.
-        unsafe {
-            let _ = KillTimer(Some(hwnd), TIMER_PUBLISH_ID);
         }
     }
 
@@ -618,31 +750,24 @@ fn run_win32_capture_loop<F>(
         let _ = UnregisterClassW(PCWSTR(class_w.as_ptr()), Some(hinstance));
     }
     msg_hwnd.store(0, Ordering::SeqCst);
-
-    if let Ok(mut guard) = snapshot.lock() {
-        guard.capturing = false;
-    }
     STATE.with(|cell| {
-        if let Some(state) = cell.borrow_mut().take() {
-            (state.on_update)();
-        }
+        cell.borrow_mut().take();
     });
 }
 
 #[cfg(windows)]
-fn decode_target(raw: u32) -> PollingTarget {
-    if raw == TARGET_AUTO_SENTINEL {
-        PollingTarget::Auto
-    } else {
-        PollingTarget::FixedHz(raw)
-    }
-}
-
-#[cfg(windows)]
-fn publish_error<F: Fn()>(snapshot: &Arc<Mutex<DiagnosticsSnapshot>>, msg: &str, on_update: &F) {
+fn publish_error(
+    snapshot: &Arc<Mutex<DiagnosticsSnapshot>>,
+    msg: &str,
+    analyzer_stop: &Arc<AtomicBool>,
+    wake_signal: &Arc<(Mutex<u64>, Condvar)>,
+    on_update: &Arc<dyn Fn() + Send + Sync>,
+) {
     if let Ok(mut guard) = snapshot.lock() {
         guard.capturing = false;
         guard.error = Some(msg.to_string());
     }
-    on_update();
+    analyzer_stop.store(true, Ordering::SeqCst);
+    notify_condvar(wake_signal);
+    (on_update)();
 }
