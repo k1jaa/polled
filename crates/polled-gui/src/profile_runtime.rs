@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 use eframe::egui;
-use polled_core::win::{AudioFlow, SystemEnv, WindowsEnv};
+use polled_core::win::{AudioFlow, DisplayModeInfo, DisplayResolutionMode, SystemEnv, WindowsEnv};
 use polled_core::{
     detect_hardware_devices, hid_topology_fingerprint, match_profile, AppPaths, ApplyOutcome,
     BatteryStatus, DeviceCapabilities, DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent,
@@ -29,6 +29,7 @@ const HOTPLUG_EVENT_DEBOUNCE: Duration = Duration::from_millis(300);
 const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const MIC_LOCK_INTERVAL: Duration = Duration::from_secs(2);
 const AUDIO_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const DISPLAY_TEST_FAILSAFE_TIMEOUT: Duration = Duration::from_secs(11);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendSelection {
@@ -55,6 +56,12 @@ pub struct ConnectedDeviceStatus {
 }
 
 #[derive(Debug, Clone)]
+pub struct DisplayOption {
+    pub info: DisplayModeInfo,
+    pub modes: Vec<DisplayResolutionMode>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ProfileRuntimeSnapshot {
     pub auto_switch_enabled: bool,
     pub profile_locked: bool,
@@ -74,6 +81,10 @@ pub struct ProfileRuntimeSnapshot {
     pub audio_inputs: Vec<(String, String, bool)>,
     /// Active Mic Gain Lock target (`0..=100%`) when the current profile enforces mic gain.
     pub mic_lock_active: Option<u8>,
+    /// Attached monitors and their supported `(width, height, refresh_hz)` modes.
+    pub displays: Vec<DisplayOption>,
+    /// Human-readable label of an active temporary display override (auto-reverts on desktop/exit).
+    pub active_display_override: Option<String>,
     pub total_flash_writes_session: u64,
     pub log: Vec<ProfileLogEntry>,
 }
@@ -85,6 +96,15 @@ pub enum ProfileRuntimeCmd {
     SwitchAudioOutput(String),
     CycleAudioOutput,
     RefreshAudioDevices,
+    RefreshDisplays,
+    TestDisplayMode {
+        device_name: Option<String>,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+    },
+    KeepTestDisplayMode,
+    RevertTestDisplayMode,
     QuickSetMousePolling(u16),
     QuickSetMouseDpi(u16),
     RefreshMouseAndBattery,
@@ -220,6 +240,12 @@ struct RuntimeState {
     /// `(optional_endpoint_id, target_volume_pct)` when Mic Gain Lock is active.
     mic_lock_target: Option<(Option<String>, u8)>,
     last_mic_lock_check: Instant,
+    displays: Vec<DisplayOption>,
+    /// Native desktop `(device_name, width, height, refresh_hz)` captured before a profile overrides display mode.
+    original_display_mode: Option<(String, u32, u32, u32)>,
+    active_display_override: Option<String>,
+    /// Failsafe auto-revert `(device_name, prev_w, prev_h, prev_hz, deadline)` for GUI "Test Mode (10s)".
+    pending_display_test_revert: Option<(String, u32, u32, u32, Instant)>,
     debouncer: FocusDebouncer,
     watcher: Option<ForegroundWatcher>,
     focus_rx: Option<Receiver<FocusEvent>>,
@@ -297,6 +323,8 @@ impl RuntimeState {
             audio_outputs: self.audio_outputs.clone(),
             audio_inputs: self.audio_inputs.clone(),
             mic_lock_active: self.mic_lock_target.as_ref().map(|(_, pct)| *pct),
+            displays: self.displays.clone(),
+            active_display_override: self.active_display_override.clone(),
             total_flash_writes_session,
             log: self.log.clone(),
         }
@@ -614,6 +642,131 @@ impl RuntimeState {
         changed
     }
 
+    fn refresh_displays(&mut self) {
+        let env = WindowsEnv;
+        let list = env.list_display_modes().unwrap_or_default();
+        self.displays = list
+            .into_iter()
+            .map(|info| {
+                let modes = env
+                    .list_supported_display_modes(&info.device_name)
+                    .unwrap_or_default();
+                DisplayOption { info, modes }
+            })
+            .collect();
+    }
+
+    fn resolve_target_display(&self, preferred: Option<&str>) -> Option<DisplayModeInfo> {
+        let env = WindowsEnv;
+        let current_list = env.list_display_modes().unwrap_or_default();
+        if let Some(name) = preferred {
+            if let Some(found) = current_list
+                .iter()
+                .find(|d| d.device_name.eq_ignore_ascii_case(name))
+            {
+                return Some(found.clone());
+            }
+        }
+        current_list
+            .iter()
+            .find(|d| d.is_primary)
+            .or_else(|| current_list.first())
+            .cloned()
+    }
+
+    fn restore_original_display(&mut self, reason: &str) {
+        if let Some((dev, w, h, hz)) = self.original_display_mode.take() {
+            let env = WindowsEnv;
+            match env.set_display_mode(&dev, w, h, hz) {
+                Ok(()) => {
+                    self.active_display_override = None;
+                    self.refresh_displays();
+                    self.push_log(
+                        Severity::Ok,
+                        format!("Restored display {dev} -> {w}×{h} @ {hz} Hz ({reason})."),
+                    );
+                }
+                Err(err) => {
+                    self.active_display_override = None;
+                    self.push_log(
+                        Severity::Warn,
+                        format!("Failed to restore display {dev} to {w}×{h} @ {hz} Hz: {err}"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn revert_test_display_if_pending(&mut self, reason: &str) -> Option<String> {
+        let (dev, w, h, hz, _) = self.pending_display_test_revert.take()?;
+        let env = WindowsEnv;
+        let msg = match env.set_display_mode(&dev, w, h, hz) {
+            Ok(()) => {
+                self.refresh_displays();
+                let m = format!("Reverted display test on {dev} -> {w}×{h} @ {hz} Hz ({reason}).");
+                self.push_log(Severity::Info, m.clone());
+                m
+            }
+            Err(err) => {
+                let m = format!("Failed to revert display test on {dev}: {err}");
+                self.push_log(Severity::Warn, m.clone());
+                m
+            }
+        };
+        Some(msg)
+    }
+
+    fn start_test_display_mode(
+        &mut self,
+        device_name: Option<&str>,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+    ) -> (String, String, String, Option<String>) {
+        // Revert any prior test first so we never lose the true original desktop mode.
+        let _ = self.revert_test_display_if_pending("starting new test");
+
+        let Some(target) = self.resolve_target_display(device_name) else {
+            return (
+                String::new(),
+                format!("{width}×{height} @ {refresh_hz} Hz"),
+                String::new(),
+                Some("No active Windows monitor found to test display mode.".to_string()),
+            );
+        };
+        let prev_label = format!(
+            "{}×{} @ {} Hz",
+            target.width, target.height, target.current_hz
+        );
+        let applied_label = format!("{width}×{height} @ {refresh_hz} Hz");
+        let env = WindowsEnv;
+        match env.set_display_mode(&target.device_name, width, height, refresh_hz) {
+            Ok(()) => {
+                self.pending_display_test_revert = Some((
+                    target.device_name.clone(),
+                    target.width,
+                    target.height,
+                    target.current_hz,
+                    Instant::now() + DISPLAY_TEST_FAILSAFE_TIMEOUT,
+                ));
+                self.refresh_displays();
+                self.push_log(
+                    Severity::Info,
+                    format!(
+                        "Testing display mode on {} -> {applied_label} (auto-revert armed).",
+                        target.device_name
+                    ),
+                );
+                (target.device_name, applied_label, prev_label, None)
+            }
+            Err(err) => {
+                let msg = format!("Display mode test rejected: {err}");
+                self.push_log(Severity::Warn, msg.clone());
+                (target.device_name, applied_label, prev_label, Some(msg))
+            }
+        }
+    }
+
     fn poll_audio_and_mic_lock(&mut self) -> bool {
         let now = Instant::now();
         let mut changed = false;
@@ -869,6 +1022,60 @@ impl RuntimeState {
             }
         }
 
+        // --- Per-Game Temporary Display Mode Switching (zero registry writes) ---
+        if let Some((opt_dev, w, h, hz)) = profile.display_mode_override() {
+            if let Some(target) = self.resolve_target_display(opt_dev) {
+                if self
+                    .original_display_mode
+                    .as_ref()
+                    .is_some_and(|(orig_dev, _, _, _)| {
+                        !orig_dev.eq_ignore_ascii_case(&target.device_name)
+                    })
+                {
+                    self.restore_original_display("switching monitor");
+                }
+                if self.original_display_mode.is_none() {
+                    self.original_display_mode = Some((
+                        target.device_name.clone(),
+                        target.width,
+                        target.height,
+                        target.current_hz,
+                    ));
+                }
+                let already_active =
+                    target.width == w && target.height == h && target.current_hz == hz;
+                if !already_active {
+                    let env = WindowsEnv;
+                    match env.set_display_mode(&target.device_name, w, h, hz) {
+                        Ok(()) => {
+                            self.active_display_override = Some(format!("{w}×{h} @ {hz} Hz"));
+                            self.refresh_displays();
+                            self.push_log(
+                                Severity::Ok,
+                                format!(
+                                    "Display {} -> {w}×{h} @ {hz} Hz ({reason}, temporary).",
+                                    target.device_name
+                                ),
+                            );
+                        }
+                        Err(err) => {
+                            self.push_log(
+                                Severity::Warn,
+                                format!(
+                                    "Display switch to {w}×{h} @ {hz} Hz failed on {}: {err}",
+                                    target.device_name
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    self.active_display_override = Some(format!("{w}×{h} @ {hz} Hz"));
+                }
+            }
+        } else if self.original_display_mode.is_some() {
+            self.restore_original_display(reason);
+        }
+
         let mut logs: Vec<(Severity, String)> = Vec::new();
         let mut max_rate_limit_wait: Option<u64> = None;
         let mut any_succeeded = false;
@@ -1036,6 +1243,10 @@ fn run_runtime_loop(
         last_audio_refresh: Instant::now(),
         mic_lock_target: None,
         last_mic_lock_check: Instant::now(),
+        displays: Vec::new(),
+        original_display_mode: None,
+        active_display_override: None,
+        pending_display_test_revert: None,
         debouncer: FocusDebouncer::new(debounce),
         watcher: None,
         focus_rx: None,
@@ -1048,6 +1259,7 @@ fn run_runtime_loop(
 
     state.rebuild_controllers(BackendSelection::AutoConnected, "startup auto-detect");
     state.refresh_audio_devices();
+    state.refresh_displays();
     if initial_auto_switch {
         state.start_watcher();
     }
@@ -1060,6 +1272,16 @@ fn run_runtime_loop(
         }
         if state.poll_audio_and_mic_lock() {
             changed = true;
+        }
+        if state
+            .pending_display_test_revert
+            .as_ref()
+            .is_some_and(|(_, _, _, _, deadline)| Instant::now() >= *deadline)
+        {
+            if let Some(msg) = state.revert_test_display_if_pending("10s auto-revert failsafe") {
+                let _ = ui_tx.send(WorkerMsg::DisplayTestReverted(msg));
+                changed = true;
+            }
         }
 
         if let Some(rx) = &state.focus_rx {
@@ -1142,9 +1364,15 @@ fn run_runtime_loop(
             let rem = hp_at.saturating_duration_since(Instant::now());
             wait = wait.min(rem.max(Duration::from_millis(10)));
         }
+        if let Some((_, _, _, _, deadline)) = state.pending_display_test_revert {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            wait = wait.min(rem.max(Duration::from_millis(50)));
+        }
 
         match cmd_rx.recv_timeout(wait) {
             Ok(ProfileRuntimeCmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+                let _ = state.revert_test_display_if_pending("shutdown");
+                state.restore_original_display("shutdown");
                 state.stop_watcher();
                 break;
             }
@@ -1258,6 +1486,46 @@ fn run_runtime_loop(
             }
             Ok(ProfileRuntimeCmd::RefreshAudioDevices) => {
                 state.refresh_audio_devices();
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::RefreshDisplays) => {
+                state.refresh_displays();
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::TestDisplayMode {
+                device_name,
+                width,
+                height,
+                refresh_hz,
+            }) => {
+                let (resolved_dev, applied_label, previous_label, error) = state
+                    .start_test_display_mode(device_name.as_deref(), width, height, refresh_hz);
+                let _ = ui_tx.send(WorkerMsg::DisplayTestStarted {
+                    device_name: resolved_dev,
+                    applied_label,
+                    previous_label,
+                    error,
+                });
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::KeepTestDisplayMode) => {
+                if let Some((dev, w, h, hz, _)) = state.pending_display_test_revert.take() {
+                    if state.original_display_mode.is_none() {
+                        state.original_display_mode = Some((dev.clone(), w, h, hz));
+                    }
+                    state.push_log(
+                        Severity::Ok,
+                        format!(
+                            "Confirmed temporary display test on {dev} (will still restore {w}×{h} @ {hz} Hz on desktop/exit)."
+                        ),
+                    );
+                }
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::RevertTestDisplayMode) => {
+                if let Some(msg) = state.revert_test_display_if_pending("user/countdown") {
+                    let _ = ui_tx.send(WorkerMsg::DisplayTestReverted(msg));
+                }
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::UpdateStore(new_store)) => {

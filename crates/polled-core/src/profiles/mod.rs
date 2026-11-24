@@ -122,6 +122,18 @@ pub struct GameProfile {
     /// Periodically enforces `audio_input_volume` every 2s so games/Steam/Discord cannot hijack mic gain.
     #[serde(default)]
     pub lock_mic_volume: bool,
+    /// Optional target display device name (e.g. `\\.\DISPLAY1`). `None` targets the primary monitor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_device_name: Option<String>,
+    /// Optional temporary display width override (e.g. `1280` for 4:3 stretched). Restored automatically on tab-out/exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_width: Option<u32>,
+    /// Optional temporary display height override (e.g. `960`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_height: Option<u32>,
+    /// Optional temporary display refresh rate override in Hz (e.g. `240`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_refresh_hz: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,9 +164,25 @@ impl GameProfile {
             audio_input_device_name: None,
             audio_input_volume: None,
             lock_mic_volume: false,
+            display_device_name: None,
+            display_width: None,
+            display_height: None,
+            display_refresh_hz: None,
             author: None,
             notes: Some("Fallback profile used whenever no game profile matches.".to_string()),
         }
+    }
+
+    /// Returns `Some((optional_device_name, width, height, refresh_hz))` when this profile configures
+    /// a valid temporary display resolution & refresh-rate override.
+    pub fn display_mode_override(&self) -> Option<(Option<&str>, u32, u32, u32)> {
+        let w = self.display_width?;
+        let h = self.display_height?;
+        let hz = self.display_refresh_hz?;
+        if w < 800 || h < 600 || hz < 30 {
+            return None;
+        }
+        Some((self.display_device_name.as_deref(), w, h, hz))
     }
 
     /// Resolves the mouse settings to apply for a specific `device_id`, returning
@@ -213,6 +241,20 @@ impl GameProfile {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         self.audio_input_volume = self.audio_input_volume.map(|v| v.min(100));
+        self.display_device_name = self
+            .display_device_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let valid_display = matches!(
+            (self.display_width, self.display_height, self.display_refresh_hz),
+            (Some(w), Some(h), Some(hz)) if w >= 800 && h >= 600 && hz >= 30
+        );
+        if !valid_display {
+            self.display_device_name = None;
+            self.display_width = None;
+            self.display_height = None;
+            self.display_refresh_hz = None;
+        }
         self
     }
 }
@@ -341,6 +383,9 @@ mod tests {
                 angle_snapping: Some(false),
                 ripple_control: Some(false),
                 sleep_timeout_secs: Some(300),
+                dpi_stage: Some(2),
+                lock_dpi_stages: Some(true),
+                glass_mode: None,
             },
             device_overrides: BTreeMap::from([(
                 "lamzu_compx_4k".to_string(),
@@ -361,6 +406,10 @@ mod tests {
             audio_input_device_name: Some("Shure MV7".to_string()),
             audio_input_volume: Some(85),
             lock_mic_volume: true,
+            display_device_name: Some(r"\\.\DISPLAY1".to_string()),
+            display_width: Some(1280),
+            display_height: Some(960),
+            display_refresh_hz: Some(240),
             author: Some("k1jaa".to_string()),
             notes: Some("Tournament config".to_string()),
         });
@@ -369,6 +418,12 @@ mod tests {
         let loaded = ProfileStore::load_or_default(&path).unwrap();
         assert_eq!(loaded.profiles.len(), 2);
         assert_eq!(loaded.profiles[1].executables, vec!["cs2.exe"]);
+        assert_eq!(
+            loaded.profiles[1].display_mode_override(),
+            Some((Some(r"\\.\DISPLAY1"), 1280, 960, 240))
+        );
+        assert_eq!(loaded.profiles[1].mouse.dpi_stage, Some(2));
+        assert_eq!(loaded.profiles[1].mouse.lock_dpi_stages, Some(true));
         assert_eq!(
             loaded.profiles[1].windows_power_plan,
             Some(PowerPlanPreset::HighPerformance)
@@ -411,6 +466,10 @@ mod tests {
             audio_input_device_name: None,
             audio_input_volume: None,
             lock_mic_volume: false,
+            display_device_name: None,
+            display_width: None,
+            display_height: None,
+            display_refresh_hz: None,
             author: Some("k1jaa".to_string()),
             notes: Some("Low LOD + 4K".to_string()),
         };

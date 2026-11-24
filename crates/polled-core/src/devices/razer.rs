@@ -925,6 +925,9 @@ impl MouseDevice for RazerDevice {
             supports_sleep_timeout: self.spec.wireless,
             sleep_timeout_min_secs: if self.spec.wireless { 60 } else { 0 },
             sleep_timeout_max_secs: if self.spec.wireless { 900 } else { 0 },
+            dpi_stage_count: 0,
+            supports_dpi_lock: self.spec.v4_dpi_protocol,
+            supports_glass_mode: false,
             supports_volatile_writes: volatile,
             flash_write_warning: (!volatile).then(|| {
                 format!(
@@ -961,11 +964,14 @@ impl MouseDevice for RazerDevice {
             let polling_rate_hz = decode_extended_polling_rate(&poll_reply)
                 .ok_or_else(|| self.dev_err("Could not decode Razer V4 polling rate"))?;
             let (dpi_x, dpi_y) = stages[active];
+            let all_locked =
+                stages.len() > 1 && stages.iter().all(|&(sx, sy)| sx == dpi_x && sy == dpi_y);
             return Ok(MouseSettings {
                 dpi: Some(dpi_x),
                 dpi_y: (dpi_y != dpi_x).then_some(dpi_y),
                 polling_rate_hz: Some(polling_rate_hz),
                 sleep_timeout_secs,
+                lock_dpi_stages: Some(all_locked),
                 ..Default::default()
             });
         }
@@ -996,16 +1002,24 @@ impl MouseDevice for RazerDevice {
         let current = self.read_settings()?;
 
         if self.spec.v4_dpi_protocol {
-            if settings.dpi.is_some() || settings.dpi_y.is_some() {
+            let lock_all = settings.lock_dpi_stages == Some(true);
+            if settings.dpi.is_some() || settings.dpi_y.is_some() || lock_all {
                 let cur_x = current.dpi.unwrap_or(800);
                 let cur_y = current.dpi_y.unwrap_or(cur_x);
                 let target_x = settings.dpi.unwrap_or(cur_x);
                 let target_y = settings.dpi_y.or(settings.dpi).unwrap_or(cur_y);
-                if target_x != cur_x || target_y != cur_y {
+                if target_x != cur_x
+                    || target_y != cur_y
+                    || (lock_all && current.lock_dpi_stages != Some(true))
+                {
                     let dpi_reply = self.request(&cmd_read_v4_dpi_stages(), None)?;
                     let (active, mut stages) = decode_razer_v4_dpi_stages(&dpi_reply)
                         .ok_or_else(|| self.dev_err("Could not decode Razer V4 DPI stages"))?;
-                    stages[active] = (target_x, target_y);
+                    if lock_all {
+                        stages.fill((target_x, target_y));
+                    } else {
+                        stages[active] = (target_x, target_y);
+                    }
                     self.request(&cmd_set_v4_dpi_stages(active, &stages), None)?;
                 }
             }

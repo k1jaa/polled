@@ -167,6 +167,16 @@ pub struct MouseSettings {
     /// Optional wireless idle sleep timeout in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sleep_timeout_secs: Option<u16>,
+    /// Optional 1-based active onboard DPI stage slot (`1..=dpi_stage_count`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpi_stage: Option<u8>,
+    /// When `Some(true)`, syncs the profile's target DPI across all onboard DPI stages so
+    /// accidentally bumping the physical DPI button mid-game keeps your exact sensitivity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_dpi_stages: Option<bool>,
+    /// Optional Glass / high-reflectivity hard-pad sensor tracking mode (supported Endgame Gear mice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glass_mode: Option<bool>,
 }
 
 impl MouseSettings {
@@ -180,6 +190,9 @@ impl MouseSettings {
             && self.angle_snapping.is_none()
             && self.ripple_control.is_none()
             && self.sleep_timeout_secs.is_none()
+            && self.dpi_stage.is_none()
+            && self.lock_dpi_stages != Some(true)
+            && self.glass_mode.is_none()
     }
 
     /// Returns `true` if every `Some(...)` field in `desired` matches `self`.
@@ -233,6 +246,19 @@ impl MouseSettings {
                 return false;
             }
         }
+        if let Some(stage) = desired.dpi_stage {
+            if self.dpi_stage != Some(stage) {
+                return false;
+            }
+        }
+        if desired.lock_dpi_stages == Some(true) && self.lock_dpi_stages != Some(true) {
+            return false;
+        }
+        if let Some(glass) = desired.glass_mode {
+            if self.glass_mode != Some(glass) {
+                return false;
+            }
+        }
         true
     }
 
@@ -261,6 +287,13 @@ impl MouseSettings {
             angle_snapping: desired.angle_snapping.or(self.angle_snapping),
             ripple_control: desired.ripple_control.or(self.ripple_control),
             sleep_timeout_secs: desired.sleep_timeout_secs.or(self.sleep_timeout_secs),
+            dpi_stage: desired.dpi_stage.or(self.dpi_stage),
+            lock_dpi_stages: if desired.lock_dpi_stages == Some(true) {
+                Some(true)
+            } else {
+                self.lock_dpi_stages
+            },
+            glass_mode: desired.glass_mode.or(self.glass_mode),
         }
     }
 
@@ -296,6 +329,15 @@ impl MouseSettings {
             } else {
                 parts.push(format!("Sleep {secs}s"));
             }
+        }
+        if let Some(stage) = self.dpi_stage {
+            parts.push(format!("Stage #{stage}"));
+        }
+        if self.lock_dpi_stages == Some(true) {
+            parts.push("DPI Locked".to_string());
+        }
+        if let Some(glass) = self.glass_mode {
+            parts.push(format!("Glass {}", if glass { "ON" } else { "OFF" }));
         }
         if parts.is_empty() {
             "(no mouse changes)".to_string()
@@ -339,6 +381,15 @@ pub struct DeviceCapabilities {
     pub sleep_timeout_min_secs: u16,
     #[serde(default)]
     pub sleep_timeout_max_secs: u16,
+    /// Number of selectable 1-based onboard DPI stage slots (`0` = not configurable).
+    #[serde(default)]
+    pub dpi_stage_count: u8,
+    /// `true` if Polled can sync the profile's DPI to all onboard stages to guard against accidental DPI shifts.
+    #[serde(default)]
+    pub supports_dpi_lock: bool,
+    /// `true` if the mouse exposes hardware Glass / high-reflectivity surface sensor mode.
+    #[serde(default)]
+    pub supports_glass_mode: bool,
     /// If `false`, writes touch onboard flash and MUST be diffed and rate-limited.
     pub supports_volatile_writes: bool,
     pub flash_write_warning: Option<String>,
@@ -470,6 +521,40 @@ impl DeviceCapabilities {
             }
         }
 
+        if let Some(stage) = settings.dpi_stage {
+            if self.dpi_stage_count == 0 {
+                return Err(PolledError::UnsupportedSetting {
+                    device: device_name.to_string(),
+                    detail: format!(
+                        "Onboard DPI stage selection is not configurable on {device_name}"
+                    ),
+                });
+            }
+            if stage < 1 || stage > self.dpi_stage_count {
+                return Err(PolledError::UnsupportedSetting {
+                    device: device_name.to_string(),
+                    detail: format!(
+                        "DPI stage {stage} out of supported range 1..={}",
+                        self.dpi_stage_count
+                    ),
+                });
+            }
+        }
+
+        if settings.lock_dpi_stages == Some(true) && !self.supports_dpi_lock {
+            return Err(PolledError::UnsupportedSetting {
+                device: device_name.to_string(),
+                detail: format!("DPI button lock is not configurable on {device_name}"),
+            });
+        }
+
+        if settings.glass_mode.is_some() && !self.supports_glass_mode {
+            return Err(PolledError::UnsupportedSetting {
+                device: device_name.to_string(),
+                detail: format!("Glass Pad Mode is not configurable on {device_name}"),
+            });
+        }
+
         Ok(())
     }
 
@@ -594,6 +679,29 @@ impl DeviceCapabilities {
             }
         }
 
+        if let Some(stage) = desired.dpi_stage {
+            if self.dpi_stage_count == 0 {
+                notes.push(format!("DPI Stage #{stage} skipped"));
+                out.dpi_stage = None;
+            } else {
+                let clamped = stage.clamp(1, self.dpi_stage_count);
+                if clamped != stage {
+                    notes.push(format!("DPI Stage #{stage} -> #{clamped}"));
+                }
+                out.dpi_stage = Some(clamped);
+            }
+        }
+
+        if desired.lock_dpi_stages == Some(true) && !self.supports_dpi_lock {
+            notes.push("DPI Lock skipped".to_string());
+            out.lock_dpi_stages = None;
+        }
+
+        if desired.glass_mode.is_some() && !self.supports_glass_mode {
+            notes.push("Glass Mode skipped".to_string());
+            out.glass_mode = None;
+        }
+
         (out, notes)
     }
 }
@@ -684,6 +792,9 @@ mod tests {
             supports_sleep_timeout: true,
             sleep_timeout_min_secs: 10,
             sleep_timeout_max_secs: 1800,
+            dpi_stage_count: 8,
+            supports_dpi_lock: true,
+            supports_glass_mode: false,
             supports_volatile_writes: false,
             flash_write_warning: None,
         };
@@ -698,6 +809,9 @@ mod tests {
             angle_snapping: Some(false),
             ripple_control: Some(false),
             sleep_timeout_secs: Some(300),
+            dpi_stage: Some(2),
+            lock_dpi_stages: Some(true),
+            glass_mode: Some(true),
         };
 
         let (adapted, notes) = lamzu_caps.adapt_settings(&pulsar_profile);
@@ -708,7 +822,10 @@ mod tests {
         assert_eq!(adapted.debounce_ms, Some(15));
         assert_eq!(adapted.motion_sync, Some(true));
         assert_eq!(adapted.sleep_timeout_secs, Some(300));
-        assert_eq!(notes.len(), 5);
+        assert_eq!(adapted.dpi_stage, Some(2));
+        assert_eq!(adapted.lock_dpi_stages, Some(true));
+        assert_eq!(adapted.glass_mode, None);
+        assert_eq!(notes.len(), 6);
         assert!(lamzu_caps.validate("LAMZU 4K", &adapted).is_ok());
     }
 
@@ -730,6 +847,9 @@ mod tests {
             supports_sleep_timeout: false,
             sleep_timeout_min_secs: 0,
             sleep_timeout_max_secs: 0,
+            dpi_stage_count: 0,
+            supports_dpi_lock: false,
+            supports_glass_mode: false,
             supports_volatile_writes: true,
             flash_write_warning: None,
         };
@@ -744,6 +864,9 @@ mod tests {
             angle_snapping: Some(false),
             ripple_control: Some(false),
             sleep_timeout_secs: Some(300),
+            dpi_stage: Some(3),
+            lock_dpi_stages: Some(true),
+            glass_mode: Some(true),
         };
 
         let (adapted, notes) = logi_caps.adapt_settings(&desired);
@@ -756,7 +879,10 @@ mod tests {
         assert_eq!(adapted.angle_snapping, None);
         assert_eq!(adapted.ripple_control, None);
         assert_eq!(adapted.sleep_timeout_secs, None);
-        assert_eq!(notes.len(), 8);
+        assert_eq!(adapted.dpi_stage, None);
+        assert_eq!(adapted.lock_dpi_stages, None);
+        assert_eq!(adapted.glass_mode, None);
+        assert_eq!(notes.len(), 11);
         assert!(logi_caps.validate("PRO X SUPERLIGHT", &adapted).is_ok());
     }
 }

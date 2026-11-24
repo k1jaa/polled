@@ -211,6 +211,9 @@ mod tests {
             angle_snapping: Some(false),
             ripple_control: Some(false),
             sleep_timeout_secs: Some(300),
+            dpi_stage: Some(2),
+            lock_dpi_stages: Some(true),
+            glass_mode: Some(false),
         };
         let outcome = ctrl.apply_profile_settings(&desired).unwrap();
         assert_eq!(

@@ -7,12 +7,14 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
+use chrono::Local;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 use polled_core::win::{RegHive, WindowsEnv};
 use polled_core::{
-    curated_custom_tweak_presets, is_autostart_enabled, set_autostart_enabled, AppPaths,
-    AppSettings, CheckReport, CustomTweakDef, CustomTweakStore, CustomValueKind, HealthEngine,
-    HotkeyBinding, MouseSettings, PolledError, ScanSummary, Severity, SupportTier, ThemePreference,
+    curated_custom_tweak_presets, export_setup_bundle_json, is_autostart_enabled,
+    parse_setup_bundle_json, restore_setup_bundle, set_autostart_enabled, AppPaths, AppSettings,
+    CheckReport, CustomTweakDef, CustomTweakStore, CustomValueKind, HealthEngine, HotkeyBinding,
+    MouseSettings, PolledError, ScanSummary, Severity, SupportTier, ThemePreference,
 };
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
@@ -236,6 +238,13 @@ pub(crate) enum WorkerMsg {
         settings: Option<MouseSettings>,
         error: Option<String>,
     },
+    DisplayTestStarted {
+        device_name: String,
+        applied_label: String,
+        previous_label: String,
+        error: Option<String>,
+    },
+    DisplayTestReverted(String),
 }
 
 pub struct PolledApp {
@@ -256,6 +265,10 @@ pub struct PolledApp {
     pending_confirm: Option<PendingConfirm>,
     show_latency_tips: bool,
     hotkeys_modal_open: bool,
+    setup_backup_export_json: Option<String>,
+    setup_backup_import_open: bool,
+    setup_backup_import_text: String,
+    setup_backup_error: Option<String>,
     custom_tweak_draft: CustomTweakDraft,
 
     profiles_ui: ProfilesUiState,
@@ -335,6 +348,10 @@ impl PolledApp {
             pending_confirm: None,
             show_latency_tips: false,
             hotkeys_modal_open: false,
+            setup_backup_export_json: None,
+            setup_backup_import_open: false,
+            setup_backup_import_text: String::new(),
+            setup_backup_error: None,
             custom_tweak_draft: CustomTweakDraft::default(),
             profiles_ui,
             profile_runtime,
@@ -756,6 +773,22 @@ impl PolledApp {
                 } => {
                     self.profiles_ui
                         .apply_read_from_mouse(device_name, settings, error);
+                }
+                WorkerMsg::DisplayTestStarted {
+                    device_name,
+                    applied_label,
+                    previous_label,
+                    error,
+                } => {
+                    self.profiles_ui.on_display_test_started(
+                        device_name,
+                        applied_label,
+                        previous_label,
+                        error,
+                    );
+                }
+                WorkerMsg::DisplayTestReverted(msg) => {
+                    self.profiles_ui.on_display_test_reverted(msg);
                 }
             }
         }
@@ -2005,12 +2038,14 @@ impl eframe::App for PolledApp {
             }
         }
 
-        // --- SETTINGS MODAL (TRAY, ALERTS & GLOBAL HOTKEYS) ---
+        // --- SETTINGS MODAL (TRAY, ALERTS, GLOBAL HOTKEYS & SETUP BACKUP) ---
         if self.hotkeys_modal_open {
             let mut close_hk = false;
             let mut save_hk = false;
+            let mut export_backup_clicked = false;
+            let mut open_import_backup_clicked = false;
             let modal_w = (ctx.screen_rect().width() - 48.0).clamp(380.0, 520.0);
-            egui::Window::new("Settings — Tray, Alerts & Global Hotkeys")
+            egui::Window::new("Settings — Tray, Alerts, Hotkeys & Backup")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -2123,6 +2158,40 @@ impl eframe::App for PolledApp {
                             });
                     });
 
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.label(
+                        RichText::new("SETUP BACKUP & RESTORE (POLLED.SETUP.V1)")
+                            .size(10.5)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Bundle all game profiles, custom tweaks, alerts, and hotkey settings into one portable JSON file for moving PCs or clean Windows installs.",
+                            )
+                            .size(11.5)
+                            .color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(secondary_button("Export Setup Backup", p)).clicked() {
+                            export_backup_clicked = true;
+                        }
+                        if ui
+                            .add(secondary_button("Restore from Backup...", p))
+                            .clicked()
+                        {
+                            open_import_backup_clicked = true;
+                        }
+                    });
+
                     ui.add_space(12.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(primary_button("Save & Apply", p)).clicked() {
@@ -2134,7 +2203,23 @@ impl eframe::App for PolledApp {
                     });
                 });
 
-            if save_hk {
+            if export_backup_clicked {
+                let paths = AppPaths::default_user_dir();
+                match export_setup_bundle_json(&paths) {
+                    Ok(json) => {
+                        self.setup_backup_export_json = Some(json);
+                        self.hotkeys_modal_open = false;
+                    }
+                    Err(err) => {
+                        self.error_message = Some(format!("Failed to export setup backup: {err}"));
+                    }
+                }
+            } else if open_import_backup_clicked {
+                self.setup_backup_import_open = true;
+                self.setup_backup_import_text.clear();
+                self.setup_backup_error = None;
+                self.hotkeys_modal_open = false;
+            } else if save_hk {
                 self.settings.alerts.low_battery_threshold_pct =
                     self.settings.alerts.clamped_threshold();
                 let _ = self
@@ -2152,6 +2237,180 @@ impl eframe::App for PolledApp {
                 self.hotkeys_modal_open = false;
             } else if close_hk {
                 self.hotkeys_modal_open = false;
+            }
+        }
+
+        // --- EXPORT FULL SETUP BACKUP MODAL ---
+        let mut close_backup_export = false;
+        if let Some(json) = self.setup_backup_export_json.clone() {
+            let modal_w = (ctx.screen_rect().width() - 48.0).clamp(380.0, 560.0);
+            egui::Window::new("Export Setup Backup (polled.setup.v1)")
+                .collapsible(false)
+                .resizable(true)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .default_width(modal_w)
+                .max_width(modal_w)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.5_f32, p.text))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(16)),
+                )
+                .show(ctx, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Includes settings.json, profiles.json, and custom_tweaks.json (host-specific baseline snapshots are excluded).",
+                            )
+                            .size(12.0)
+                            .color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(6.0);
+                    let mut preview = json.clone();
+                    egui::ScrollArea::vertical()
+                        .id_salt("backup_export_scroll")
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut preview)
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    ui.add_space(10.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(secondary_button("Close", p)).clicked() {
+                            close_backup_export = true;
+                        }
+                        if ui.add(secondary_button("Save to Exports", p)).clicked() {
+                            let dir = AppPaths::default_user_dir().exports_dir();
+                            let filename = format!(
+                                "polled_backup_{}.json",
+                                Local::now().format("%Y%m%d_%H%M%S")
+                            );
+                            let path = dir.join(filename);
+                            match std::fs::create_dir_all(&dir)
+                                .and_then(|()| std::fs::write(&path, &json))
+                            {
+                                Ok(()) => {
+                                    self.status_message = Some(format!(
+                                        "Saved setup backup bundle to {}",
+                                        path.display()
+                                    ));
+                                    self.error_message = None;
+                                }
+                                Err(err) => {
+                                    self.error_message =
+                                        Some(format!("Failed to save backup file: {err}"));
+                                }
+                            }
+                        }
+                        if ui.add(primary_button("Copy JSON", p)).clicked() {
+                            ctx.copy_text(json.clone());
+                            self.status_message =
+                                Some("Copied full setup backup JSON to clipboard.".to_string());
+                            self.error_message = None;
+                        }
+                    });
+                });
+        }
+        if close_backup_export {
+            self.setup_backup_export_json = None;
+        }
+
+        // --- RESTORE FULL SETUP BACKUP MODAL ---
+        if self.setup_backup_import_open {
+            let mut close_backup_import = false;
+            let mut restore_backup_now = false;
+            let modal_w = (ctx.screen_rect().width() - 48.0).clamp(380.0, 560.0);
+            egui::Window::new("Restore Setup Backup (polled.setup.v1)")
+                .collapsible(false)
+                .resizable(true)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .default_width(modal_w)
+                .max_width(modal_w)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.5_f32, p.text))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(16)),
+                )
+                .show(ctx, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Paste a Polled setup backup JSON bundle (`polled.setup.v1`). Restores your profiles, custom tweaks, alerts, theme, and hotkeys (never touches Windows registry directly).",
+                            )
+                            .size(12.0)
+                            .color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("backup_import_scroll")
+                        .max_height(230.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.setup_backup_import_text)
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    if let Some(err) = &self.setup_backup_error {
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(RichText::new(err).size(12.0).color(p.bad)).wrap(),
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(primary_button("Restore Setup", p)).clicked() {
+                            restore_backup_now = true;
+                        }
+                        if ui.add(secondary_button("Cancel", p)).clicked() {
+                            close_backup_import = true;
+                        }
+                    });
+                });
+
+            if restore_backup_now {
+                let paths = AppPaths::default_user_dir();
+                match parse_setup_bundle_json(&self.setup_backup_import_text)
+                    .and_then(|bundle| restore_setup_bundle(&paths, &bundle))
+                {
+                    Ok(restored) => {
+                        let summary = restored.summary_counts();
+                        self.settings = restored.settings.clone();
+                        self.theme = ThemeMode::from(self.settings.theme);
+                        self.theme.apply_to(ctx);
+                        self.hotkey_manager
+                            .update_config(self.settings.hotkeys.clone());
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::UpdateAlertConfig(
+                                self.settings.alerts.clone(),
+                            ));
+                        self.profiles_ui.reload_store(restored.profiles.clone());
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::UpdateStore(restored.profiles));
+                        self.sync_tray_from_snapshot();
+                        self.setup_backup_import_open = false;
+                        self.setup_backup_error = None;
+                        self.status_message = Some(format!("Restored setup backup ({summary})."));
+                        self.error_message = None;
+                        self.start_scan(ctx, false);
+                    }
+                    Err(err) => {
+                        self.setup_backup_error = Some(err.to_string());
+                    }
+                }
+            } else if close_backup_import {
+                self.setup_backup_import_open = false;
+                self.setup_backup_error = None;
             }
         }
 

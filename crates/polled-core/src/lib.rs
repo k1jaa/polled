@@ -2,6 +2,7 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+pub mod backup;
 pub mod checks;
 pub mod devices;
 pub mod diagnostics;
@@ -11,6 +12,11 @@ pub mod paths;
 pub mod profiles;
 pub mod settings;
 pub mod win;
+
+pub use backup::{
+    export_setup_bundle, export_setup_bundle_json, parse_setup_bundle_json, restore_setup_bundle,
+    SetupBackupBundle, SETUP_BACKUP_FORMAT, SETUP_BACKUP_SCHEMA_VERSION,
+};
 
 pub use checks::{
     curated_custom_tweak_presets, CheckReport, CustomTweakCheck, CustomTweakDef, CustomTweakStore,
@@ -41,7 +47,7 @@ pub use diagnostics::{
     BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, STANDARD_RATES_HZ,
 };
 pub use error::{PolledError, Result};
-pub use hid::{dump_hid_devices, HidDeviceDump, HidDumpReport};
+pub use hid::{dump_hid_devices, format_unsupported_mouse_issue, HidDeviceDump, HidDumpReport};
 pub use paths::AppPaths;
 pub use profiles::{
     discover_installed_games, discover_running_apps, export_profile_json, import_profile_json,
@@ -53,6 +59,7 @@ pub use settings::{
     HotkeyBinding, HotkeyConfig, ThemePreference, TrayAlertConfig,
 };
 pub use win::{
-    AudioEndpointInfo, AudioFlow, AudioLatencyBenchmark, NetworkAdapterInfo, NetworkAdapterKind,
-    NetworkJitterBenchmark, PingHopStats,
+    AudioEndpointInfo, AudioFlow, AudioLatencyBenchmark, DisplayModeInfo, DisplayResolutionMode,
+    NetworkAdapterInfo, NetworkAdapterKind, NetworkJitterBenchmark, PciMsiCategory, PciMsiDevice,
+    PingHopStats,
 };

@@ -7,7 +7,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 
 ---
 
-## 1. Built-In Health Checks & Optional Tweaks (40 Total)
+## 1. Built-In Health Checks & Optional Tweaks (41 Total)
 
 ### 1.1 Core Mouse & Cursor Input
 
@@ -26,6 +26,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 | `usb_selective_suspend` | Fixable | `powrprof.dll` active scheme → Subgroup `2a737441-1930-4402-8d77-b2bebba308a3` → Setting `48e6b7a6-50f5-4782-a5d4-53bb8f07e226` | AC index = `0` (Disabled); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
 | `usb_power_management` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_...` & `ROOT_HUB20/30` (`EnhancedPowerManagementEnabled`, `SelectiveSuspendEnabled`, `AllowIdleIrpInD3`, `WDF\IdleInWorkingState`) | *None (never modifies)* | No admin | N/A |
 | `usb_xhci_msi` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\...\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties\MSISupported` where `Service == USBXHCI` | *None (never modifies)* | No admin | N/A |
+| `pci_gpu_audio_msi` | **Report-Only** | Reads `MSISupported` under `HKLM\SYSTEM\CurrentControlSet\Enum\PCI` for PCI Display adapters (NVIDIA/AMD/Intel GPUs) and PCI High Definition Audio controllers (`HDAudBus`, `HdAudio`, `MEDIA`) | *None (never modifies)* | No admin | N/A |
 | `usb_topology` | **Report-Only** | Walks live Windows PnP USB device tree via `cfgmgr32.dll` (`CM_Get_Device_ID_ListW`, `CM_Get_Parent`, `CM_Get_Child`, `CM_Get_Sibling`) + `hidapi` to map connected mice/dongles to their exact USB port, hub, PCI xHCI controller, and sibling cameras/USB audio DACs/storage | *None (never modifies)* | No admin | N/A |
 | `pcie_aspm` | Fixable | `powrprof.dll` active scheme → Subgroup `501a4d13-42af-4429-9fd1-a8218c268e20` → Setting `ee12f906-d277-404b-b6da-e5fa1a576df5` | AC index = `0` (Off); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
 | `power_plan` | Fixable | `powrprof.dll` `PowerSetActiveScheme` | Switches active scheme to High Performance (`8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c`) / Ultimate Performance / Balanced (if on Power Saver) | No admin / Immediate | Calls `PowerSetActiveScheme` with original scheme GUID |
@@ -118,7 +119,7 @@ All persistent files created by Polled live under **`%LOCALAPPDATA%\Polled\`**:
 | `profiles.json` | User-created per-game mouse profiles, per-mouse overrides, and focus debounce delay. |
 | `settings.json` | UI theme (`dark` / `light`), Auto-Switch startup toggle, live battery tray icon & toast alert preferences (`alerts`), and optional global hotkey bindings (`RegisterHotKey`, disabled by default). |
 | `custom_tweaks.json` | User-defined custom reversible registry tweaks. |
-| `exports/` | Optional user-triggered Bench PNG benchmark cards (`polled_bench_*.png`) and CSV raw interval exports (`polled_bench_*.csv`). |
+| `exports/` | Optional user-triggered Bench PNG/Scorecard PNG cards (`polled_bench_*.png`), CSV raw interval exports (`polled_bench_*.csv`), full setup backup bundles (`polled_backup_*.json`), and serial-redacted unsupported-mouse reports (`polled_mouse_report_*.md`). |
 
 **Optional Windows Startup Entry (OFF by default):**
 - When you toggle **Startup: OFF → ON**, Polled writes:
@@ -138,23 +139,26 @@ When **Auto-Switch** is enabled or you click **Apply Now**, Polled can modify:
 3. **Optional Windows Audio Output, Microphone & Mic Gain Lock** (only if configured on the profile, switched from the tray **Audio Output** submenu, or cycled via global hotkey):
    - Uses standard user-mode Windows Core Audio COM (`IPolicyConfig::SetDefaultEndpoint` across Console, Multimedia, and Communications roles; zero admin required) to switch default playback/capture endpoints.
    - Uses `IAudioEndpointVolume::SetMasterVolumeLevelScalar` to set playback/mic volume (`0..=100%`). When **Lock Gain** is enabled on a profile with a configured Mic Volume, Polled checks and restores the microphone level every 2 seconds while that profile is active so games, Steam Voice, or Discord cannot silently alter your mic slider.
-4. **Mouse Hardware Settings over USB HID** (only on matching protocol-family devices):
+4. **Optional Temporary Display Resolution & Refresh Rate Override** (only if enabled on a profile):
+   - Pre-validates modes with Win32 `ChangeDisplaySettingsExW(..., CDS_TEST)` and applies strictly as a temporary session-only switch (`dwflags = 0`; **`CDS_UPDATEREGISTRY` is never passed**, so crashes or reboots always recover native desktop resolution cleanly).
+   - Automatically restores your captured native resolution & refresh rate when tabbing back to desktop, switching to a profile without a display override, or exiting Polled. GUI **Test (10s)** enforces both a 10-second confirmation countdown and an independent 11-second background failsafe auto-revert.
+5. **Mouse Hardware Settings over USB HID** (only on matching protocol-family devices):
    - **CompX / Nordic 17-byte protocol** (`usage_page 0xFF02`, `usage 0x0002`, `Report ID 0x08`, `CMD_MEM_SET = 0x07`, Pulsar / LAMZU / VGN / Scyrox V8 / ATK & VXE R1 / G-Wolves XVI:0 / Hitscan Hyperlight):
-     - Writes **only changed registers** among: Polling Rate (`0x0000`), Active DPI Stage X/Y (`0x000C + 4*stage`), Lift-Off Distance (`0x000A`), Debounce (`0x00A9`), Motion Sync (`0x00AB`), Angle Snapping (`0x00AF`), and Ripple Control (`0x00B1`). Reads battery via read-only `CMD_BATTERY = 0x04`. Never sends factory reset (`0x09`).
+     - Writes **only changed registers** among: Polling Rate (`0x0000`), Active DPI Stage Slot (`0x0004`), DPI Stage X/Y (`0x000C + 4*stage`, or all stages when **Lock DPI Button** is enabled), Lift-Off Distance (`0x000A`), Debounce (`0x00A9`), Motion Sync (`0x00AB`), Idle Sleep (`0x00AD`), Angle Snapping (`0x00AF`), and Ripple Control (`0x00B1`). Reads battery via read-only `CMD_BATTERY = 0x04`. Never sends factory reset (`0x09`).
    - **CompX 64-byte Page-Command protocol** (`Report ID 0x00`, WLMouse / LAMZU Maya X & Inca / Attack Shark / Vancer / RAWM / CRDRAKO / LunaFury):
-     - Writes active-profile DPI stage table (`page 0x01, cmd 0x01`), polling rate (`cmd 0x00`), LOD (`cmd 0x08`), debounce (`page 0x00, cmd 0x08`), Motion Sync (`0x09`), Angle Snapping (`0x04`), and Ripple Control (`0x0A`) to onboard profile storage. Reads battery via read-only `0x83`.
+     - Writes active-profile DPI stage table (`page 0x01, cmd 0x01`, syncing all stages when **Lock DPI Button** is enabled), polling rate (`cmd 0x00`), LOD (`cmd 0x08`), debounce (`page 0x00, cmd 0x08`), Motion Sync (`0x09`), Angle Snapping (`0x04`), and Ripple Control (`0x0A`) to onboard profile storage. Reads battery via read-only `0x83`.
    - **Razer 90-byte Feature Report protocol** (`VID 0x1532`, `Report ID 0x00`, XOR checksum byte 88):
-     - Writes DPI (`class 0x04, id 0x05`, or V4 multi-stage `0x04/0x06` on Viper V4 Pro), legacy (`0x00/0x05`) or extended (`0x00/0x40` + commit selector `0x01` where required) polling rate, and symmetric tracking distance (`0x0B/0x0B`, only on verified LOD-capable models). Reads battery via read-only `0x07/0x80` & `0x07/0x84`. Never writes button remaps or lighting.
+     - Writes DPI (`class 0x04, id 0x05`, or V4 multi-stage `0x04/0x06` on Viper V4 Pro / DeathAdder V4 Pro with optional **Lock DPI Button**), legacy (`0x00/0x05`) or extended (`0x00/0x40` + commit selector `0x01` where required) polling rate, and symmetric tracking distance (`0x0B/0x0B`, only on verified LOD-capable models). Reads battery via read-only `0x07/0x80` & `0x07/0x84`. Never writes button remaps or lighting.
    - **Endgame Gear K26/W26 protocol** (`VID 0x3367`, Feature Report `0xA0`/`0xA1`):
-     - Updates enabled CPI stages, polling divider, LOD, Motion Sync, Angle Snapping, and Ripple Control via full config store (`0x11`) on wired 8K models or changed-only block writes (`0x14`/`0x15`) on wireless 4K models. Never issues factory reset (`0x13`).
+     - Updates enabled CPI stages, polling divider, LOD, Motion Sync, Angle Snapping, Ripple Control, and **Glass Pad Mode** (`OFFSET_GLASS_MODE = 127` / 4K wireless `OP_WRITE_POWER` byte `0x6F` on supported v2 / Purple Frost models) via full config store (`0x11`) on wired 8K models or changed-only block writes (`0x14`/`0x15`) on wireless 4K models. Never issues factory reset (`0x13`).
    - **Finalmouse ULX / SLX protocol** (`VID 0x361D`, Output Report `0x04`/`0x01`):
      - Sends DPI (`cmd 16`), polling rate (`cmd 17`, ULX only), LOD (`cmd 21` / `cmd 25`), and Motion Sync (`cmd 18`). Reads battery via read-only telemetry (`cmd 5/37/38`).
    - **VAXEE Control Center v3.6 protocol** (`VID 0x3057`, Feature Report `0x0E` on `0xFF05:0x01`):
-     - Updates active-stage DPI (`0x04`), polling rate (`0x07`), and LOD (`0x09`). Reads battery via read-only `0x0B` & `0x10`.
+     - Updates active DPI stage (`0x02`), active/all-stage DPI (`0x04`), polling rate (`0x07`), and LOD (`0x09`). Reads battery via read-only `0x0B` & `0x10`.
    - **Ninjutso NinjaForce protocol** (`VID 0x093A` Feature Report `0x06`/`0x03`, `VID 0x1915` Feature Report `0x05`/`0x04`):
      - Updates active-stage DPI, polling rate, LOD, and Motion Sync. Reads battery on current-gen models via read-only cmds `17/18`.
    - **MCHOSE V2 / Ultra protocol** (`VID 0x3837` / `0x5253`, Feature Reports `0x11`/`0x12` on `0xFF01:0x01`):
-     - Updates DPI stages, polling rate (`0x42`), LOD, debounce, Motion Sync, Angle Snapping, and Ripple Control via read-modify-write config blob (`0x67`/`0x57`). Reads battery via read-only `0x06`.
+     - Updates active DPI stage, DPI stages (with optional **Lock DPI Button**), polling rate (`0x42`), LOD, debounce, Motion Sync, Angle Snapping, and Ripple Control via read-modify-write config blob (`0x67`/`0x57`). Reads battery via read-only `0x06`.
    - **Incott protocol** (`VID 0x093A:522C/622C`, Feature Report `0x09` on `0xFF05`):
      - Updates polling rate (`0x01`), active-stage DPI (`0x02`), LOD / Ripple / Angle Snap / Motion Sync (`0x04`), and debounce (`0x05`).
    - **Keychron Launcher 8K protocol** (`VID 0x3434`, Output/Input Reports `0xB3`/`0xB4`/`0xB5`/`0xB6` on `0xFFC1:0x01`):

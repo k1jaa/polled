@@ -45,6 +45,9 @@ impl DryRunDevice {
                 angle_snapping: Some(false),
                 ripple_control: Some(false),
                 sleep_timeout_secs: Some(300),
+                dpi_stage: Some(1),
+                lock_dpi_stages: Some(false),
+                glass_mode: Some(false),
             },
             simulate_next_mismatch: false,
             write_count: Arc::new(AtomicU64::new(0)),
@@ -107,6 +110,9 @@ impl MouseDevice for DryRunDevice {
             supports_sleep_timeout: true,
             sleep_timeout_min_secs: 10,
             sleep_timeout_max_secs: 1800,
+            dpi_stage_count: 6,
+            supports_dpi_lock: true,
+            supports_glass_mode: true,
             supports_volatile_writes: self.supports_volatile_writes,
             flash_write_warning: if self.supports_volatile_writes {
                 None

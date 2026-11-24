@@ -720,6 +720,9 @@ impl MouseDevice for EndgameGearOp1Device {
             supports_sleep_timeout: false,
             sleep_timeout_min_secs: 0,
             sleep_timeout_max_secs: 0,
+            dpi_stage_count: 0,
+            supports_dpi_lock: false,
+            supports_glass_mode: self.profile.has_glass_mode,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} stores settings in onboard flash. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -749,6 +752,9 @@ impl MouseDevice for EndgameGearOp1Device {
             angle_snapping: Some(config[OFFSET_ANGLE_SNAPPING] != 0),
             ripple_control: Some(config[OFFSET_RIPPLE_CONTROL] != 0),
             sleep_timeout_secs: None,
+            dpi_stage: None,
+            lock_dpi_stages: None,
+            glass_mode: self.profile.has_glass_mode.then_some(glass_mode),
         })
     }
 
@@ -764,7 +770,33 @@ impl MouseDevice for EndgameGearOp1Device {
 
         let mut config = self.read_config_raw()?;
         let before = config.clone();
-        let glass_mode = self.profile.has_glass_mode && config[OFFSET_GLASS_MODE] != 0;
+        let prev_glass_mode = self.profile.has_glass_mode && config[OFFSET_GLASS_MODE] != 0;
+        let glass_mode = if let Some(target_glass) = settings.glass_mode {
+            if !self.profile.has_glass_mode {
+                return Err(PolledError::UnsupportedSetting {
+                    device: self.profile.name.to_string(),
+                    detail: format!("Glass Mode is not supported on {}", self.profile.name),
+                });
+            }
+            config[OFFSET_GLASS_MODE] = u8::from(target_glass);
+            target_glass
+        } else {
+            prev_glass_mode
+        };
+
+        if glass_mode != prev_glass_mode && settings.lod.is_none() {
+            // Re-encode the active LOD for the new surface mode (glass mode supports 1.0/2.0 mm).
+            let cur_lod = decode_egg_lod(self.profile, config[OFFSET_LOD], prev_glass_mode)
+                .unwrap_or(LiftOffDistance::Mm10);
+            let mapped = if glass_mode && cur_lod == LiftOffDistance::Mm07 {
+                LiftOffDistance::Mm10
+            } else {
+                cur_lod
+            };
+            if let Some(encoded) = encode_egg_lod(self.profile, mapped, glass_mode) {
+                config[OFFSET_LOD] = encoded;
+            }
+        }
 
         if let Some(target_dpi) = settings.dpi {
             if !self.profile.is_valid_cpi(target_dpi) {

@@ -8,7 +8,9 @@ use chrono::{DateTime, Utc};
 use hidapi::HidApi;
 use serde::{Deserialize, Serialize};
 
+use crate::devices::DeviceInfo;
 use crate::error::{PolledError, Result};
+use crate::win::UsbMouseTopology;
 
 /// Summary of Input/Output/Feature reports declared by a single HID collection's descriptor.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +259,92 @@ pub fn describe_usage_page(page: u16) -> &'static str {
     }
 }
 
+/// Formats a privacy-safe, serial-redacted GitHub Issue markdown report combining connected
+/// mouse/vendor HID interfaces, report descriptors, and USB hub/port topology so users can
+/// request driver support for unsupported mice in one click.
+pub fn format_unsupported_mouse_issue(
+    dump: &HidDumpReport,
+    topology: &[UsbMouseTopology],
+    detected: &[DeviceInfo],
+    windows_version: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("### Unsupported Mouse Support Request\n\n");
+    out.push_str(&format!(
+        "- **Polled Version**: `{}`\n",
+        env!("CARGO_PKG_VERSION")
+    ));
+    if let Some(win) = windows_version.filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("- **Windows Build**: `{win}`\n"));
+    }
+    out.push_str("- **Mouse Brand & Exact Model**: *(please fill in, e.g. Pulsar X2H Mini / Logitech G309)*\n");
+    out.push_str("- **Connection**: *(Wired USB / 1K Dongle / 4K-8K Dongle)*\n");
+    out.push_str("- **Serial Numbers Redacted**: `yes`\n\n");
+
+    out.push_str("#### Currently Detected by Polled\n");
+    if detected.is_empty() {
+        out.push_str("- *(none — Dry-Run fallback active)*\n");
+    } else {
+        for dev in detected {
+            let vp = dev.vid_pid.as_deref().unwrap_or("n/a");
+            out.push_str(&format!(
+                "- `{}` (`{vp}`, {}, {})\n",
+                dev.name,
+                dev.connection,
+                dev.support_tier.label()
+            ));
+        }
+    }
+    out.push('\n');
+
+    if !topology.is_empty() {
+        out.push_str("#### USB Mouse Topology\n");
+        for item in topology {
+            let loc = match (item.port_number, item.hub_number) {
+                (Some(p), Some(h)) => format!("Port #{p}, Hub #{h} ({})", item.hub_name),
+                (Some(p), None) => format!("Port #{p} ({})", item.hub_name),
+                _ => item.hub_name.clone(),
+            };
+            out.push_str(&format!("- `{}` (`{}`) — {loc}\n", item.name, item.vid_pid));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("#### HID Interfaces (Mouse & Vendor Config Collections)\n");
+    out.push_str("```text\n");
+    let relevant: Vec<&HidDeviceDump> = dump
+        .devices
+        .iter()
+        .filter(|d| (d.usage_page == 0x0001 && d.usage == 0x0002) || d.usage_page >= 0xFF00)
+        .collect();
+    if relevant.is_empty() {
+        out.push_str("(no mouse or vendor-defined HID interfaces found)\n");
+    } else {
+        for d in relevant {
+            let prod = d.product.as_deref().unwrap_or("<unknown>");
+            let mfg = d.manufacturer.as_deref().unwrap_or("<unknown>");
+            let rep = d
+                .reports
+                .as_ref()
+                .map(|r| r.compact_label())
+                .unwrap_or_else(|| "reports:locked/unopened".to_string());
+            out.push_str(&format!(
+                "{} | if={:02} | up=0x{:04x} u=0x{:04x} | rel=0x{:04x} | {} / {} | {}\n",
+                d.vid_pid,
+                d.interface_number,
+                d.usage_page,
+                d.usage,
+                d.release_number,
+                mfg,
+                prod,
+                rep
+            ));
+        }
+    }
+    out.push_str("```\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +384,58 @@ mod tests {
         assert_eq!(summary.output_reports.get(&0x08), Some(&17));
         assert!(summary.feature_reports.is_empty());
         assert!(summary.has_report_id(0x08));
+    }
+
+    #[test]
+    fn formats_serial_redacted_unsupported_mouse_issue_markdown() {
+        let mut reports = HidReportSummary::default();
+        reports.feature_reports.insert(0x09, 9);
+        let dump = HidDumpReport {
+            schema_version: 1,
+            captured_at: Utc::now(),
+            serials_redacted: true,
+            device_count: 2,
+            devices: vec![
+                HidDeviceDump {
+                    vendor_id: 0x1234,
+                    product_id: 0x5678,
+                    vid_pid: "1234:5678".to_string(),
+                    manufacturer: Some("Acme".to_string()),
+                    product: Some("HyperMouse 8K".to_string()),
+                    serial_number: Some("SECRET-SERIAL-999".to_string()),
+                    release_number: 0x0100,
+                    interface_number: 1,
+                    usage_page: 0xFF05,
+                    usage: 0x0001,
+                    usage_page_label: "Vendor-Defined".to_string(),
+                    bus_type: "Usb".to_string(),
+                    reports: Some(reports),
+                    path: r"\\?\hid#vid_1234&pid_5678#SECRET-SERIAL-999".to_string(),
+                },
+                HidDeviceDump {
+                    vendor_id: 0x1234,
+                    product_id: 0x5678,
+                    vid_pid: "1234:5678".to_string(),
+                    manufacturer: Some("Acme".to_string()),
+                    product: Some("HyperMouse Keyboard".to_string()),
+                    serial_number: Some("<redacted>".to_string()),
+                    release_number: 0x0100,
+                    interface_number: 0,
+                    usage_page: 0x0007,
+                    usage: 0x0006,
+                    usage_page_label: "Keyboard".to_string(),
+                    bus_type: "Usb".to_string(),
+                    reports: None,
+                    path: String::new(),
+                },
+            ],
+        };
+
+        let md = format_unsupported_mouse_issue(&dump, &[], &[], Some("26200.1000"));
+        assert!(md.contains("1234:5678"));
+        assert!(md.contains("0xff05"));
+        assert!(md.contains("feat:[0x09(9B)]"));
+        assert!(!md.contains("SECRET-SERIAL-999"));
+        assert!(!md.contains("HyperMouse Keyboard"));
     }
 }

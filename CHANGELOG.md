@@ -16,6 +16,27 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.0] - 2026-11-25
+
+### Added
+- **Per-Game Display Mode Switching (Stretched Resolution & Refresh Rate) + 10-Second Auto-Revert Safety Guard (`win/display.rs`, `profiles/mod.rs`, `profile_runtime.rs`, `profiles_ui.rs`):**
+  - Added optional per-game **Display Mode** override (`display_device_name`, `display_width`, `display_height`, `display_refresh_hz`) to `GameProfile` and the **Profiles → Display, Audio & Power** editor tab, enumerating all 32-bit monitor modes with aspect ratio tags (`16:9`, `4:3`, `5:4`, `16:10`, `21:9`).
+  - Uses Win32 `ChangeDisplaySettingsExW` pre-validated with `CDS_TEST` and applied strictly as a temporary session-only switch (`CDS_UPDATEREGISTRY` is **never** passed), automatically restoring native desktop resolution & Hz when tabbing out, switching profiles, or exiting Polled.
+  - Added a **`Test (10s)`** button with both a live 10-second countdown confirmation modal and an independent 11-second runtime failsafe timer so unsupported or blank monitor modes always auto-revert cleanly.
+- **Full Setup Backup & Restore (`backup.rs`, `app.rs`):**
+  - Added versioned `polled.setup.v1` JSON export/import bundling `settings.json`, `profiles.json`, and `custom_tweaks.json` (while excluding host-specific `baseline_snapshot.json` and `state.json`, and validating all custom tweaks against protected security paths on import).
+  - Accessible directly from **Settings → Export Setup Backup / Restore from Backup...** with one-click **Copy JSON**, **Save to Exports**, and live apply across theme, hotkeys, alerts, profiles, and custom tweaks.
+- **GUI "Report Unsupported Mouse" Modal (`hid/dump.rs`, `profiles_ui.rs`):**
+  - Added a **Report Mouse** button in the Profiles device bar that generates a ready-to-paste, serial-redacted GitHub Issue markdown report combining `dump_hid_devices()`, `list_usb_topology()`, detected devices, and Windows build version with **Copy Markdown** and **Save to Exports**.
+- **GPU & Audio PCI MSI Interrupts Health Check (`pci_gpu_audio_msi`, Total Built-In Checks: 40 → 41):**
+  - Added read-only audit of PCI Display adapters (NVIDIA / AMD / Intel GPUs via Display `ClassGUID` & graphics services) and PCI High Definition Audio controllers (`HDAudBus` / `HdAudio` / `MEDIA`) for `MSISupported = 1` vs legacy line-based IRQ sharing.
+- **Verified Pro Onboard Mouse Controls (`devices/mod.rs`, `compx.rs`, `compx64.rs`, `mchose.rs`, `vaxee.rs`, `razer.rs`, `endgame_gear.rs`, `profiles_ui.rs`):**
+  - **Onboard DPI Stage Slot (`dpi_stage`)**: switch active 1-based onboard DPI stage on CompX 17B (Pulsar X2 CrazyLight, LAMZU, Scyrox, VGN, VXE, G-Wolves, Hitscan), MCHOSE, and VAXEE mice.
+  - **Lock DPI Button (`lock_dpi_stages`)**: syncs the profile's target DPI across all onboard DPI stages (diffed per-stage, verified via read-back) on CompX 17B, CompX 64B, MCHOSE, VAXEE, and Razer V4 mice so accidentally pressing the physical DPI button mid-game never shifts sensitivity.
+  - **Glass Pad Mode (`glass_mode`)**: exposes verified hardware Glass / high-reflectivity surface sensor mode (`OFFSET_GLASS_MODE`) on supported Endgame Gear v2 / Purple Frost mice.
+
+---
+
 ## [0.10.0] - 2026-11-24
 
 ### Added

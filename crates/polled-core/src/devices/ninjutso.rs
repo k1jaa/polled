@@ -375,6 +375,9 @@ impl MouseDevice for NinjutsoDevice {
             supports_sleep_timeout: false,
             sleep_timeout_min_secs: 0,
             sleep_timeout_max_secs: 0,
+            dpi_stage_count: 0,
+            supports_dpi_lock: false,
+            supports_glass_mode: false,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists profile settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -434,6 +437,9 @@ impl MouseDevice for NinjutsoDevice {
                 angle_snapping: None,
                 ripple_control: None,
                 sleep_timeout_secs: None,
+                dpi_stage: None,
+                lock_dpi_stages: None,
+                glass_mode: None,
             });
         }
 
@@ -478,6 +484,9 @@ impl MouseDevice for NinjutsoDevice {
             angle_snapping: None,
             ripple_control: None,
             sleep_timeout_secs: None,
+            dpi_stage: None,
+            lock_dpi_stages: None,
+            glass_mode: None,
         })
     }
 

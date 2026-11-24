@@ -67,6 +67,10 @@ mod tests {
             audio_input_device_name: None,
             audio_input_volume: None,
             lock_mic_volume: false,
+            display_device_name: None,
+            display_width: None,
+            display_height: None,
+            display_refresh_hz: None,
             author: None,
             notes: None,
         });
@@ -89,6 +93,10 @@ mod tests {
             audio_input_device_name: None,
             audio_input_volume: None,
             lock_mic_volume: false,
+            display_device_name: None,
+            display_width: None,
+            display_height: None,
+            display_refresh_hz: None,
             author: None,
             notes: None,
         });

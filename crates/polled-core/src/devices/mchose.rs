@@ -504,6 +504,9 @@ impl MouseDevice for MchoseDevice {
             supports_sleep_timeout: wireless,
             sleep_timeout_min_secs: if wireless { 60 } else { 0 },
             sleep_timeout_max_secs: if wireless { 1800 } else { 0 },
+            dpi_stage_count: DPI_STAGES as u8,
+            supports_dpi_lock: true,
+            supports_glass_mode: false,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists profile settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -539,8 +542,11 @@ impl MouseDevice for MchoseDevice {
         let polling_rate_hz = rates.get(rate_idx).copied();
         let lod = decode_lod_index(self.product, cfg.lod_index);
 
+        let active_dpi = cfg.dpi_stages[stage_idx];
+        let all_locked = cfg.dpi_stages.iter().all(|&d| d == active_dpi);
+
         Ok(MouseSettings {
-            dpi: Some(cfg.dpi_stages[stage_idx]),
+            dpi: Some(active_dpi),
             dpi_y: None,
             polling_rate_hz,
             lod,
@@ -550,6 +556,9 @@ impl MouseDevice for MchoseDevice {
             ripple_control: Some(cfg.ripple_control),
             sleep_timeout_secs: (!wired && cfg.sleep_minutes > 0)
                 .then(|| u16::from(cfg.sleep_minutes) * 60),
+            dpi_stage: Some((stage_idx + 1) as u8),
+            lock_dpi_stages: Some(all_locked),
+            glass_mode: None,
         })
     }
 
@@ -566,14 +575,36 @@ impl MouseDevice for MchoseDevice {
         let mut debounce = cfg.debounce_ms;
         let mut config_dirty = false;
 
-        let active_stage = usize::from(if wired {
+        let mut active_stage = usize::from(if wired {
             cfg.wired_dpi_index
         } else {
             cfg.wireless_dpi_index
         })
         .min(DPI_STAGES - 1);
 
-        if let Some(target_dpi) = settings.dpi {
+        if let Some(target_stage_1based) = settings.dpi_stage {
+            let target_idx = usize::from(target_stage_1based.saturating_sub(1)).min(DPI_STAGES - 1);
+            if active_stage != target_idx {
+                active_stage = target_idx;
+                if wired {
+                    wired_link.1 = target_idx as u8;
+                } else {
+                    wireless_link.1 = target_idx as u8;
+                }
+                config_dirty = true;
+            }
+        }
+
+        let lock_all = settings.lock_dpi_stages == Some(true);
+        if lock_all {
+            let target_dpi = settings.dpi.unwrap_or(stages[active_stage]);
+            for slot in &mut stages {
+                if *slot != target_dpi {
+                    *slot = target_dpi;
+                    config_dirty = true;
+                }
+            }
+        } else if let Some(target_dpi) = settings.dpi {
             if stages[active_stage] != target_dpi {
                 stages[active_stage] = target_dpi;
                 config_dirty = true;

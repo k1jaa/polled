@@ -6,21 +6,35 @@
 //! Only the four semantic statuses (`OK`, `INFO`, `WARN`, `BAD`) carry chroma.
 
 use std::collections::{BTreeMap, HashSet};
+use std::time::{Duration, Instant};
 
+use chrono::Local;
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Margin, RichText, Stroke, TextFormat, Vec2,
 };
+use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
-    discover_installed_games, discover_running_apps, export_profile_json, import_profile_json,
-    AppPaths, DeviceCapabilities, DiscoveredGame, GameProfile, LiftOffDistance, MouseSettings,
-    PowerPlanPreset, ProfileStore, Severity, SupportTier,
+    discover_installed_games, discover_running_apps, dump_hid_devices, export_profile_json,
+    format_unsupported_mouse_issue, import_profile_json, AppPaths, DeviceCapabilities,
+    DiscoveredGame, GameProfile, LiftOffDistance, MouseSettings, PowerPlanPreset, ProfileStore,
+    Severity, SupportTier,
 };
 
 use crate::profile_runtime::{
     BackendSelection, ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot,
 };
 use crate::theme::{Palette, ThemeMode};
+
+const DISPLAY_TEST_UI_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone)]
+struct DisplayTestCountdown {
+    device_name: String,
+    applied_label: String,
+    previous_label: String,
+    expires_at: Instant,
+}
 
 #[derive(Debug, Clone)]
 enum PendingUnverifiedWrite {
@@ -65,6 +79,8 @@ pub struct ProfilesUiState {
     discovered_installed: Vec<DiscoveredGame>,
     discovered_running: Vec<DiscoveredGame>,
     pub notice: Option<(Severity, String)>,
+    report_mouse_modal: Option<String>,
+    display_test_countdown: Option<DisplayTestCountdown>,
     acknowledged_unverified_devices: HashSet<String>,
     pending_unverified_action: Option<PendingUnverifiedWrite>,
 }
@@ -97,6 +113,16 @@ pub struct ProfileDraft {
     pub ripple_control: bool,
     pub set_sleep: bool,
     pub sleep_timeout_secs: u16,
+    pub set_dpi_stage: bool,
+    pub dpi_stage: u8,
+    pub lock_dpi_stages: bool,
+    pub set_glass_mode: bool,
+    pub glass_mode: bool,
+    pub set_display_mode: bool,
+    pub display_device_name: Option<String>,
+    pub display_width: u32,
+    pub display_height: u32,
+    pub display_refresh_hz: u32,
     pub set_win_speed: bool,
     pub win_speed: u32,
     pub set_power_plan: bool,
@@ -142,6 +168,16 @@ impl ProfileDraft {
             ripple_control: false,
             set_sleep: false,
             sleep_timeout_secs: 300,
+            set_dpi_stage: false,
+            dpi_stage: 1,
+            lock_dpi_stages: false,
+            set_glass_mode: false,
+            glass_mode: false,
+            set_display_mode: p.display_mode_override().is_some(),
+            display_device_name: p.display_device_name.clone(),
+            display_width: p.display_width.unwrap_or(1920),
+            display_height: p.display_height.unwrap_or(1080),
+            display_refresh_hz: p.display_refresh_hz.unwrap_or(240),
             set_win_speed: p.windows_pointer_speed.is_some(),
             win_speed: p.windows_pointer_speed.unwrap_or(10),
             set_power_plan: p.windows_power_plan.is_some(),
@@ -183,6 +219,11 @@ impl ProfileDraft {
         self.ripple_control = m.ripple_control.unwrap_or(false);
         self.set_sleep = m.sleep_timeout_secs.is_some();
         self.sleep_timeout_secs = m.sleep_timeout_secs.unwrap_or(300);
+        self.set_dpi_stage = m.dpi_stage.is_some();
+        self.dpi_stage = m.dpi_stage.unwrap_or(1).max(1);
+        self.lock_dpi_stages = m.lock_dpi_stages == Some(true);
+        self.set_glass_mode = m.glass_mode.is_some();
+        self.glass_mode = m.glass_mode.unwrap_or(false);
     }
 
     fn current_mouse_fields(&self) -> MouseSettings {
@@ -196,6 +237,9 @@ impl ProfileDraft {
             angle_snapping: self.set_angle_snapping.then_some(self.angle_snapping),
             ripple_control: self.set_ripple_control.then_some(self.ripple_control),
             sleep_timeout_secs: self.set_sleep.then_some(self.sleep_timeout_secs),
+            dpi_stage: self.set_dpi_stage.then_some(self.dpi_stage.max(1)),
+            lock_dpi_stages: self.lock_dpi_stages.then_some(true),
+            glass_mode: self.set_glass_mode.then_some(self.glass_mode),
         }
     }
 
@@ -287,6 +331,13 @@ impl ProfileDraft {
                 .set_audio_input_vol
                 .then_some(copy.audio_input_vol.min(100)),
             lock_mic_volume: copy.set_audio_input_vol && copy.lock_mic_volume,
+            display_device_name: copy
+                .set_display_mode
+                .then_some(copy.display_device_name)
+                .flatten(),
+            display_width: copy.set_display_mode.then_some(copy.display_width),
+            display_height: copy.set_display_mode.then_some(copy.display_height),
+            display_refresh_hz: copy.set_display_mode.then_some(copy.display_refresh_hz),
             author: (!copy.author.trim().is_empty()).then(|| copy.author.trim().to_string()),
             notes: (!copy.notes.trim().is_empty()).then(|| copy.notes.trim().to_string()),
         }
@@ -319,9 +370,55 @@ impl ProfilesUiState {
             discovered_installed: Vec::new(),
             discovered_running: Vec::new(),
             notice: None,
+            report_mouse_modal: None,
+            display_test_countdown: None,
             acknowledged_unverified_devices: HashSet::new(),
             pending_unverified_action: None,
         }
+    }
+
+    pub fn reload_store(&mut self, store: ProfileStore) {
+        self.store = store;
+        let target_id = if self
+            .store
+            .profiles
+            .iter()
+            .any(|p| p.id == self.selected_profile_id)
+        {
+            self.selected_profile_id.clone()
+        } else {
+            self.store
+                .profiles
+                .first()
+                .map(|p| p.id.clone())
+                .unwrap_or_else(|| "desktop".to_string())
+        };
+        self.select_profile(&target_id);
+    }
+
+    pub fn on_display_test_started(
+        &mut self,
+        device_name: String,
+        applied_label: String,
+        previous_label: String,
+        error: Option<String>,
+    ) {
+        if let Some(err) = error {
+            self.display_test_countdown = None;
+            self.notice = Some((Severity::Warn, err));
+            return;
+        }
+        self.display_test_countdown = Some(DisplayTestCountdown {
+            device_name,
+            applied_label,
+            previous_label,
+            expires_at: Instant::now() + DISPLAY_TEST_UI_TIMEOUT,
+        });
+    }
+
+    pub fn on_display_test_reverted(&mut self, message: String) {
+        self.display_test_countdown = None;
+        self.notice = Some((Severity::Info, message));
     }
 
     fn unacknowledged_unverified_devices(
@@ -929,6 +1026,175 @@ impl ProfilesUiState {
                 }
             }
         }
+
+        // --- DISPLAY MODE TEST 10-SECOND AUTO-REVERT GUARD MODAL ---
+        if let Some(test) = self.display_test_countdown.clone() {
+            let now = Instant::now();
+            if now >= test.expires_at {
+                self.display_test_countdown = None;
+                runtime.send(ProfileRuntimeCmd::RevertTestDisplayMode);
+            } else {
+                let rem_secs = test.expires_at.saturating_duration_since(now).as_secs_f32();
+                ctx.request_repaint_after(Duration::from_millis(100));
+                let mut revert_now = false;
+                let mut keep_active = false;
+                let guard_w = (ctx.screen_rect().width() - 48.0).clamp(340.0, 460.0);
+                egui::Window::new("Display Mode Test — Safe Auto-Revert")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(guard_w)
+                    .max_width(guard_w)
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(p.surface)
+                            .stroke(Stroke::new(1.5_f32, p.text))
+                            .corner_radius(CornerRadius::same(10))
+                            .inner_margin(Margin::same(16)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Switched {} to {}",
+                                test.device_name, test.applied_label
+                            ))
+                            .size(14.5)
+                            .strong()
+                            .color(p.text),
+                        );
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "Automatically reverting to {} in {:.0}s if you don't respond.",
+                                    test.previous_label,
+                                    rem_secs.ceil()
+                                ))
+                                .size(12.5)
+                                .color(p.warn),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
+                                    "Display mode switches are strictly temporary (never written to the Windows registry). Click Save on your profile to use this mode automatically in-game.",
+                                )
+                                .size(11.5)
+                                .color(p.text_muted),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(12.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(primary_btn("Revert Now", p)).clicked() {
+                                revert_now = true;
+                            }
+                            if ui.add(secondary_btn("Keep Active", p)).clicked() {
+                                keep_active = true;
+                            }
+                        });
+                    });
+                if revert_now {
+                    self.display_test_countdown = None;
+                    runtime.send(ProfileRuntimeCmd::RevertTestDisplayMode);
+                } else if keep_active {
+                    self.display_test_countdown = None;
+                    runtime.send(ProfileRuntimeCmd::KeepTestDisplayMode);
+                    self.notice = Some((
+                        Severity::Ok,
+                        format!(
+                            "Kept {} temporarily (will still restore {} on desktop switch or exit).",
+                            test.applied_label, test.previous_label
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // --- REPORT UNSUPPORTED MOUSE MODAL (SERIAL-REDACTED) ---
+        let mut close_report = false;
+        if let Some(md) = self.report_mouse_modal.clone() {
+            let report_w = (ctx.screen_rect().width() - 48.0).clamp(380.0, 620.0);
+            egui::Window::new("Report Unsupported Mouse (Serial-Redacted)")
+                .collapsible(false)
+                .resizable(true)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .default_width(report_w)
+                .max_width(report_w)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.5_f32, p.text))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(16)),
+                )
+                .show(ctx, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Paste this serial-redacted HID + USB topology report into a GitHub Issue so support for your mouse can be added safely:",
+                            )
+                            .size(12.0)
+                            .color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(8.0);
+                    let mut preview = md.clone();
+                    egui::ScrollArea::vertical()
+                        .id_salt("report_mouse_scroll")
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut preview)
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    ui.add_space(10.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(secondary_btn("Close", p)).clicked() {
+                            close_report = true;
+                        }
+                        if ui.add(secondary_btn("Save to Exports", p)).clicked() {
+                            let dir = AppPaths::default_user_dir().exports_dir();
+                            let filename = format!(
+                                "polled_mouse_report_{}.md",
+                                Local::now().format("%Y%m%d_%H%M%S")
+                            );
+                            let path = dir.join(filename);
+                            match std::fs::create_dir_all(&dir)
+                                .and_then(|()| std::fs::write(&path, &md))
+                            {
+                                Ok(()) => {
+                                    self.notice = Some((
+                                        Severity::Ok,
+                                        format!("Saved mouse report to {}", path.display()),
+                                    ));
+                                }
+                                Err(err) => {
+                                    self.notice = Some((
+                                        Severity::Bad,
+                                        format!("Failed to save mouse report: {err}"),
+                                    ));
+                                }
+                            }
+                        }
+                        if ui.add(primary_btn("Copy Markdown", p)).clicked() {
+                            ctx.copy_text(md.clone());
+                            self.notice = Some((
+                                Severity::Ok,
+                                "Copied serial-redacted mouse report to clipboard.".to_string(),
+                            ));
+                        }
+                    });
+                });
+        }
+        if close_report {
+            self.report_mouse_modal = None;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -951,7 +1217,8 @@ impl ProfilesUiState {
                 (inner_w * 0.34).clamp(180.0, 300.0)
             };
 
-            let render_device_picker = |ui: &mut egui::Ui| {
+            let mut report_mouse_clicked = false;
+            let render_device_picker = |ui: &mut egui::Ui, report_clicked: &mut bool| {
                 ui.label(RichText::new("Device:").strong().color(p.text));
 
                 let current_label = snap
@@ -1042,6 +1309,15 @@ impl ProfilesUiState {
                 if ui.add(secondary_btn("Redetect", p)).clicked() {
                     runtime.send(ProfileRuntimeCmd::RedetectHardware);
                 }
+                if ui
+                    .add(secondary_btn("Report Mouse", p))
+                    .on_hover_text(
+                        "Generate a serial-redacted HID + USB topology markdown report for requesting support for an unsupported mouse",
+                    )
+                    .clicked()
+                {
+                    *report_clicked = true;
+                }
             };
 
             let auto_on = snap.is_some_and(|s| s.auto_switch_enabled);
@@ -1053,7 +1329,7 @@ impl ProfilesUiState {
 
             if split_controls {
                 ui.horizontal(|ui| {
-                    render_device_picker(ui);
+                    render_device_picker(ui, &mut report_mouse_clicked);
                 });
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
@@ -1098,7 +1374,7 @@ impl ProfilesUiState {
                 });
             } else {
                 ui.horizontal(|ui| {
-                    render_device_picker(ui);
+                    render_device_picker(ui, &mut report_mouse_clicked);
                     ui.add_space(4.0);
                     let toggle_label = if auto_on {
                         "Auto-Switch: ON"
@@ -1139,6 +1415,29 @@ impl ProfilesUiState {
                         debounce_committed = true;
                     }
                 });
+            }
+
+            if report_mouse_clicked {
+                match dump_hid_devices(false, None) {
+                    Ok(dump) => {
+                        let env = WindowsEnv;
+                        let topology = env.list_usb_topology().unwrap_or_default();
+                        let win_ver = env.windows_version().ok().map(|v| v.display_string());
+                        let detected = snap.map(|s| s.detected_hardware.as_slice()).unwrap_or(&[]);
+                        self.report_mouse_modal = Some(format_unsupported_mouse_issue(
+                            &dump,
+                            &topology,
+                            detected,
+                            win_ver.as_deref(),
+                        ));
+                    }
+                    Err(err) => {
+                        self.notice = Some((
+                            Severity::Bad,
+                            format!("Could not enumerate HID devices: {err}"),
+                        ));
+                    }
+                }
             }
 
             if toggle_lock_clicked {
@@ -1187,6 +1486,9 @@ impl ProfilesUiState {
                 }
                 if let Some(locked_pct) = s.mic_lock_active {
                     status_chunks.push(format!("Mic Lock: {locked_pct}%"));
+                }
+                if let Some(disp) = &s.active_display_override {
+                    status_chunks.push(format!("Display: {disp} (temp)"));
                 }
                 if s.any_flash_only && s.total_flash_writes_session > 0 {
                     status_chunks.push(format!("Flash writes: {}", s.total_flash_writes_session));
@@ -1292,6 +1594,9 @@ impl ProfilesUiState {
                                 angle_snapping: None,
                                 ripple_control: None,
                                 sleep_timeout_secs: None,
+                                dpi_stage: None,
+                                lock_dpi_stages: None,
+                                glass_mode: None,
                             },
                             device_overrides: BTreeMap::new(),
                             windows_pointer_speed: None,
@@ -1303,6 +1608,10 @@ impl ProfilesUiState {
                             audio_input_device_name: None,
                             audio_input_volume: None,
                             lock_mic_volume: false,
+                            display_device_name: None,
+                            display_width: None,
+                            display_height: None,
+                            display_refresh_hz: None,
                             author: None,
                             notes: None,
                         };
@@ -1487,11 +1796,11 @@ impl ProfilesUiState {
 
             ui.add_space(8.0);
 
-            // Clean segmented sub-tabs inside Profile Editor (`Mouse` | `Audio & Power` | `General`)
+            // Clean segmented sub-tabs inside Profile Editor (`Mouse` | `Display, Audio & Power` | `General`)
             ui.horizontal(|ui| {
                 for (tab, label) in [
                     (ProfileEditorTab::Mouse, "Mouse"),
-                    (ProfileEditorTab::AudioPower, "Audio & Power"),
+                    (ProfileEditorTab::AudioPower, "Display, Audio & Power"),
                     (ProfileEditorTab::General, "General"),
                 ] {
                     let selected = self.editor_tab == tab;
@@ -1571,12 +1880,21 @@ impl ProfilesUiState {
             let sleep_max = active_target_caps
                 .as_ref()
                 .map_or(1800, |c| c.sleep_timeout_max_secs);
+            let dpi_stage_count = active_target_caps.as_ref().map_or(6, |c| c.dpi_stage_count);
+            let supports_dpi_lock = active_target_caps
+                .as_ref()
+                .is_none_or(|c| c.supports_dpi_lock);
+            let supports_glass_mode = active_target_caps
+                .as_ref()
+                .is_none_or(|c| c.supports_glass_mode);
 
             let mut next_target: Option<(Option<String>, Option<DeviceCapabilities>)> = None;
             let mut remove_override = false;
             let mut read_from_mouse = false;
             let mut open_game_picker = false;
             let mut refresh_audio = false;
+            let mut refresh_displays = false;
+            let mut test_display_clicked = false;
 
             egui::ScrollArea::vertical()
                 .id_salt("profile_editor_scroll")
@@ -1888,9 +2206,204 @@ impl ProfilesUiState {
                                 });
                             }
                             ui.end_row();
+
+                            if dpi_stage_count > 0 {
+                                ui.checkbox(&mut self.editor.set_dpi_stage, "DPI Stage Slot");
+                                ui.add_enabled_ui(self.editor.set_dpi_stage, |ui| {
+                                    let clamped = self.editor.dpi_stage.clamp(1, dpi_stage_count);
+                                    self.editor.dpi_stage = clamped;
+                                    egui::ComboBox::from_id_salt("dpi_stage_combo")
+                                        .selected_text(format!("Stage #{clamped}"))
+                                        .show_ui(ui, |ui| {
+                                            for stage in 1..=dpi_stage_count {
+                                                ui.selectable_value(
+                                                    &mut self.editor.dpi_stage,
+                                                    stage,
+                                                    format!("Stage #{stage}"),
+                                                );
+                                            }
+                                        });
+                                });
+                                ui.end_row();
+                            }
+
+                            if supports_dpi_lock {
+                                ui.checkbox(&mut self.editor.lock_dpi_stages, "Lock DPI Button");
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(
+                                            "Syncs profile DPI to all onboard stages (prevents accidental DPI clicks)",
+                                        )
+                                        .size(11.5)
+                                        .color(p.text_muted),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.end_row();
+                            }
+
+                            if supports_glass_mode {
+                                render_bool_sensor_row(
+                                    ui,
+                                    p,
+                                    "Glass Pad Mode",
+                                    true,
+                                    &mut self.editor.set_glass_mode,
+                                    &mut self.editor.glass_mode,
+                                );
+                                ui.end_row();
+                            }
                             }
 
                             if self.editor_tab == ProfileEditorTab::AudioPower {
+                            let disp_combo_w = (field_w - 148.0).clamp(130.0, 260.0);
+                            let displays = snap.map(|s| s.displays.as_slice()).unwrap_or(&[]);
+                            let selected_display = self
+                                .editor
+                                .display_device_name
+                                .as_deref()
+                                .and_then(|name| {
+                                    displays
+                                        .iter()
+                                        .find(|d| d.info.device_name.eq_ignore_ascii_case(name))
+                                })
+                                .or_else(|| displays.iter().find(|d| d.info.is_primary))
+                                .or_else(|| displays.first());
+
+                            ui.checkbox(&mut self.editor.set_display_mode, "Display Mode");
+                            ui.vertical(|ui| {
+                                ui.add_enabled_ui(self.editor.set_display_mode, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        let mon_label = match &self.editor.display_device_name {
+                                            None => selected_display
+                                                .map(|d| format!("Primary ({})", d.info.friendly_name))
+                                                .unwrap_or_else(|| "Primary Monitor".to_string()),
+                                            Some(dev) => displays
+                                                .iter()
+                                                .find(|d| d.info.device_name.eq_ignore_ascii_case(dev))
+                                                .map(|d| {
+                                                    format!(
+                                                        "{} ({})",
+                                                        d.info.friendly_name, d.info.device_name
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| dev.clone()),
+                                        };
+                                        egui::ComboBox::from_id_salt("display_monitor_combo")
+                                            .selected_text(mon_label)
+                                            .width(disp_combo_w)
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.editor.display_device_name.is_none(),
+                                                        "Primary Monitor (Auto)",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.editor.display_device_name = None;
+                                                }
+                                                for d in displays {
+                                                    let lbl = if d.info.is_primary {
+                                                        format!(
+                                                            "{} · Primary ({}×{} @ {} Hz)",
+                                                            d.info.friendly_name,
+                                                            d.info.width,
+                                                            d.info.height,
+                                                            d.info.current_hz
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "{} ({}×{} @ {} Hz)",
+                                                            d.info.friendly_name,
+                                                            d.info.width,
+                                                            d.info.height,
+                                                            d.info.current_hz
+                                                        )
+                                                    };
+                                                    let sel = self
+                                                        .editor
+                                                        .display_device_name
+                                                        .as_deref()
+                                                        .is_some_and(|n| {
+                                                            n.eq_ignore_ascii_case(
+                                                                &d.info.device_name,
+                                                            )
+                                                        });
+                                                    if ui.selectable_label(sel, lbl).clicked() {
+                                                        self.editor.display_device_name =
+                                                            Some(d.info.device_name.clone());
+                                                    }
+                                                }
+                                            });
+                                        if ui
+                                            .add(secondary_btn("Refresh", p))
+                                            .on_hover_text("Re-scan connected displays & supported modes")
+                                            .clicked()
+                                        {
+                                            refresh_displays = true;
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        let mode_label = format!(
+                                            "{}×{} @ {} Hz",
+                                            self.editor.display_width,
+                                            self.editor.display_height,
+                                            self.editor.display_refresh_hz
+                                        );
+                                        egui::ComboBox::from_id_salt("display_mode_combo")
+                                            .selected_text(mode_label)
+                                            .width(disp_combo_w)
+                                            .show_ui(ui, |ui| {
+                                                if let Some(disp) = selected_display {
+                                                    for m in &disp.modes {
+                                                        let tag = m.aspect_tag();
+                                                        let lbl = if tag.is_empty() {
+                                                            m.label()
+                                                        } else {
+                                                            format!("{}  ({tag})", m.label())
+                                                        };
+                                                        let sel = self.editor.display_width
+                                                            == m.width
+                                                            && self.editor.display_height
+                                                                == m.height
+                                                            && self.editor.display_refresh_hz
+                                                                == m.refresh_hz;
+                                                        if ui.selectable_label(sel, lbl).clicked() {
+                                                            self.editor.display_width = m.width;
+                                                            self.editor.display_height = m.height;
+                                                            self.editor.display_refresh_hz =
+                                                                m.refresh_hz;
+                                                        }
+                                                    }
+                                                } else {
+                                                    ui.label("No display modes detected");
+                                                }
+                                            });
+                                        if ui
+                                            .add(secondary_btn("Test (10s)", p))
+                                            .on_hover_text(
+                                                "Temporarily test this resolution & refresh rate with an automatic 10-second revert safety guard",
+                                            )
+                                            .clicked()
+                                        {
+                                            test_display_clicked = true;
+                                        }
+                                    });
+                                });
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(
+                                            "Temporary session-only switch (never saved to registry) — auto-reverts to native desktop on tab-out or exit.",
+                                        )
+                                        .size(11.0)
+                                        .color(p.text_muted),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                            ui.end_row();
+
                             ui.checkbox(&mut self.editor.set_win_speed, "Windows Speed");
                             ui.add_enabled(
                                 self.editor.set_win_speed,
@@ -2063,6 +2576,17 @@ impl ProfilesUiState {
 
             if refresh_audio {
                 runtime.send(ProfileRuntimeCmd::RefreshAudioDevices);
+            }
+            if refresh_displays {
+                runtime.send(ProfileRuntimeCmd::RefreshDisplays);
+            }
+            if test_display_clicked {
+                runtime.send(ProfileRuntimeCmd::TestDisplayMode {
+                    device_name: self.editor.display_device_name.clone(),
+                    width: self.editor.display_width,
+                    height: self.editor.display_height,
+                    refresh_hz: self.editor.display_refresh_hz,
+                });
             }
             if read_from_mouse {
                 runtime.send(ProfileRuntimeCmd::ReadFromMouseForEditor(

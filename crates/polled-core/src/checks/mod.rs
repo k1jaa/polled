@@ -27,6 +27,7 @@ pub mod network_connection;
 pub mod network_dns;
 pub mod network_nagle;
 pub mod network_nic_power;
+pub mod pci_gpu_audio_msi;
 pub mod pcie_aspm;
 pub mod pointer_speed;
 pub mod power_plan;
@@ -153,7 +154,7 @@ pub trait HealthCheck: Send + Sync {
     }
 }
 
-/// Returns all 40 registered built-in input, audio, network & OS health checks and optional tweaks in display order.
+/// Returns all 41 registered built-in input, audio, network & OS health checks and optional tweaks in display order.
 pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
     vec![
         // --- Core Mouse & Cursor Input ---
@@ -166,6 +167,7 @@ pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
         Box::new(usb_selective_suspend::UsbSelectiveSuspendCheck),
         Box::new(usb_power_management::UsbPowerManagementCheck),
         Box::new(usb_msi_mode::UsbXhciMsiCheck),
+        Box::new(pci_gpu_audio_msi::PciGpuAudioMsiCheck),
         Box::new(usb_topology::UsbTopologyCheck),
         Box::new(pcie_aspm::PcieAspmCheck),
         Box::new(power_plan::PowerPlanCheck),

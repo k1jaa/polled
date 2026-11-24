@@ -553,6 +553,9 @@ impl MouseDevice for KeychronDevice {
             supports_sleep_timeout: wireless,
             sleep_timeout_min_secs: if wireless { 60 } else { 0 },
             sleep_timeout_max_secs: if wireless { 14_400 } else { 0 },
+            dpi_stage_count: 0,
+            supports_dpi_lock: false,
+            supports_glass_mode: false,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists profile settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -637,6 +640,9 @@ impl MouseDevice for KeychronDevice {
             angle_snapping: (!no_sensor).then_some(st.angle_snapping),
             ripple_control: (!no_sensor).then_some(st.ripple_control),
             sleep_timeout_secs,
+            dpi_stage: None,
+            lock_dpi_stages: None,
+            glass_mode: None,
         })
     }
 

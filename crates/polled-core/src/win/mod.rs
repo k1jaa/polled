@@ -108,6 +108,38 @@ pub struct DisplayModeInfo {
     pub max_supported_hz: u32,
 }
 
+/// Single supported `(width, height, refresh_hz)` mode exposed by a monitor driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DisplayResolutionMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+}
+
+impl DisplayResolutionMode {
+    pub fn label(self) -> String {
+        format!("{}×{} @ {} Hz", self.width, self.height, self.refresh_hz)
+    }
+
+    pub fn aspect_tag(self) -> &'static str {
+        let w = self.width;
+        let h = self.height;
+        if w * 9 == h * 16 {
+            "16:9"
+        } else if w * 3 == h * 4 {
+            "4:3"
+        } else if w * 4 == h * 5 {
+            "5:4"
+        } else if w * 10 == h * 16 {
+            "16:10"
+        } else if w * 9 == h * 21 || w * 1440 == h * 3440 {
+            "21:9"
+        } else {
+            ""
+        }
+    }
+}
+
 /// Statistics from a short non-elevated Windows 1 ms timer wake-jitter micro-test.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimerResolutionSample {
@@ -140,6 +172,32 @@ pub struct UsbPowerDevice {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsbControllerInfo {
     pub name: String,
+    /// `Some(true)` = MSI enabled (`MSISupported=1`), `Some(false)` = legacy IRQ, `None` = unset.
+    pub msi_supported: Option<bool>,
+}
+
+/// Device category audited by the GPU & Audio PCI MSI check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PciMsiCategory {
+    Gpu,
+    Audio,
+}
+
+impl PciMsiCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            PciMsiCategory::Gpu => "GPU",
+            PciMsiCategory::Audio => "Audio",
+        }
+    }
+}
+
+/// PCI GPU or HD Audio controller interrupt delivery state (MSI vs legacy line-based IRQ).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PciMsiDevice {
+    pub name: String,
+    pub category: PciMsiCategory,
     /// `Some(true)` = MSI enabled (`MSISupported=1`), `Some(false)` = legacy IRQ, `None` = unset.
     pub msi_supported: Option<bool>,
 }
@@ -355,9 +413,19 @@ pub trait SystemEnv: Send + Sync {
     fn list_processes(&self) -> Result<Vec<ProcessSample>>;
     fn windows_version(&self) -> Result<WindowsVersion>;
     fn list_display_modes(&self) -> Result<Vec<DisplayModeInfo>>;
+    fn list_supported_display_modes(&self, device_name: &str)
+        -> Result<Vec<DisplayResolutionMode>>;
+    fn set_display_mode(
+        &self,
+        device_name: &str,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+    ) -> Result<()>;
     fn measure_timer_resolution(&self) -> Result<TimerResolutionSample>;
     fn list_usb_power_devices(&self) -> Result<Vec<UsbPowerDevice>>;
     fn list_usb_controllers(&self) -> Result<Vec<UsbControllerInfo>>;
+    fn list_pci_msi_devices(&self) -> Result<Vec<PciMsiDevice>>;
     fn list_usb_topology(&self) -> Result<Vec<UsbMouseTopology>>;
     fn list_audio_endpoints(&self, flow: AudioFlow) -> Result<Vec<AudioEndpointInfo>>;
     fn set_default_audio_endpoint(&self, endpoint_id: &str) -> Result<()>;
@@ -481,6 +549,23 @@ impl SystemEnv for WindowsEnv {
         display::list_display_modes()
     }
 
+    fn list_supported_display_modes(
+        &self,
+        device_name: &str,
+    ) -> Result<Vec<DisplayResolutionMode>> {
+        display::list_supported_display_modes(device_name)
+    }
+
+    fn set_display_mode(
+        &self,
+        device_name: &str,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+    ) -> Result<()> {
+        display::set_display_mode(device_name, width, height, refresh_hz)
+    }
+
     fn measure_timer_resolution(&self) -> Result<TimerResolutionSample> {
         timer::measure_timer_resolution()
     }
@@ -491,6 +576,10 @@ impl SystemEnv for WindowsEnv {
 
     fn list_usb_controllers(&self) -> Result<Vec<UsbControllerInfo>> {
         usb_msi::list_usb_controllers()
+    }
+
+    fn list_pci_msi_devices(&self) -> Result<Vec<PciMsiDevice>> {
+        usb_msi::list_pci_msi_devices()
     }
 
     fn list_usb_topology(&self) -> Result<Vec<UsbMouseTopology>> {

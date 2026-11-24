@@ -5,5 +5,6 @@
 pub mod dump;
 
 pub use dump::{
-    dump_hid_devices, parse_hid_report_descriptor, HidDeviceDump, HidDumpReport, HidReportSummary,
+    dump_hid_devices, format_unsupported_mouse_issue, parse_hid_report_descriptor, HidDeviceDump,
+    HidDumpReport, HidReportSummary,
 };

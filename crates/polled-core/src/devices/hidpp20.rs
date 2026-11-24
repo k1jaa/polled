@@ -564,6 +564,9 @@ impl MouseDevice for Hidpp20Device {
             supports_sleep_timeout: false,
             sleep_timeout_min_secs: 0,
             sleep_timeout_max_secs: 0,
+            dpi_stage_count: 0,
+            supports_dpi_lock: false,
+            supports_glass_mode: false,
             supports_volatile_writes: true,
             flash_write_warning: None,
         }

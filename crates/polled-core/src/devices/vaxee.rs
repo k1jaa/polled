@@ -220,6 +220,9 @@ impl MouseDevice for VaxeeDevice {
             supports_sleep_timeout: false,
             sleep_timeout_min_secs: 0,
             sleep_timeout_max_secs: 0,
+            dpi_stage_count: 4,
+            supports_dpi_lock: true,
+            supports_glass_mode: false,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} persists settings to onboard memory. Polled diffs unchanged values and rate-limits rapid writes.",
@@ -249,8 +252,13 @@ impl MouseDevice for VaxeeDevice {
         if !(1..=4).contains(&stage) {
             return Err(self.dev_err(format!("Invalid VAXEE DPI stage {stage}")));
         }
-        let dpi_reply = self.exchange(CMD_DPI_VALUE, 3, &[stage], 3, false)?;
-        let dpi = u16::from_le_bytes([dpi_reply[6], dpi_reply[7]]);
+        let mut all_dpis = [0u16; 4];
+        for s in 1..=4u8 {
+            let reply = self.exchange(CMD_DPI_VALUE, 3, &[s], 3, false)?;
+            all_dpis[usize::from(s - 1)] = u16::from_le_bytes([reply[6], reply[7]]);
+        }
+        let dpi = all_dpis[usize::from(stage - 1)];
+        let all_locked = all_dpis.iter().all(|&d| d == dpi);
 
         let poll_code = self.exchange(CMD_POLLING, 1, &[], 1, false)?[5];
         let polling_rate_hz = decode_vaxee_polling_rate(poll_code)
@@ -267,6 +275,8 @@ impl MouseDevice for VaxeeDevice {
             dpi: Some(dpi),
             polling_rate_hz: Some(polling_rate_hz),
             lod,
+            dpi_stage: Some(stage),
+            lock_dpi_stages: Some(all_locked),
             ..Default::default()
         })
     }
@@ -274,14 +284,36 @@ impl MouseDevice for VaxeeDevice {
     fn apply_settings(&mut self, settings: &MouseSettings, _mode: WriteMode) -> Result<()> {
         let current = self.read_settings()?;
 
-        if let Some(target_dpi) = settings.dpi {
-            if current.dpi != Some(target_dpi) {
-                let stage = self.exchange(CMD_DPI_STAGE, 1, &[], 1, false)?[5];
-                if !(1..=4).contains(&stage) {
-                    return Err(self.dev_err(format!("Invalid VAXEE DPI stage {stage}")));
+        let mut active_stage = current.dpi_stage.unwrap_or(1).clamp(1, 4);
+        if let Some(target_stage) = settings.dpi_stage {
+            let target = target_stage.clamp(1, 4);
+            if active_stage != target {
+                let _ = self.exchange(CMD_DPI_STAGE, 1, &[target], 1, true)?;
+                active_stage = target;
+            }
+        }
+
+        let lock_all = settings.lock_dpi_stages == Some(true);
+        if lock_all {
+            let target_dpi = settings.dpi.or(current.dpi).unwrap_or(800);
+            let le = target_dpi.to_le_bytes();
+            for s in 1..=4u8 {
+                let existing = self
+                    .exchange(CMD_DPI_VALUE, 3, &[s], 3, false)
+                    .ok()
+                    .map(|r| u16::from_le_bytes([r[6], r[7]]));
+                if existing != Some(target_dpi) {
+                    let _ = self.exchange(CMD_DPI_VALUE, 3, &[s, le[0], le[1]], 1, true)?;
                 }
+            }
+        } else if let Some(target_dpi) = settings.dpi {
+            let existing = self
+                .exchange(CMD_DPI_VALUE, 3, &[active_stage], 3, false)
+                .ok()
+                .map(|r| u16::from_le_bytes([r[6], r[7]]));
+            if existing != Some(target_dpi) {
                 let le = target_dpi.to_le_bytes();
-                let _ = self.exchange(CMD_DPI_VALUE, 3, &[stage, le[0], le[1]], 1, true)?;
+                let _ = self.exchange(CMD_DPI_VALUE, 3, &[active_stage, le[0], le[1]], 1, true)?;
             }
         }
 

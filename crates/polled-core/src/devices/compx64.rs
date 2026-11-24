@@ -687,6 +687,9 @@ impl MouseDevice for Compx64Device {
             supports_sleep_timeout: self.spec.wireless,
             sleep_timeout_min_secs: if self.spec.wireless { 10 } else { 0 },
             sleep_timeout_max_secs: if self.spec.wireless { 3600 } else { 0 },
+            dpi_stage_count: 0,
+            supports_dpi_lock: self.spec.max_dpi_stages > 1,
+            supports_glass_mode: false,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} writes profile settings to onboard flash. Polled diffs unchanged fields and rate-limits rapid writes.",
@@ -741,6 +744,9 @@ impl MouseDevice for Compx64Device {
         let dpi_y = stages
             .get(active_idx)
             .and_then(|s| (s.y != s.x).then_some(s.y));
+        let lock_dpi_stages = stages.get(active_idx).map(|active| {
+            stages.len() > 1 && stages.iter().all(|s| s.x == active.x && s.y == active.y)
+        });
 
         let poll_reply = self.request(
             self.spec.mouse_target,
@@ -843,6 +849,9 @@ impl MouseDevice for Compx64Device {
             angle_snapping,
             ripple_control,
             sleep_timeout_secs,
+            dpi_stage: None,
+            lock_dpi_stages,
+            glass_mode: None,
         })
     }
 
@@ -850,12 +859,16 @@ impl MouseDevice for Compx64Device {
         let current = self.read_settings()?;
         let profile = self.read_active_profile();
 
-        if settings.dpi.is_some() || settings.dpi_y.is_some() {
+        let lock_all = settings.lock_dpi_stages == Some(true);
+        if settings.dpi.is_some() || settings.dpi_y.is_some() || lock_all {
             let cur_x = current.dpi.unwrap_or(800);
             let cur_y = current.dpi_y.unwrap_or(cur_x);
             let target_x = settings.dpi.unwrap_or(cur_x);
             let target_y = settings.dpi_y.or(settings.dpi).unwrap_or(cur_y);
-            if target_x != cur_x || target_y != cur_y {
+            if target_x != cur_x
+                || target_y != cur_y
+                || (lock_all && current.lock_dpi_stages != Some(true))
+            {
                 let stages_reply = self.request(
                     self.spec.mouse_target,
                     PAGE_PROFILE,
@@ -877,10 +890,15 @@ impl MouseDevice for Compx64Device {
                 let active_idx = usize::from(active_reply.get(1).copied().unwrap_or(1).max(1))
                     .saturating_sub(1)
                     .min(stages.len() - 1);
-                stages[active_idx] = Compx64DpiStage {
+                let target_stage = Compx64DpiStage {
                     x: target_x,
                     y: target_y,
                 };
+                if lock_all {
+                    stages.fill(target_stage);
+                } else {
+                    stages[active_idx] = target_stage;
+                }
 
                 let _ = self.write_profile_cmd(
                     PAGE_PROFILE,

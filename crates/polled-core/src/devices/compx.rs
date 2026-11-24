@@ -820,6 +820,9 @@ impl MouseDevice for CompxDevice {
             supports_sleep_timeout: wireless,
             sleep_timeout_min_secs: if wireless { 10 } else { 0 },
             sleep_timeout_max_secs: if wireless { 1800 } else { 0 },
+            dpi_stage_count: self.spec.max_dpi_stages,
+            supports_dpi_lock: self.spec.max_dpi_stages > 1,
+            supports_glass_mode: false,
             supports_volatile_writes: false,
             flash_write_warning: Some(format!(
                 "{} uses Compx/Nordic onboard profile flash (no volatile RAM-only write command). Polled diffs every register and rate-limits writes to prevent flash wear.",
@@ -842,18 +845,31 @@ impl MouseDevice for CompxDevice {
         };
 
         let active_stage = self.read_active_dpi_stage()?;
-        let stage_addr = ADDR_DPI_BASE + u16::from(active_stage) * DPI_STAGE_STRIDE;
-        let dpi_bytes = self.mem_read(stage_addr, 4)?;
-        let (dpi_x, dpi_y) = decode_dpi_xy_raw(
-            [dpi_bytes[0], dpi_bytes[1], dpi_bytes[2]],
-            self.spec.dpi_encoding,
-        )
-        .ok_or_else(|| {
-            self.dev_err(format!(
-                "Failed to decode DPI stage bytes {:02x?}",
-                &dpi_bytes[..3]
-            ))
-        })?;
+        let stage_count = usize::from(self.spec.max_dpi_stages.max(1));
+        let mut decoded_stages: Vec<(u16, u16)> = Vec::with_capacity(stage_count);
+        for idx in 0..stage_count {
+            let addr = ADDR_DPI_BASE + (idx as u16) * DPI_STAGE_STRIDE;
+            if let Ok(bytes) = self.mem_read(addr, 4) {
+                if bytes.len() >= 3 {
+                    if let Some(pair) =
+                        decode_dpi_xy_raw([bytes[0], bytes[1], bytes[2]], self.spec.dpi_encoding)
+                    {
+                        decoded_stages.push(pair);
+                        continue;
+                    }
+                }
+            }
+            if idx == usize::from(active_stage) {
+                return Err(self.dev_err("Failed to decode active DPI stage bytes"));
+            }
+            decoded_stages.push((0, 0));
+        }
+        let (dpi_x, dpi_y) = decoded_stages[usize::from(active_stage)];
+        let lock_dpi_stages = (stage_count > 1).then(|| {
+            decoded_stages
+                .iter()
+                .all(|&(sx, sy)| sx == dpi_x && sy == dpi_y)
+        });
 
         let lod_bytes = self.mem_read(ADDR_LOD_MM, 2)?;
         let lod = decode_lod(lod_bytes[0])
@@ -877,11 +893,23 @@ impl MouseDevice for CompxDevice {
             angle_snapping,
             ripple_control,
             sleep_timeout_secs,
+            dpi_stage: Some(active_stage.saturating_add(1)),
+            lock_dpi_stages,
+            glass_mode: None,
         })
     }
 
     fn apply_settings(&mut self, settings: &MouseSettings, _mode: WriteMode) -> Result<()> {
         let current = self.read_settings()?;
+
+        if let Some(target_stage_1based) = settings.dpi_stage {
+            let target_idx = target_stage_1based
+                .saturating_sub(1)
+                .min(self.spec.max_dpi_stages.saturating_sub(1));
+            if current.dpi_stage != Some(target_idx + 1) {
+                self.write_byte_with_checksum(ADDR_ACTIVE_DPI_STAGE, target_idx)?;
+            }
+        }
 
         if let Some(target_hz) = settings.polling_rate_hz {
             if current.polling_rate_hz != Some(target_hz) {
@@ -901,23 +929,47 @@ impl MouseDevice for CompxDevice {
             }
         }
 
-        if settings.dpi.is_some() || settings.dpi_y.is_some() {
+        let lock_all = settings.lock_dpi_stages == Some(true);
+        if settings.dpi.is_some() || settings.dpi_y.is_some() || lock_all {
             let cur_x = current.dpi.unwrap_or(800);
             let cur_y = current.dpi_y.unwrap_or(cur_x);
             let target_x = settings.dpi.unwrap_or(cur_x);
             let target_y = settings.dpi_y.or(settings.dpi).unwrap_or(cur_y);
-            if target_x != cur_x || target_y != cur_y {
-                let raw = encode_dpi_xy_raw(target_x, target_y, self.spec.dpi_encoding)
-                    .ok_or_else(|| PolledError::UnsupportedSetting {
+            let raw =
+                encode_dpi_xy_raw(target_x, target_y, self.spec.dpi_encoding).ok_or_else(|| {
+                    PolledError::UnsupportedSetting {
                         device: self.spec.display_name.clone(),
                         detail: format!(
                             "DPI {target_x}x{target_y} cannot be encoded for {}",
                             self.spec.display_name
                         ),
-                    })?;
+                    }
+                })?;
+            let payload = [raw[0], raw[1], raw[2], checksum(&raw)];
+
+            if lock_all {
+                for idx in 0..self.spec.max_dpi_stages.max(1) {
+                    let stage_addr = ADDR_DPI_BASE + u16::from(idx) * DPI_STAGE_STRIDE;
+                    let existing = self.mem_read(stage_addr, 4).ok().and_then(|b| {
+                        (b.len() >= 3)
+                            .then(|| decode_dpi_xy_raw([b[0], b[1], b[2]], self.spec.dpi_encoding))
+                            .flatten()
+                    });
+                    if existing != Some((target_x, target_y)) {
+                        self.mem_write(stage_addr, &payload)?;
+                    }
+                }
+            } else {
                 let active_stage = self.read_active_dpi_stage()?;
                 let stage_addr = ADDR_DPI_BASE + u16::from(active_stage) * DPI_STAGE_STRIDE;
-                self.mem_write(stage_addr, &[raw[0], raw[1], raw[2], checksum(&raw)])?;
+                let existing = self.mem_read(stage_addr, 4).ok().and_then(|b| {
+                    (b.len() >= 3)
+                        .then(|| decode_dpi_xy_raw([b[0], b[1], b[2]], self.spec.dpi_encoding))
+                        .flatten()
+                });
+                if existing != Some((target_x, target_y)) {
+                    self.mem_write(stage_addr, &payload)?;
+                }
             }
         }
 

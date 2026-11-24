@@ -7,10 +7,10 @@ use std::sync::Mutex;
 
 use crate::error::{PolledError, Result};
 use crate::win::{
-    AccessibilityKind, AudioEndpointInfo, AudioFlow, DisplayModeInfo, KeyboardRepeatParams,
-    MouseAccelParams, NetworkAdapterInfo, NetworkAdapterKind, PowerSchemeInfo, PowerValueIndex,
-    ProcessSample, RegHive, SystemEnv, TimerResolutionSample, UsbControllerInfo, UsbMouseTopology,
-    UsbPowerDevice, WindowsVersion,
+    AccessibilityKind, AudioEndpointInfo, AudioFlow, DisplayModeInfo, DisplayResolutionMode,
+    KeyboardRepeatParams, MouseAccelParams, NetworkAdapterInfo, NetworkAdapterKind, PciMsiCategory,
+    PciMsiDevice, PowerSchemeInfo, PowerValueIndex, ProcessSample, RegHive, SystemEnv,
+    TimerResolutionSample, UsbControllerInfo, UsbMouseTopology, UsbPowerDevice, WindowsVersion,
 };
 
 #[derive(Debug, Clone)]
@@ -33,9 +33,11 @@ struct MockState {
     processes: Vec<ProcessSample>,
     windows_version: WindowsVersion,
     displays: Vec<DisplayModeInfo>,
+    supported_display_modes: Vec<DisplayResolutionMode>,
     timer_sample: TimerResolutionSample,
     usb_power_devices: Vec<UsbPowerDevice>,
     usb_controllers: Vec<UsbControllerInfo>,
+    pci_msi_devices: Vec<PciMsiDevice>,
     usb_topology: Vec<UsbMouseTopology>,
     audio_endpoints: Vec<AudioEndpointInfo>,
     network_adapters: Vec<NetworkAdapterInfo>,
@@ -91,6 +93,28 @@ impl Default for MockState {
                 current_hz: 240,
                 max_supported_hz: 240,
             }],
+            supported_display_modes: vec![
+                DisplayResolutionMode {
+                    width: 2560,
+                    height: 1440,
+                    refresh_hz: 240,
+                },
+                DisplayResolutionMode {
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 240,
+                },
+                DisplayResolutionMode {
+                    width: 1280,
+                    height: 960,
+                    refresh_hz: 240,
+                },
+                DisplayResolutionMode {
+                    width: 2560,
+                    height: 1440,
+                    refresh_hz: 60,
+                },
+            ],
             timer_sample: TimerResolutionSample {
                 requested_ms: 1,
                 samples: 48,
@@ -104,6 +128,18 @@ impl Default for MockState {
                 name: "USB xHCI Compliant Host Controller".to_string(),
                 msi_supported: Some(true),
             }],
+            pci_msi_devices: vec![
+                PciMsiDevice {
+                    name: "Mock GPU RTX".to_string(),
+                    category: PciMsiCategory::Gpu,
+                    msi_supported: Some(true),
+                },
+                PciMsiDevice {
+                    name: "High Definition Audio Controller".to_string(),
+                    category: PciMsiCategory::Audio,
+                    msi_supported: Some(true),
+                },
+            ],
             usb_topology: Vec::new(),
             audio_endpoints: vec![
                 AudioEndpointInfo {
@@ -204,6 +240,14 @@ impl MockEnv {
 
     pub fn set_usb_controllers(&self, controllers: Vec<UsbControllerInfo>) {
         self.state.lock().unwrap().usb_controllers = controllers;
+    }
+
+    pub fn set_pci_msi_devices(&self, devices: Vec<PciMsiDevice>) {
+        self.state.lock().unwrap().pci_msi_devices = devices;
+    }
+
+    pub fn set_supported_display_modes(&self, modes: Vec<DisplayResolutionMode>) {
+        self.state.lock().unwrap().supported_display_modes = modes;
     }
 
     pub fn set_usb_topology(&self, topology: Vec<UsbMouseTopology>) {
@@ -460,6 +504,43 @@ impl SystemEnv for MockEnv {
         Ok(self.state.lock().unwrap().displays.clone())
     }
 
+    fn list_supported_display_modes(
+        &self,
+        _device_name: &str,
+    ) -> Result<Vec<DisplayResolutionMode>> {
+        Ok(self.state.lock().unwrap().supported_display_modes.clone())
+    }
+
+    fn set_display_mode(
+        &self,
+        device_name: &str,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+    ) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let supported = s
+            .supported_display_modes
+            .iter()
+            .any(|m| m.width == width && m.height == height && m.refresh_hz == refresh_hz);
+        if !supported {
+            return Err(PolledError::Win32 {
+                context: "MockEnv::set_display_mode".to_string(),
+                message: format!("Unsupported mock mode {width}x{height} @ {refresh_hz} Hz"),
+            });
+        }
+        if let Some(d) = s
+            .displays
+            .iter_mut()
+            .find(|d| d.device_name.eq_ignore_ascii_case(device_name))
+        {
+            d.width = width;
+            d.height = height;
+            d.current_hz = refresh_hz;
+        }
+        Ok(())
+    }
+
     fn measure_timer_resolution(&self) -> Result<TimerResolutionSample> {
         Ok(self.state.lock().unwrap().timer_sample.clone())
     }
@@ -470,6 +551,10 @@ impl SystemEnv for MockEnv {
 
     fn list_usb_controllers(&self) -> Result<Vec<UsbControllerInfo>> {
         Ok(self.state.lock().unwrap().usb_controllers.clone())
+    }
+
+    fn list_pci_msi_devices(&self) -> Result<Vec<PciMsiDevice>> {
+        Ok(self.state.lock().unwrap().pci_msi_devices.clone())
     }
 
     fn list_usb_topology(&self) -> Result<Vec<UsbMouseTopology>> {
