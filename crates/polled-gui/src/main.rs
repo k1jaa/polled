@@ -8,6 +8,7 @@
 mod app;
 mod elevation;
 mod hotkeys;
+mod hotplug;
 mod icon;
 mod input_lab_ui;
 mod notifications;

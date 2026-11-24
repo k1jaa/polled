@@ -143,6 +143,54 @@ impl Default for HotkeyConfig {
     }
 }
 
+/// Tray icon & Windows toast notification preferences (`settings.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrayAlertConfig {
+    /// Render live wireless mouse battery % & charge bar directly on the system tray icon.
+    #[serde(default = "default_true")]
+    pub battery_tray_icon: bool,
+    /// Send a Windows toast notification when a wireless mouse drops to or below `low_battery_threshold_pct`.
+    #[serde(default = "default_true")]
+    pub low_battery_toast: bool,
+    /// Percentage threshold (`5..=50`) at which low-battery alerts trigger.
+    #[serde(default = "default_low_battery_threshold")]
+    pub low_battery_threshold_pct: u8,
+    /// Send an optional Windows toast notification when Polled switches to a game/desktop profile.
+    #[serde(default)]
+    pub profile_switch_toast: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_low_battery_threshold() -> u8 {
+    15
+}
+
+impl Default for TrayAlertConfig {
+    fn default() -> Self {
+        Self {
+            battery_tray_icon: true,
+            low_battery_toast: true,
+            low_battery_threshold_pct: default_low_battery_threshold(),
+            profile_switch_toast: false,
+        }
+    }
+}
+
+impl TrayAlertConfig {
+    /// Returns the low-battery alert threshold clamped to a safe `5..=50` percent range.
+    pub fn clamped_threshold(&self) -> u8 {
+        self.low_battery_threshold_pct.clamp(5, 50)
+    }
+
+    /// Hysteresis recovery percentage (`threshold + 10%`) before re-arming the low-battery toast.
+    pub fn reset_threshold(&self) -> u8 {
+        self.clamped_threshold().saturating_add(10).min(95)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_schema_version")]
@@ -153,6 +201,8 @@ pub struct AppSettings {
     pub auto_switch_on_startup: bool,
     #[serde(default)]
     pub hotkeys: HotkeyConfig,
+    #[serde(default)]
+    pub alerts: TrayAlertConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -166,6 +216,7 @@ impl Default for AppSettings {
             theme: ThemePreference::Dark,
             auto_switch_on_startup: false,
             hotkeys: HotkeyConfig::default(),
+            alerts: TrayAlertConfig::default(),
         }
     }
 }
@@ -256,9 +307,24 @@ mod tests {
                 toggle_input_lab: None,
                 cycle_audio_output: Some(HotkeyBinding::new(true, true, false, "A")),
             },
+            alerts: TrayAlertConfig {
+                battery_tray_icon: true,
+                low_battery_toast: true,
+                low_battery_threshold_pct: 20,
+                profile_switch_toast: true,
+            },
         };
         custom.save_atomic(&path).unwrap();
         assert_eq!(AppSettings::load_or_default(&path), custom);
+        assert_eq!(custom.alerts.clamped_threshold(), 20);
+        assert_eq!(custom.alerts.reset_threshold(), 30);
+
+        // Legacy settings.json without `alerts` still deserializes cleanly with defaults.
+        let legacy_json = r#"{"schema_version":1,"theme":"dark","auto_switch_on_startup":true}"#;
+        fs::write(&path, legacy_json).unwrap();
+        let loaded_legacy = AppSettings::load_or_default(&path);
+        assert!(loaded_legacy.auto_switch_on_startup);
+        assert_eq!(loaded_legacy.alerts, TrayAlertConfig::default());
         assert_eq!(
             custom.hotkeys.cycle_profile.as_ref().unwrap().win32_vk(),
             Some(0x77)

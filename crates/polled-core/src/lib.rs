@@ -49,7 +49,7 @@ pub use profiles::{
 };
 pub use settings::{
     format_autostart_command, is_autostart_enabled, set_autostart_enabled, AppSettings,
-    HotkeyBinding, HotkeyConfig, ThemePreference,
+    HotkeyBinding, HotkeyConfig, ThemePreference, TrayAlertConfig,
 };
 pub use win::{
     AudioEndpointInfo, AudioFlow, AudioLatencyBenchmark, NetworkAdapterInfo, NetworkAdapterKind,

@@ -47,12 +47,23 @@ pub fn notify_if_regressed(summary: &ScanSummary) {
     let _ = Notification::new().summary(title).body(&body).show();
 }
 
-/// Sends a one-shot Windows notification when a connected wireless mouse battery drops to <= 15%.
+/// Sends a one-shot Windows notification when a connected wireless mouse battery drops to or below threshold.
 pub fn notify_low_battery(device_name: &str, percent: u8) {
     let title = format!("Polled: Low mouse battery ({percent}%)");
     let body = format!(
         "{device_name} is at {percent}% battery. Plug in or dock it soon to avoid wireless dropouts."
     );
+    let _ = Notification::new().summary(&title).body(&body).show();
+}
+
+/// Sends an optional Windows toast notification when Polled activates a game or desktop profile.
+pub fn notify_profile_switched(profile_name: &str, details: &str) {
+    let title = format!("Polled: {profile_name}");
+    let body = if details.trim().is_empty() {
+        "Profile active.".to_string()
+    } else {
+        details.to_string()
+    };
     let _ = Notification::new().summary(&title).body(&body).show();
 }
 

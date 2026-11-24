@@ -108,7 +108,7 @@ All persistent files created by Polled live under **`%LOCALAPPDATA%\Polled\`**:
 | `baseline_snapshot.json` | Atomic pre-change backup of every Windows setting modified by Polled, used by **Undo** / **Undo All**. |
 | `state.json` | Last scanned Windows build number and previous check severities for Windows Update regression alerts. |
 | `profiles.json` | User-created per-game mouse profiles, per-mouse overrides, and focus debounce delay. |
-| `settings.json` | UI theme (`dark` / `light`), Auto-Switch startup toggle, and optional global hotkey bindings (`RegisterHotKey`, disabled by default). |
+| `settings.json` | UI theme (`dark` / `light`), Auto-Switch startup toggle, live battery tray icon & toast alert preferences (`alerts`), and optional global hotkey bindings (`RegisterHotKey`, disabled by default). |
 | `custom_tweaks.json` | User-defined custom reversible registry tweaks. |
 | `exports/` | Optional user-triggered Bench PNG benchmark cards (`polled_bench_*.png`) and CSV raw interval exports (`polled_bench_*.csv`). |
 

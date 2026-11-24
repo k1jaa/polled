@@ -12,7 +12,7 @@ use polled_core::win::{RegHive, WindowsEnv};
 use polled_core::{
     curated_custom_tweak_presets, is_autostart_enabled, set_autostart_enabled, AppPaths,
     AppSettings, CheckReport, CustomTweakDef, CustomTweakStore, CustomValueKind, HealthEngine,
-    HotkeyBinding, PolledError, ScanSummary, Severity, ThemePreference,
+    HotkeyBinding, MouseSettings, PolledError, ScanSummary, Severity, SupportTier, ThemePreference,
 };
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
@@ -23,7 +23,7 @@ use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRun
 use crate::profiles_ui::ProfilesUiState;
 use crate::single_instance::SingleInstanceGuard;
 use crate::theme::{Palette, ThemeMode};
-use crate::tray::{find_own_main_hwnd, TrayController};
+use crate::tray::{find_own_main_hwnd, TrayController, TrayMouseState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveView {
@@ -231,6 +231,11 @@ pub(crate) enum WorkerMsg {
         updated_scan: Option<ScanSummary>,
     },
     ProfileRuntimeUpdated(Box<ProfileRuntimeSnapshot>),
+    ReadFromMouseFinished {
+        device_name: Option<String>,
+        settings: Option<MouseSettings>,
+        error: Option<String>,
+    },
 }
 
 pub struct PolledApp {
@@ -285,6 +290,7 @@ impl PolledApp {
         let profile_runtime = ProfileRuntimeHandle::start(
             profiles_ui.store.clone(),
             settings.auto_switch_on_startup,
+            settings.alerts.clone(),
             tx.clone(),
             cc.egui_ctx.clone(),
         );
@@ -730,28 +736,6 @@ impl PolledApp {
                         .store(snap.auto_switch_enabled, Ordering::SeqCst);
                     self.profile_locked_state
                         .store(snap.profile_locked, Ordering::SeqCst);
-                    let battery_parts: Vec<String> = snap
-                        .active_devices
-                        .iter()
-                        .filter_map(|d| {
-                            d.battery
-                                .map(|b| format!("{} {}", d.info.name, b.compact_label()))
-                        })
-                        .collect();
-                    let battery_summary = if battery_parts.is_empty() {
-                        None
-                    } else {
-                        Some(battery_parts.join(", "))
-                    };
-                    self.tray.update_status(
-                        snap.auto_switch_enabled,
-                        snap.profile_locked,
-                        &snap.active_profile_id,
-                        &snap.active_profile_name,
-                        &snap.available_profiles,
-                        &snap.audio_outputs,
-                        battery_summary.as_deref(),
-                    );
                     if self.settings.auto_switch_on_startup != snap.auto_switch_enabled {
                         self.settings.auto_switch_on_startup = snap.auto_switch_enabled;
                         let _ = self
@@ -759,9 +743,64 @@ impl PolledApp {
                             .save_atomic(&AppPaths::default_user_dir().settings_path());
                     }
                     self.profiles_ui.runtime_snapshot = Some(*snap);
+                    self.sync_tray_from_snapshot();
+                }
+                WorkerMsg::ReadFromMouseFinished {
+                    device_name,
+                    settings,
+                    error,
+                } => {
+                    self.profiles_ui
+                        .apply_read_from_mouse(device_name, settings, error);
                 }
             }
         }
+    }
+
+    fn sync_tray_from_snapshot(&mut self) {
+        let Some(snap) = self.profiles_ui.runtime_snapshot.as_ref() else {
+            return;
+        };
+        let battery_parts: Vec<String> = snap
+            .active_devices
+            .iter()
+            .filter_map(|d| {
+                d.battery
+                    .map(|b| format!("{} {}", d.info.name, b.compact_label()))
+            })
+            .collect();
+        let battery_summary = if battery_parts.is_empty() {
+            None
+        } else {
+            Some(battery_parts.join(", "))
+        };
+        let primary_mouse = snap
+            .active_devices
+            .iter()
+            .find(|d| d.info.support_tier != SupportTier::Simulator)
+            .or_else(|| snap.active_devices.first())
+            .map(|d| TrayMouseState {
+                name: d.info.name.clone(),
+                is_simulator: d.info.support_tier == SupportTier::Simulator,
+                current_dpi: d.settings.as_ref().and_then(|s| s.dpi),
+                current_polling_hz: d.settings.as_ref().and_then(|s| s.polling_rate_hz),
+                dpi_min: d.caps.dpi_min,
+                dpi_max: d.caps.dpi_max,
+                polling_rates_hz: d.caps.polling_rates_hz.clone(),
+                battery: d.battery,
+            });
+        self.tray.update_status(
+            snap.auto_switch_enabled,
+            snap.profile_locked,
+            &snap.active_profile_id,
+            &snap.active_profile_name,
+            &snap.available_profiles,
+            &snap.audio_outputs,
+            primary_mouse.as_ref(),
+            battery_summary.as_deref(),
+            self.settings.alerts.battery_tray_icon,
+            self.settings.alerts.clamped_threshold(),
+        );
     }
 }
 
@@ -876,14 +915,14 @@ impl eframe::App for PolledApp {
                         }
 
                         let hk_btn = if self.settings.hotkeys.enabled {
-                            primary_button("Hotkeys: ON", p)
+                            primary_button("Settings · HK", p)
                         } else {
-                            secondary_button("Hotkeys", p)
+                            secondary_button("Settings", p)
                         };
                         if ui
                             .add(hk_btn)
                             .on_hover_text(
-                                "Configure optional global hotkeys (Win32 RegisterHotKey, zero hooks)",
+                                "Configure live battery tray icon, low-battery / profile-switch notifications, and optional global hotkeys",
                             )
                             .clicked()
                         {
@@ -1019,8 +1058,14 @@ impl eframe::App for PolledApp {
                 ui.set_max_width(content_w);
 
                 if self.active_view == ActiveView::Profiles {
-                    self.profiles_ui
-                        .render(ctx, ui, p, mode, &self.profile_runtime);
+                    self.profiles_ui.render(
+                        ctx,
+                        ui,
+                        p,
+                        mode,
+                        &self.profile_runtime,
+                        self.settings.alerts.clamped_threshold(),
+                    );
                     return;
                 }
                 if self.active_view == ActiveView::InputLab {
@@ -1842,12 +1887,12 @@ impl eframe::App for PolledApp {
             }
         }
 
-        // --- GLOBAL HOTKEYS MODAL ---
+        // --- SETTINGS MODAL (TRAY, ALERTS & GLOBAL HOTKEYS) ---
         if self.hotkeys_modal_open {
             let mut close_hk = false;
             let mut save_hk = false;
-            let modal_w = (ctx.screen_rect().width() - 48.0).clamp(360.0, 500.0);
-            egui::Window::new("Global Hotkeys (Win32 RegisterHotKey)")
+            let modal_w = (ctx.screen_rect().width() - 48.0).clamp(380.0, 520.0);
+            egui::Window::new("Settings — Tray, Alerts & Global Hotkeys")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -1861,22 +1906,64 @@ impl eframe::App for PolledApp {
                         .inner_margin(Margin::same(16)),
                 )
                 .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("TRAY ICON & NOTIFICATIONS")
+                            .size(10.5)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut self.settings.alerts.battery_tray_icon,
+                        "Show wireless mouse battery % on system tray icon",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.settings.alerts.low_battery_toast,
+                            "Low-battery Windows notification at",
+                        );
+                        ui.add_enabled(
+                            self.settings.alerts.low_battery_toast,
+                            egui::DragValue::new(
+                                &mut self.settings.alerts.low_battery_threshold_pct,
+                            )
+                            .range(5..=50)
+                            .speed(1)
+                            .suffix("%"),
+                        );
+                    });
+                    ui.checkbox(
+                        &mut self.settings.alerts.profile_switch_toast,
+                        "Show notification when game/desktop profile switches",
+                    );
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.label(
+                        RichText::new("GLOBAL HOTKEYS (WIN32 REGISTERHOTKEY)")
+                            .size(10.5)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.add_space(4.0);
                     ui.add(
                         egui::Label::new(
                             RichText::new(
                                 "Uses official Windows RegisterHotKey (zero keyboard hooks, anti-cheat safe). Off by default.",
                             )
-                            .size(12.0)
+                            .size(11.5)
                             .color(p.text_muted),
                         )
                         .wrap(),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     ui.checkbox(
                         &mut self.settings.hotkeys.enabled,
                         "Enable Global Hotkeys",
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
 
                     ui.add_enabled_ui(self.settings.hotkeys.enabled, |ui| {
                         egui::Grid::new("global_hotkeys_grid")
@@ -1930,16 +2017,20 @@ impl eframe::App for PolledApp {
                 });
 
             if save_hk {
+                self.settings.alerts.low_battery_threshold_pct =
+                    self.settings.alerts.clamped_threshold();
                 let _ = self
                     .settings
                     .save_atomic(&AppPaths::default_user_dir().settings_path());
                 self.hotkey_manager
                     .update_config(self.settings.hotkeys.clone());
-                self.status_message = Some(if self.settings.hotkeys.enabled {
-                    "Saved & registered global hotkeys.".to_string()
-                } else {
-                    "Disabled global hotkeys.".to_string()
-                });
+                self.profile_runtime
+                    .send(ProfileRuntimeCmd::UpdateAlertConfig(
+                        self.settings.alerts.clone(),
+                    ));
+                self.sync_tray_from_snapshot();
+                self.status_message =
+                    Some("Saved tray, notification, and global hotkey settings.".to_string());
                 self.hotkeys_modal_open = false;
             } else if close_hk {
                 self.hotkeys_modal_open = false;

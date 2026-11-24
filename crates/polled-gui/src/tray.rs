@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use eframe::egui;
 use polled_core::win::WindowsEnv;
-use polled_core::{AppPaths, AppSettings, HealthEngine};
+use polled_core::{AppPaths, AppSettings, BatteryStatus, HealthEngine};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::app::WorkerMsg;
-use crate::icon::tray_icon_image;
+use crate::icon::{tray_battery_icon_image, tray_icon_image};
 use crate::notifications::notify_if_regressed;
 use crate::profile_runtime::ProfileRuntimeCmd;
 
@@ -24,8 +24,25 @@ const ID_SCAN: &str = "scan";
 const ID_AUTO_SWITCH: &str = "auto_switch";
 const ID_LOCK_PROFILE: &str = "lock_profile";
 const ID_PROFILE_PREFIX: &str = "profile::";
+const ID_MOUSE_POLL_PREFIX: &str = "mouse_poll::";
+const ID_MOUSE_DPI_PREFIX: &str = "mouse_dpi::";
+const ID_MOUSE_REFRESH: &str = "mouse_refresh";
 const ID_AUDIO_PREFIX: &str = "audio::";
 const ID_QUIT: &str = "quit";
+
+/// Snapshot of the primary connected mouse used to populate the tray Mouse Quick Controls
+/// submenu, live battery icon, and rich hover tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayMouseState {
+    pub name: String,
+    pub is_simulator: bool,
+    pub current_dpi: Option<u16>,
+    pub current_polling_hz: Option<u16>,
+    pub dpi_min: u16,
+    pub dpi_max: u16,
+    pub polling_rates_hz: Vec<u16>,
+    pub battery: Option<BatteryStatus>,
+}
 
 /// Finds Polled's own top-level `HWND` on the current Win32 UI thread (including when hidden).
 #[cfg(windows)]
@@ -95,11 +112,18 @@ pub struct TrayController {
     profiles_submenu: Submenu,
     profile_menu_items: Vec<MenuItem>,
     last_profile_key: (String, Vec<(String, String)>),
+    mouse_submenu: Submenu,
+    mouse_menu_items: Vec<MenuItem>,
+    mouse_menu_seps: Vec<PredefinedMenuItem>,
+    last_mouse_key: Option<Option<TrayMouseState>>,
     audio_submenu: Submenu,
     audio_menu_items: Vec<MenuItem>,
     last_audio_key: Vec<(String, String, bool)>,
     auto_switch_item: CheckMenuItem,
     lock_profile_item: CheckMenuItem,
+    /// Cached rendered icon state: `None` = unset, `Some(None)` = default crosshair,
+    /// `Some(Some((percent, charging, low_threshold)))` = dynamic battery percentage icon.
+    last_icon_key: Option<Option<(u8, bool, u8)>>,
 }
 
 impl TrayController {
@@ -122,6 +146,7 @@ impl TrayController {
         let scan_item = MenuItem::with_id(ID_SCAN, "Scan Now", true, None);
         let sep_top = PredefinedMenuItem::separator();
         let profiles_submenu = Submenu::new("Switch Profile", true);
+        let mouse_submenu = Submenu::new("Mouse Quick Controls", true);
         let audio_submenu = Submenu::new("Audio Output", true);
         let lock_profile_item =
             CheckMenuItem::with_id(ID_LOCK_PROFILE, "Lock Current Profile", true, false, None);
@@ -140,6 +165,7 @@ impl TrayController {
         let _ = menu.append(&scan_item);
         let _ = menu.append(&sep_top);
         let _ = menu.append(&profiles_submenu);
+        let _ = menu.append(&mouse_submenu);
         let _ = menu.append(&audio_submenu);
         let _ = menu.append(&lock_profile_item);
         let _ = menu.append(&auto_switch_item);
@@ -192,6 +218,22 @@ impl TrayController {
                             ctx.request_repaint();
                             continue;
                         }
+                        if let Some(hz_str) = id_str.strip_prefix(ID_MOUSE_POLL_PREFIX) {
+                            if let Ok(hz) = hz_str.parse::<u16>() {
+                                let _ = profile_cmd_tx
+                                    .send(ProfileRuntimeCmd::QuickSetMousePolling(hz));
+                                ctx.request_repaint();
+                            }
+                            continue;
+                        }
+                        if let Some(dpi_str) = id_str.strip_prefix(ID_MOUSE_DPI_PREFIX) {
+                            if let Ok(dpi) = dpi_str.parse::<u16>() {
+                                let _ =
+                                    profile_cmd_tx.send(ProfileRuntimeCmd::QuickSetMouseDpi(dpi));
+                                ctx.request_repaint();
+                            }
+                            continue;
+                        }
                         if let Some(audio_id) = id_str.strip_prefix(ID_AUDIO_PREFIX) {
                             let _ = profile_cmd_tx
                                 .send(ProfileRuntimeCmd::SwitchAudioOutput(audio_id.to_string()));
@@ -200,6 +242,11 @@ impl TrayController {
                         }
                         match id_str {
                             ID_OPEN => show_and_focus(&main_hwnd, &ctx),
+                            ID_MOUSE_REFRESH => {
+                                let _ =
+                                    profile_cmd_tx.send(ProfileRuntimeCmd::RefreshMouseAndBattery);
+                                ctx.request_repaint();
+                            }
                             ID_SCAN => {
                                 // Run directly on a background thread so tray scans work even
                                 // while the main window is hidden in the tray.
@@ -264,15 +311,21 @@ impl TrayController {
             profiles_submenu,
             profile_menu_items: Vec::new(),
             last_profile_key: (String::new(), Vec::new()),
+            mouse_submenu,
+            mouse_menu_items: Vec::new(),
+            mouse_menu_seps: Vec::new(),
+            last_mouse_key: None,
             audio_submenu,
             audio_menu_items: Vec::new(),
             last_audio_key: Vec::new(),
             auto_switch_item,
             lock_profile_item,
+            last_icon_key: Some(None),
         }
     }
 
-    /// Synchronizes the tray menu status header, profile & audio submenus, checkmarks, and tooltip.
+    /// Synchronizes the tray menu status header, profile / mouse / audio submenus, dynamic
+    /// battery icon, checkmarks, and hover tooltip.
     #[allow(clippy::too_many_arguments)]
     pub fn update_status(
         &mut self,
@@ -282,7 +335,10 @@ impl TrayController {
         active_profile_name: &str,
         available_profiles: &[(String, String)],
         audio_outputs: &[(String, String, bool)],
+        primary_mouse: Option<&TrayMouseState>,
         battery_summary: Option<&str>,
+        show_battery_icon: bool,
+        low_battery_threshold: u8,
     ) {
         self.auto_switch_item.set_checked(auto_switch_enabled);
         self.lock_profile_item.set_checked(profile_locked);
@@ -294,6 +350,29 @@ impl TrayController {
         };
         self.status_item.set_text(header_text);
 
+        // 1. Dynamic live battery percentage tray icon (only redraws when state changes).
+        let desired_icon_key = if show_battery_icon {
+            primary_mouse.and_then(|m| {
+                m.battery
+                    .map(|b| (b.percent.min(100), b.charging, low_battery_threshold))
+            })
+        } else {
+            None
+        };
+        if self.last_icon_key != Some(desired_icon_key) {
+            if let Some(tray) = &self.tray {
+                let icon = match desired_icon_key {
+                    Some((pct, chg, low)) => tray_battery_icon_image(pct, chg, low),
+                    None => tray_icon_image(),
+                };
+                if let Some(img) = icon {
+                    let _ = tray.set_icon(Some(img));
+                }
+            }
+            self.last_icon_key = Some(desired_icon_key);
+        }
+
+        // 2. Profile switcher submenu.
         let next_key = (active_profile_id.to_string(), available_profiles.to_vec());
         if next_key != self.last_profile_key {
             for old in self.profile_menu_items.drain(..) {
@@ -312,6 +391,107 @@ impl TrayController {
             self.last_profile_key = next_key;
         }
 
+        // 3. Mouse Quick Controls submenu (live Polling Rate + DPI presets + Refresh).
+        let next_mouse_key = primary_mouse.cloned();
+        if self.last_mouse_key.as_ref() != Some(&next_mouse_key) {
+            for old in self.mouse_menu_items.drain(..) {
+                let _ = self.mouse_submenu.remove(&old);
+            }
+            for sep in self.mouse_menu_seps.drain(..) {
+                let _ = self.mouse_submenu.remove(&sep);
+            }
+
+            if let Some(mouse) = primary_mouse {
+                let mut header_parts = vec![mouse.name.clone()];
+                if let Some(dpi) = mouse.current_dpi {
+                    header_parts.push(format!("{dpi} DPI"));
+                }
+                if let Some(hz) = mouse.current_polling_hz {
+                    header_parts.push(format!("{hz} Hz"));
+                }
+                if let Some(batt) = mouse.battery {
+                    header_parts.push(batt.compact_label());
+                }
+                let header =
+                    MenuItem::with_id("mouse_header", header_parts.join(" · "), false, None);
+                let _ = self.mouse_submenu.append(&header);
+                self.mouse_menu_items.push(header);
+
+                if !mouse.polling_rates_hz.is_empty() {
+                    let sep = PredefinedMenuItem::separator();
+                    let _ = self.mouse_submenu.append(&sep);
+                    self.mouse_menu_seps.push(sep);
+
+                    for &hz in &mouse.polling_rates_hz {
+                        let active = mouse.current_polling_hz == Some(hz);
+                        let label = if active {
+                            format!("● Polling: {hz} Hz")
+                        } else {
+                            format!("   Polling: {hz} Hz")
+                        };
+                        let item = MenuItem::with_id(
+                            format!("{ID_MOUSE_POLL_PREFIX}{hz}"),
+                            label,
+                            true,
+                            None,
+                        );
+                        let _ = self.mouse_submenu.append(&item);
+                        self.mouse_menu_items.push(item);
+                    }
+                }
+
+                let mut dpi_presets: Vec<u16> = [400u16, 800, 1600, 3200]
+                    .into_iter()
+                    .filter(|&d| d >= mouse.dpi_min && d <= mouse.dpi_max)
+                    .collect();
+                if let Some(cur) = mouse.current_dpi {
+                    if cur >= mouse.dpi_min && cur <= mouse.dpi_max && !dpi_presets.contains(&cur) {
+                        dpi_presets.push(cur);
+                        dpi_presets.sort_unstable();
+                    }
+                }
+                if !dpi_presets.is_empty() {
+                    let sep = PredefinedMenuItem::separator();
+                    let _ = self.mouse_submenu.append(&sep);
+                    self.mouse_menu_seps.push(sep);
+
+                    for dpi in dpi_presets {
+                        let active = mouse.current_dpi == Some(dpi);
+                        let label = if active {
+                            format!("● DPI: {dpi}")
+                        } else {
+                            format!("   DPI: {dpi}")
+                        };
+                        let item = MenuItem::with_id(
+                            format!("{ID_MOUSE_DPI_PREFIX}{dpi}"),
+                            label,
+                            true,
+                            None,
+                        );
+                        let _ = self.mouse_submenu.append(&item);
+                        self.mouse_menu_items.push(item);
+                    }
+                }
+
+                let sep_end = PredefinedMenuItem::separator();
+                let _ = self.mouse_submenu.append(&sep_end);
+                self.mouse_menu_seps.push(sep_end);
+            } else {
+                let empty =
+                    MenuItem::with_id("mouse_empty", "No supported mouse connected", false, None);
+                let _ = self.mouse_submenu.append(&empty);
+                self.mouse_menu_items.push(empty);
+            }
+
+            let refresh =
+                MenuItem::with_id(ID_MOUSE_REFRESH, "Refresh Mouse & Battery", true, None);
+            let _ = self.mouse_submenu.append(&refresh);
+            self.mouse_menu_items.push(refresh);
+
+            self.last_mouse_key = Some(next_mouse_key);
+        }
+
+        // 4. Audio output switcher submenu.
         if audio_outputs != self.last_audio_key.as_slice() {
             for old in self.audio_menu_items.drain(..) {
                 let _ = self.audio_submenu.remove(&old);
@@ -337,18 +517,31 @@ impl TrayController {
             self.last_audio_key = audio_outputs.to_vec();
         }
 
+        // 5. Rich hover tooltip (`Polled · Mouse · 68% · 4000 Hz · Profile`).
         if let Some(tray) = &self.tray {
-            let mut tooltip = if profile_locked {
-                format!("Polled — LOCKED · {active_profile_name}")
-            } else if auto_switch_enabled {
-                format!("Polled — Auto-Switch ON · {active_profile_name}")
-            } else {
-                "Polled — Auto-Switch OFF".to_string()
-            };
-            if let Some(batt) = battery_summary.filter(|s| !s.is_empty()) {
-                tooltip.push_str(" · ");
-                tooltip.push_str(batt);
+            let mut parts: Vec<String> = vec!["Polled".to_string()];
+            if let Some(mouse) = primary_mouse.filter(|m| !m.is_simulator) {
+                parts.push(mouse.name.clone());
+                if let Some(batt) = mouse.battery {
+                    parts.push(batt.compact_label());
+                }
+                if let Some(hz) = mouse.current_polling_hz {
+                    parts.push(format!("{hz} Hz"));
+                }
+            } else if let Some(batt) = battery_summary.filter(|s| !s.is_empty()) {
+                parts.push(batt.to_string());
             }
+
+            let profile_part = if profile_locked {
+                format!("{active_profile_name} [LOCKED]")
+            } else if auto_switch_enabled {
+                active_profile_name.to_string()
+            } else {
+                format!("{active_profile_name} (Auto OFF)")
+            };
+            parts.push(profile_part);
+
+            let mut tooltip = parts.join(" · ");
             // Windows NOTIFYICONDATAW.szTip is capped at 127 UTF-16 code units.
             if tooltip.chars().count() > 120 {
                 let truncated: String = tooltip.chars().take(117).collect();

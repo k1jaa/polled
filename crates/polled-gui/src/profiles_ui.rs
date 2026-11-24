@@ -342,6 +342,42 @@ impl ProfilesUiState {
         }
     }
 
+    pub fn apply_read_from_mouse(
+        &mut self,
+        device_name: Option<String>,
+        settings: Option<MouseSettings>,
+        error: Option<String>,
+    ) {
+        if let Some(err) = error {
+            self.notice = Some((Severity::Warn, err));
+            return;
+        }
+        let Some(live) = settings else {
+            self.notice = Some((
+                Severity::Warn,
+                "Mouse did not return readable onboard settings.".to_string(),
+            ));
+            return;
+        };
+        if live.is_empty() {
+            self.notice = Some((
+                Severity::Info,
+                "Mouse returned no configurable fields.".to_string(),
+            ));
+            return;
+        }
+        self.editor.load_mouse_fields(&live);
+        self.editor.commit_current_mouse_fields();
+        let dev_label = device_name.unwrap_or_else(|| "mouse".to_string());
+        self.notice = Some((
+            Severity::Ok,
+            format!(
+                "Loaded live settings from {dev_label} ({}) into editor. Click Save to keep.",
+                live.summary_string()
+            ),
+        ));
+    }
+
     pub fn render(
         &mut self,
         ctx: &egui::Context,
@@ -349,6 +385,7 @@ impl ProfilesUiState {
         p: Palette,
         mode: ThemeMode,
         runtime: &ProfileRuntimeHandle,
+        low_battery_threshold: u8,
     ) {
         // Compute authoritative width directly from the live viewport rect so resizing the window
         // immediately reflows every card, banner, pill row, and log line with zero clipping.
@@ -365,7 +402,15 @@ impl ProfilesUiState {
                 .show(ui, |ui| {
                     let stack_w = (content_w - 14.0).max(280.0);
                     ui.set_max_width(stack_w);
-                    self.render_device_card(ui, p, mode, stack_w, snap.as_ref(), runtime);
+                    self.render_device_card(
+                        ui,
+                        p,
+                        mode,
+                        stack_w,
+                        snap.as_ref(),
+                        runtime,
+                        low_battery_threshold,
+                    );
                     if let Some((sev, msg)) = self.notice.clone() {
                         ui.add_space(8.0);
                         semantic_banner(ui, p, mode, stack_w, sev, &msg);
@@ -379,7 +424,15 @@ impl ProfilesUiState {
                 });
         } else {
             // --- DEVICE & AUTO-SWITCH CONTROL CARD ---
-            self.render_device_card(ui, p, mode, content_w, snap.as_ref(), runtime);
+            self.render_device_card(
+                ui,
+                p,
+                mode,
+                content_w,
+                snap.as_ref(),
+                runtime,
+                low_battery_threshold,
+            );
 
             if let Some((sev, msg)) = self.notice.clone() {
                 ui.add_space(8.0);
@@ -840,6 +893,7 @@ impl ProfilesUiState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_device_card(
         &mut self,
         ui: &mut egui::Ui,
@@ -848,6 +902,7 @@ impl ProfilesUiState {
         card_w: f32,
         snap: Option<&ProfileRuntimeSnapshot>,
         runtime: &ProfileRuntimeHandle,
+        low_battery_threshold: u8,
     ) {
         let inner_w = (card_w - 24.0).max(120.0);
         card_frame(ui, p, card_w, |ui| {
@@ -1135,7 +1190,7 @@ impl ProfilesUiState {
                     .iter()
                     .filter_map(|d| {
                         d.battery
-                            .filter(|b| !b.charging && b.percent <= 15)
+                            .filter(|b| !b.charging && b.percent <= low_battery_threshold)
                             .map(|b| format!("{} ({}%)", d.info.name, b.percent))
                     })
                     .collect();
@@ -1465,6 +1520,7 @@ impl ProfilesUiState {
 
             let mut next_target: Option<(Option<String>, Option<DeviceCapabilities>)> = None;
             let mut remove_override = false;
+            let mut read_from_mouse = false;
             let mut open_game_picker = false;
             let mut refresh_audio = false;
 
@@ -1475,12 +1531,13 @@ impl ProfilesUiState {
                 .show(ui, |ui| {
                     let field_w = (inner_w - 175.0).clamp(140.0, 420.0);
                     let target_combo_w = (field_w
+                        - 126.0
                         - if self.editor.editing_device_id.is_some() {
-                            80.0
+                            74.0
                         } else {
                             0.0
                         })
-                    .clamp(130.0, 310.0);
+                    .clamp(115.0, 240.0);
 
                     egui::Grid::new("profile_editor_grid")
                         .num_columns(2)
@@ -1587,6 +1644,16 @@ impl ProfilesUiState {
                                             }
                                         }
                                     });
+
+                                if ui
+                                    .add(secondary_btn("Read from Mouse", p))
+                                    .on_hover_text(
+                                        "Read live DPI, polling rate, LOD, debounce, and sensor toggles directly from the connected mouse into this editor",
+                                    )
+                                    .clicked()
+                                {
+                                    read_from_mouse = true;
+                                }
 
                                 if self.editor.editing_device_id.is_some()
                                     && ui.add(secondary_btn("Remove", p)).clicked()
@@ -1934,6 +2001,11 @@ impl ProfilesUiState {
 
             if refresh_audio {
                 runtime.send(ProfileRuntimeCmd::RefreshAudioDevices);
+            }
+            if read_from_mouse {
+                runtime.send(ProfileRuntimeCmd::ReadFromMouseForEditor(
+                    self.editor.editing_device_id.clone(),
+                ));
             }
             if open_game_picker {
                 self.game_picker_open = true;

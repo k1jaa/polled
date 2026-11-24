@@ -16,19 +16,19 @@ use polled_core::{
     detect_hardware_devices, hid_topology_fingerprint, match_profile, AppPaths, ApplyOutcome,
     BatteryStatus, DeviceCapabilities, DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent,
     ForegroundWatcher, GameProfile, MouseSettings, PolledError, ProfileStore, SafeDeviceController,
-    Severity,
+    Severity, TrayAlertConfig,
 };
 
 use crate::app::WorkerMsg;
-use crate::notifications::notify_low_battery;
+use crate::hotplug::UsbHotplugWatcher;
+use crate::notifications::{notify_low_battery, notify_profile_switched};
 
 const MAX_LOG_ENTRIES: usize = 50;
-const HOTPLUG_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+const HOTPLUG_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const HOTPLUG_EVENT_DEBOUNCE: Duration = Duration::from_millis(300);
 const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const MIC_LOCK_INTERVAL: Duration = Duration::from_secs(2);
 const AUDIO_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-const LOW_BATTERY_WARN_PCT: u8 = 15;
-const LOW_BATTERY_RESET_PCT: u8 = 25;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendSelection {
@@ -85,6 +85,12 @@ pub enum ProfileRuntimeCmd {
     SwitchAudioOutput(String),
     CycleAudioOutput,
     RefreshAudioDevices,
+    QuickSetMousePolling(u16),
+    QuickSetMouseDpi(u16),
+    RefreshMouseAndBattery,
+    ReadFromMouseForEditor(Option<String>),
+    UpdateAlertConfig(TrayAlertConfig),
+    UsbDeviceChanged,
     UpdateStore(ProfileStore),
     SelectBackend(BackendSelection),
     RedetectHardware,
@@ -94,25 +100,38 @@ pub enum ProfileRuntimeCmd {
 
 pub struct ProfileRuntimeHandle {
     cmd_tx: Sender<ProfileRuntimeCmd>,
+    _hotplug_watcher: UsbHotplugWatcher,
 }
 
 impl ProfileRuntimeHandle {
     pub fn start(
         initial_store: ProfileStore,
         initial_auto_switch: bool,
+        initial_alerts: TrayAlertConfig,
         ui_tx: Sender<WorkerMsg>,
         ctx: egui::Context,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
+        let hotplug_watcher = UsbHotplugWatcher::start(cmd_tx.clone());
 
         std::thread::Builder::new()
             .name("polled-profile-runtime".to_string())
             .spawn(move || {
-                run_runtime_loop(initial_store, initial_auto_switch, cmd_rx, ui_tx, ctx);
+                run_runtime_loop(
+                    initial_store,
+                    initial_auto_switch,
+                    initial_alerts,
+                    cmd_rx,
+                    ui_tx,
+                    ctx,
+                );
             })
             .expect("failed to spawn profile runtime thread");
 
-        Self { cmd_tx }
+        Self {
+            cmd_tx,
+            _hotplug_watcher: hotplug_watcher,
+        }
     }
 
     pub fn send(&self, cmd: ProfileRuntimeCmd) {
@@ -138,14 +157,17 @@ struct ManagedController {
 }
 
 impl ManagedController {
-    fn init(mut controller: SafeDeviceController) -> Self {
+    fn init(mut controller: SafeDeviceController, alerts: &TrayAlertConfig) -> Self {
         let last_settings = controller.read_settings().ok();
         let last_battery = controller.read_battery();
         let mut low_battery_notified = false;
-        if let Some(batt) = last_battery {
-            if !batt.charging && batt.percent <= LOW_BATTERY_WARN_PCT {
-                notify_low_battery(&controller.info().name, batt.percent);
-                low_battery_notified = true;
+        let warn_pct = alerts.clamped_threshold();
+        if alerts.low_battery_toast {
+            if let Some(batt) = last_battery {
+                if !batt.charging && batt.percent <= warn_pct {
+                    notify_low_battery(&controller.info().name, batt.percent);
+                    low_battery_notified = true;
+                }
             }
         }
         Self {
@@ -156,12 +178,17 @@ impl ManagedController {
         }
     }
 
-    fn refresh_battery(&mut self) -> bool {
+    fn refresh_battery(&mut self, alerts: &TrayAlertConfig) -> bool {
         let next = self.controller.read_battery();
+        let warn_pct = alerts.clamped_threshold();
+        let reset_pct = alerts.reset_threshold();
         if let Some(batt) = next {
-            if batt.charging || batt.percent >= LOW_BATTERY_RESET_PCT {
+            if batt.charging || batt.percent >= reset_pct {
                 self.low_battery_notified = false;
-            } else if batt.percent <= LOW_BATTERY_WARN_PCT && !self.low_battery_notified {
+            } else if alerts.low_battery_toast
+                && batt.percent <= warn_pct
+                && !self.low_battery_notified
+            {
                 notify_low_battery(&self.controller.info().name, batt.percent);
                 self.low_battery_notified = true;
             }
@@ -177,6 +204,7 @@ impl ManagedController {
 
 struct RuntimeState {
     store: ProfileStore,
+    alerts: TrayAlertConfig,
     auto_switch_enabled: bool,
     profile_locked: bool,
     selection: BackendSelection,
@@ -184,6 +212,7 @@ struct RuntimeState {
     controllers: Vec<ManagedController>,
     last_topology: Vec<(u16, u16, u16, u16)>,
     last_topology_check: Instant,
+    pending_hotplug_at: Option<Instant>,
     last_battery_poll: Instant,
     audio_outputs: Vec<(String, String, bool)>,
     audio_inputs: Vec<(String, String, bool)>,
@@ -316,25 +345,30 @@ impl RuntimeState {
         self.last_topology_check = Instant::now();
 
         let mut next_controllers: Vec<ManagedController> = Vec::new();
+        let alerts = self.alerts.clone();
         let effective_selection = match selection {
             BackendSelection::AutoConnected => {
                 if hardware.is_empty() {
-                    next_controllers.push(ManagedController::init(SafeDeviceController::new(
-                        Box::new(DryRunDevice::new_volatile()),
-                    )));
+                    next_controllers.push(ManagedController::init(
+                        SafeDeviceController::new(Box::new(DryRunDevice::new_volatile())),
+                        &alerts,
+                    ));
                 } else {
                     for dev in hardware {
-                        next_controllers
-                            .push(ManagedController::init(SafeDeviceController::new(dev)));
+                        next_controllers.push(ManagedController::init(
+                            SafeDeviceController::new(dev),
+                            &alerts,
+                        ));
                     }
                 }
                 BackendSelection::AutoConnected
             }
             BackendSelection::HardwareIndex(idx) => {
                 if idx < hardware.len() {
-                    next_controllers.push(ManagedController::init(SafeDeviceController::new(
-                        hardware.remove(idx),
-                    )));
+                    next_controllers.push(ManagedController::init(
+                        SafeDeviceController::new(hardware.remove(idx)),
+                        &alerts,
+                    ));
                     BackendSelection::HardwareIndex(idx)
                 } else {
                     self.push_log(
@@ -345,15 +379,17 @@ impl RuntimeState {
                 }
             }
             BackendSelection::DryRunVolatile => {
-                next_controllers.push(ManagedController::init(SafeDeviceController::new(
-                    Box::new(DryRunDevice::new_volatile()),
-                )));
+                next_controllers.push(ManagedController::init(
+                    SafeDeviceController::new(Box::new(DryRunDevice::new_volatile())),
+                    &alerts,
+                ));
                 BackendSelection::DryRunVolatile
             }
             BackendSelection::DryRunFlashOnly => {
-                next_controllers.push(ManagedController::init(SafeDeviceController::new(
-                    Box::new(DryRunDevice::new_flash_only()),
-                )));
+                next_controllers.push(ManagedController::init(
+                    SafeDeviceController::new(Box::new(DryRunDevice::new_flash_only())),
+                    &alerts,
+                ));
                 BackendSelection::DryRunFlashOnly
             }
         };
@@ -390,36 +426,171 @@ impl RuntimeState {
             return false;
         }
         self.last_battery_poll = now;
+        let alerts = self.alerts.clone();
         let mut any_changed = false;
         for managed in &mut self.controllers {
-            if managed.refresh_battery() {
+            if managed.refresh_battery(&alerts) {
                 any_changed = true;
             }
         }
         any_changed
     }
 
-    /// Checks whether USB HID devices were plugged in or unplugged and auto-refreshes when changed.
+    fn force_refresh_mouse_and_battery(&mut self) {
+        let alerts = self.alerts.clone();
+        let mut details = Vec::new();
+        for managed in &mut self.controllers {
+            if let Ok(settings) = managed.controller.read_settings() {
+                managed.last_settings = Some(settings);
+            }
+            managed.refresh_battery(&alerts);
+            let name = managed.controller.info().name;
+            let batt = managed
+                .last_battery
+                .map(|b| format!(" · {}", b.compact_label()))
+                .unwrap_or_default();
+            let s = managed
+                .last_settings
+                .as_ref()
+                .map(MouseSettings::summary_string)
+                .unwrap_or_else(|| "asleep".to_string());
+            details.push(format!("{name} ({s}{batt})"));
+        }
+        self.last_battery_poll = Instant::now();
+        if !details.is_empty() {
+            self.push_log(
+                Severity::Info,
+                format!("Refreshed mouse & battery: {}", details.join(" | ")),
+            );
+        }
+    }
+
+    fn quick_apply_mouse_setting(&mut self, desired: &MouseSettings, label: &str) {
+        let alerts = self.alerts.clone();
+        let mut logs: Vec<(Severity, String)> = Vec::new();
+        for managed in &mut self.controllers {
+            let dev_name = managed.controller.info().name;
+            let caps = managed.controller.capabilities();
+            let (adapted, _) = caps.adapt_settings(desired);
+            if adapted.is_empty() {
+                continue;
+            }
+            match managed.controller.apply_profile_settings(&adapted) {
+                Ok(ApplyOutcome::Applied { mode, verified, .. }) => {
+                    managed.last_settings = Some(verified.clone());
+                    logs.push((
+                        Severity::Ok,
+                        format!(
+                            "[{dev_name}] Tray quick-set {label} via {mode:?} & verified ({}).",
+                            verified.summary_string()
+                        ),
+                    ));
+                }
+                Ok(ApplyOutcome::SkippedUnchanged { current }) => {
+                    managed.last_settings = Some(current);
+                    logs.push((
+                        Severity::Info,
+                        format!("[{dev_name}] Tray quick-set {label}: already active (0 writes)."),
+                    ));
+                }
+                Ok(ApplyOutcome::SkippedNoSettings) => {}
+                Err(err) => {
+                    logs.push((
+                        Severity::Warn,
+                        format!("[{dev_name}] Tray quick-set {label} failed: {err}"),
+                    ));
+                }
+            }
+            managed.refresh_battery(&alerts);
+        }
+        self.last_battery_poll = Instant::now();
+        for (sev, msg) in logs {
+            self.push_log(sev, msg);
+        }
+    }
+
+    fn read_from_mouse_for_editor(
+        &mut self,
+        target_device_id: Option<&str>,
+    ) -> (Option<String>, Option<MouseSettings>, Option<String>) {
+        let managed = match target_device_id {
+            Some(id) => self
+                .controllers
+                .iter_mut()
+                .find(|m| m.controller.info().id == id),
+            None => self.controllers.first_mut(),
+        };
+        let Some(managed) = managed else {
+            return (
+                None,
+                None,
+                Some("No connected mouse is available to read from.".to_string()),
+            );
+        };
+        let name = managed.controller.info().name;
+        match managed.controller.read_settings() {
+            Ok(settings) => {
+                managed.last_settings = Some(settings.clone());
+                let alerts = self.alerts.clone();
+                managed.refresh_battery(&alerts);
+                self.push_log(
+                    Severity::Ok,
+                    format!(
+                        "[{name}] Read live settings into profile editor: {}.",
+                        settings.summary_string()
+                    ),
+                );
+                (Some(name), Some(settings), None)
+            }
+            Err(err) => {
+                let msg = format!(
+                    "Could not read live settings from {name} (move mouse to wake it if wireless): {err}"
+                );
+                self.push_log(Severity::Warn, msg.clone());
+                (Some(name), None, Some(msg))
+            }
+        }
+    }
+
+    /// Checks whether USB HID devices were plugged in or unplugged via either an immediate
+    /// `WM_DEVICECHANGE` notification (debounced 300ms) or the 5s safety fallback poll.
     fn check_hotplug(&mut self) -> bool {
-        if !matches!(
+        let now = Instant::now();
+        let event_due = self.pending_hotplug_at.is_some_and(|at| now >= at);
+        let fallback_due = now.saturating_duration_since(self.last_topology_check)
+            >= HOTPLUG_FALLBACK_POLL_INTERVAL;
+
+        if !event_due && !fallback_due {
+            return false;
+        }
+        if event_due {
+            self.pending_hotplug_at = None;
+        }
+        self.last_topology_check = now;
+
+        let mut any_changed = false;
+        if event_due && self.refresh_audio_devices() {
+            any_changed = true;
+        }
+
+        if matches!(
             self.selection,
             BackendSelection::AutoConnected | BackendSelection::HardwareIndex(_)
         ) {
-            return false;
+            let current_fp = hid_topology_fingerprint();
+            if current_fp != self.last_topology {
+                let sel = self.selection.clone();
+                let reason = if event_due {
+                    "USB hot-plug (instant)"
+                } else {
+                    "USB hot-plug"
+                };
+                self.rebuild_controllers(sel, reason);
+                self.refresh_audio_devices();
+                any_changed = true;
+            }
         }
-        let now = Instant::now();
-        if now.saturating_duration_since(self.last_topology_check) < HOTPLUG_CHECK_INTERVAL {
-            return false;
-        }
-        self.last_topology_check = now;
-        let current_fp = hid_topology_fingerprint();
-        if current_fp == self.last_topology {
-            return false;
-        }
-        let sel = self.selection.clone();
-        self.rebuild_controllers(sel, "USB hot-plug");
-        self.refresh_audio_devices();
-        true
+        any_changed
     }
 
     fn refresh_audio_devices(&mut self) -> bool {
@@ -791,10 +962,11 @@ impl RuntimeState {
                     ));
                 }
             }
-            managed.refresh_battery();
+            managed.refresh_battery(&self.alerts);
         }
         self.last_battery_poll = Instant::now();
 
+        let switched_profile = self.active_profile_id != profile.id;
         if let Some(wait_secs) = max_rate_limit_wait {
             if self.auto_switch_enabled {
                 self.pending_retry = Some((
@@ -805,6 +977,24 @@ impl RuntimeState {
         } else if any_succeeded || self.controllers.is_empty() {
             self.active_profile_id = profile.id.clone();
             self.active_profile_name = profile.name.clone();
+            if self.alerts.profile_switch_toast
+                && (switched_profile || reason == "hotkey cycle" || reason == "manual test")
+            {
+                let mut parts = Vec::new();
+                if let Some(dpi) = profile.mouse.dpi {
+                    parts.push(format!("{dpi} DPI"));
+                }
+                if let Some(hz) = profile.mouse.polling_rate_hz {
+                    parts.push(format!("{hz} Hz"));
+                }
+                if let Some(plan) = profile.windows_power_plan {
+                    parts.push(plan.label().to_string());
+                }
+                if let Some(out) = profile.audio_output_device_name.as_deref() {
+                    parts.push(out.to_string());
+                }
+                notify_profile_switched(&profile.name, &parts.join(" · "));
+            }
         }
 
         for (sev, msg) in logs {
@@ -816,6 +1006,7 @@ impl RuntimeState {
 fn run_runtime_loop(
     initial_store: ProfileStore,
     initial_auto_switch: bool,
+    initial_alerts: TrayAlertConfig,
     cmd_rx: Receiver<ProfileRuntimeCmd>,
     ui_tx: Sender<WorkerMsg>,
     ctx: egui::Context,
@@ -830,6 +1021,7 @@ fn run_runtime_loop(
 
     let mut state = RuntimeState {
         store: initial_store,
+        alerts: initial_alerts,
         auto_switch_enabled: initial_auto_switch,
         profile_locked: false,
         selection: BackendSelection::AutoConnected,
@@ -837,6 +1029,7 @@ fn run_runtime_loop(
         controllers: Vec::new(),
         last_topology: Vec::new(),
         last_topology_check: Instant::now(),
+        pending_hotplug_at: None,
         last_battery_poll: Instant::now(),
         audio_outputs: Vec::new(),
         audio_inputs: Vec::new(),
@@ -936,9 +1129,8 @@ fn run_runtime_loop(
             state.emit(&ui_tx, &ctx);
         }
 
-        let wait = if !state.auto_switch_enabled {
-            // Still check USB hot-plug every 2s so plugging in a new mouse updates the UI live.
-            HOTPLUG_CHECK_INTERVAL
+        let mut wait = if !state.auto_switch_enabled {
+            HOTPLUG_FALLBACK_POLL_INTERVAL
         } else {
             state
                 .debouncer
@@ -946,6 +1138,10 @@ fn run_runtime_loop(
                 .map(|rem| rem.min(Duration::from_millis(100)))
                 .unwrap_or(Duration::from_millis(150))
         };
+        if let Some(hp_at) = state.pending_hotplug_at {
+            let rem = hp_at.saturating_duration_since(Instant::now());
+            wait = wait.min(rem.max(Duration::from_millis(10)));
+        }
 
         match cmd_rx.recv_timeout(wait) {
             Ok(ProfileRuntimeCmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
@@ -953,6 +1149,46 @@ fn run_runtime_loop(
                 break;
             }
             Err(RecvTimeoutError::Timeout) => continue,
+            Ok(ProfileRuntimeCmd::UsbDeviceChanged) => {
+                state.pending_hotplug_at = Some(Instant::now() + HOTPLUG_EVENT_DEBOUNCE);
+            }
+            Ok(ProfileRuntimeCmd::UpdateAlertConfig(next_alerts)) => {
+                state.alerts = next_alerts;
+                for m in &mut state.controllers {
+                    m.low_battery_notified = false;
+                }
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::QuickSetMousePolling(hz)) => {
+                let desired = MouseSettings {
+                    polling_rate_hz: Some(hz),
+                    ..Default::default()
+                };
+                state.quick_apply_mouse_setting(&desired, &format!("{hz} Hz"));
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::QuickSetMouseDpi(dpi)) => {
+                let desired = MouseSettings {
+                    dpi: Some(dpi),
+                    ..Default::default()
+                };
+                state.quick_apply_mouse_setting(&desired, &format!("{dpi} DPI"));
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::RefreshMouseAndBattery) => {
+                state.force_refresh_mouse_and_battery();
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::ReadFromMouseForEditor(dev_id)) => {
+                let (device_name, settings, error) =
+                    state.read_from_mouse_for_editor(dev_id.as_deref());
+                let _ = ui_tx.send(WorkerMsg::ReadFromMouseFinished {
+                    device_name,
+                    settings,
+                    error,
+                });
+                state.emit(&ui_tx, &ctx);
+            }
             Ok(ProfileRuntimeCmd::SetAutoSwitch(enabled)) => {
                 state.auto_switch_enabled = enabled;
                 if enabled {

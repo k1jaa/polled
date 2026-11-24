@@ -16,6 +16,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.0] - 2026-11-24
+
+### Added
+- **Live Battery Tray Icon & Configurable Notifications (`icon.rs`, `tray.rs`, `notifications.rs`, `settings.rs`):**
+  - Procedurally renders a live 32×32 monochrome wireless battery percentage + charge-meter icon directly into the Windows system tray (with semantic green while charging, amber at low battery, and red at critical `<= 5%`), paired with a rich live hover tooltip (`Polled · Mouse · Battery · Polling Hz · Profile`).
+  - Added unified **Settings — Tray, Alerts & Global Hotkeys** modal in the top bar: toggle the live battery tray icon, configure low-battery toast alerts and threshold (`5–50%`, default `15%`), and opt into Windows toast notifications when game/desktop profiles switch.
+- **Tray Mouse Quick Controls (`tray.rs`, `profile_runtime.rs`):**
+  - Added a **Mouse Quick Controls** submenu to the system tray to switch **Polling Rate** (per device capabilities, up to `8000 Hz`) and **Quick DPI** (`400 / 800 / 1600 / 3200`) or trigger **Refresh Mouse & Battery** in one click — routed through `SafeDeviceController` with full validation, diff-before-write, flash-wear protection, and read-back verification.
+- **Instant Event-Driven USB Hot-Plug Detection (`hotplug.rs`):**
+  - Added a zero-CPU Win32 `WM_DEVICECHANGE` + `RegisterDeviceNotificationW` (`GUID_DEVINTERFACE_HID` & `GUID_DEVINTERFACE_USB_DEVICE`) watcher so plugging/unplugging mice, 4K/8K dongles, wired charging cables, or USB audio interfaces updates the UI and tray within ~300 ms (with a 5 s fallback poll).
+- **Read from Mouse in Profile Editor (`profiles_ui.rs`, `profile_runtime.rs`):**
+  - Added a one-click **Read from Mouse** button beside **Mouse Target** in the Profile Editor to pull live onboard DPI, polling rate, LOD, debounce, sensor toggles, and sleep timeout directly from your connected mouse into a profile draft.
+
+---
+
 ## [0.7.0] - 2026-11-24
 
 ### Added
