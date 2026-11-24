@@ -30,6 +30,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `audio_format` (**Report-Only**): audits default playback & capture sample rates, channels, bit depths, and WASAPI scheduling periods — flagging Bluetooth Hands-Free (HFP/SCO `<= 16 kHz`) as `Bad`, extreme shared-mode resampling (`>= 192 kHz`) or high periods (`>= 15 ms`) as `Warn`, and playback/mic sample-rate mismatches (`44.1` vs `48 kHz`) as `Info`.
 - **Silent WASAPI Audio Latency & Wake-Jitter Benchmark in Input Lab (`input_lab_ui.rs`):**
   - On-demand 1-second strictly silent (`AUDCLNT_BUFFERFLAGS_SILENT`) shared-mode WASAPI benchmark (`IAudioClient3` low-latency period when supported) plotting real audio callback wake intervals, driver min/default period, active buffer, p99/max latency, and DPC glitch counts (also appended to **Copy Report**).
+- **Hands-Free Timed Input Lab Capture & `Esc` Stop (`input_lab_ui.rs`):**
+  - Default capture mode is now a clean **`3s -> 10s` timed run** (selectable `3s -> 5s`, `3s -> 10s`, `3s -> 15s`, or `Manual`): clicking **Start Capture** gives a 3-second prep countdown before recording starts and stops automatically when finished so moving/clicking Stop never pollutes your polling trace or click debounce counter.
+  - Press **`Esc`** anytime while focused (or use the global `Ctrl+Alt+I` hotkey) to stop capture or cancel the countdown hands-free.
 - **CLI `--audio` Inspection (`polled --audio` / `--audio --json`):**
   - Lists all active playback & capture endpoints with default status, volume/mute, format, WASAPI periods, APO enhancement state, and Bluetooth HFP status.
 

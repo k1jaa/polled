@@ -784,6 +784,7 @@ impl eframe::App for PolledApp {
         }
 
         self.drain_worker_messages(ctx);
+        self.input_lab_ui.tick_timers(ctx);
 
         let p = self.theme.palette();
         let mode = self.theme;

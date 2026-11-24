@@ -8,6 +8,7 @@
 use std::fs;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use eframe::egui::text::LayoutJob;
@@ -60,8 +61,56 @@ impl RulerUnit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CaptureMode {
+    Timed5s,
+    #[default]
+    Timed10s,
+    Timed15s,
+    Manual,
+}
+
+impl CaptureMode {
+    const ALL: [CaptureMode; 4] = [
+        CaptureMode::Timed10s,
+        CaptureMode::Timed5s,
+        CaptureMode::Timed15s,
+        CaptureMode::Manual,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            CaptureMode::Timed5s => "3s -> 5s",
+            CaptureMode::Timed10s => "3s -> 10s",
+            CaptureMode::Timed15s => "3s -> 15s",
+            CaptureMode::Manual => "Manual",
+        }
+    }
+
+    fn prep_secs(self) -> Option<u64> {
+        match self {
+            CaptureMode::Manual => None,
+            _ => Some(3),
+        }
+    }
+
+    fn capture_secs(self) -> Option<u64> {
+        match self {
+            CaptureMode::Timed5s => Some(5),
+            CaptureMode::Timed10s => Some(10),
+            CaptureMode::Timed15s => Some(15),
+            CaptureMode::Manual => None,
+        }
+    }
+}
+
 pub struct InputLabUiState {
     session: Option<RawInputCaptureSession>,
+    capture_mode: CaptureMode,
+    countdown_ends_at: Option<Instant>,
+    countdown_total_secs: f32,
+    capture_ends_at: Option<Instant>,
+    capture_total_secs: f32,
     target: PollingTarget,
     chart_mode: ChartViewMode,
     saturated_only: bool,
@@ -94,6 +143,11 @@ impl InputLabUiState {
     pub fn new() -> Self {
         Self {
             session: None,
+            capture_mode: CaptureMode::default(),
+            countdown_ends_at: None,
+            countdown_total_secs: 3.0,
+            capture_ends_at: None,
+            capture_total_secs: 10.0,
             target: PollingTarget::Auto,
             chart_mode: ChartViewMode::Split,
             saturated_only: false,
@@ -118,10 +172,44 @@ impl InputLabUiState {
     }
 
     pub fn is_capturing(&self) -> bool {
+        self.session.is_some() || self.countdown_ends_at.is_some()
+    }
+
+    fn is_live_capturing(&self) -> bool {
         self.session.is_some()
     }
 
+    fn is_counting_down(&self) -> bool {
+        self.countdown_ends_at.is_some()
+    }
+
+    /// Starts immediate manual capture (used by Global Hotkey and DPI Calibrator).
     pub fn start_capture(&mut self, ctx: &egui::Context) {
+        self.countdown_ends_at = None;
+        self.capture_ends_at = None;
+        self.start_live_session(ctx);
+    }
+
+    /// Starts capture according to the selected `CaptureMode` (3s countdown + timed run, or immediate manual).
+    fn begin_configured_capture(&mut self, ctx: &egui::Context) {
+        if let (Some(prep), Some(dur)) = (
+            self.capture_mode.prep_secs(),
+            self.capture_mode.capture_secs(),
+        ) {
+            self.stop_capture();
+            self.reset_capture();
+            self.countdown_total_secs = prep as f32;
+            self.capture_total_secs = dur as f32;
+            self.countdown_ends_at = Some(Instant::now() + Duration::from_secs(prep));
+            self.capture_ends_at = None;
+            self.notice = None;
+            ctx.request_repaint_after(Duration::from_millis(33));
+        } else {
+            self.start_capture(ctx);
+        }
+    }
+
+    fn start_live_session(&mut self, ctx: &egui::Context) {
         if self.session.is_some() {
             return;
         }
@@ -138,6 +226,8 @@ impl InputLabUiState {
     }
 
     pub fn stop_capture(&mut self) {
+        self.countdown_ends_at = None;
+        self.capture_ends_at = None;
         self.dpi_measuring = false;
         if let Some(mut session) = self.session.take() {
             session.set_dpi_measuring(false);
@@ -149,6 +239,8 @@ impl InputLabUiState {
     }
 
     fn reset_capture(&mut self) {
+        self.countdown_ends_at = None;
+        self.capture_ends_at = None;
         self.dpi_measuring = false;
         if let Some(session) = &self.session {
             session.set_dpi_measuring(false);
@@ -185,9 +277,12 @@ impl InputLabUiState {
             }
             self.last_snapshot.dpi_measurement.active = false;
         } else {
+            // DPI ruler slide always runs manually without timed auto-stop or countdown.
+            self.countdown_ends_at = None;
+            self.capture_ends_at = None;
             self.dpi_measuring = true;
             if self.session.is_none() {
-                self.start_capture(ctx);
+                self.start_live_session(ctx);
             } else if let Some(session) = &self.session {
                 session.set_dpi_measuring(true);
             }
@@ -271,6 +366,40 @@ impl InputLabUiState {
         }
     }
 
+    /// Advances timed capture prep countdown and auto-stop even if the user switches tabs.
+    pub fn tick_timers(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if let Some(prep_end) = self.countdown_ends_at {
+            if now >= prep_end {
+                self.countdown_ends_at = None;
+                self.start_live_session(ctx);
+                if let Some(secs) = self.capture_mode.capture_secs() {
+                    self.capture_total_secs = secs as f32;
+                    self.capture_ends_at = Some(Instant::now() + Duration::from_secs(secs));
+                }
+                ctx.request_repaint_after(Duration::from_millis(33));
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(33));
+            }
+        } else if let Some(cap_end) = self.capture_ends_at {
+            if now >= cap_end {
+                let dur_secs = self.capture_total_secs.round() as u64;
+                self.stop_capture();
+                let pkts = self.last_snapshot.polling.total_motion_packets;
+                let clicks = self.last_snapshot.clicks.total_presses;
+                let keys = self.last_snapshot.keyboard.total_events;
+                self.notice = Some((
+                    Severity::Ok,
+                    format!(
+                        "Completed {dur_secs}s timed capture ({pkts} mouse packets, {clicks} clicks, {keys} key transitions) — stopped automatically."
+                    ),
+                ));
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
+    }
+
     pub fn render(
         &mut self,
         ctx: &egui::Context,
@@ -280,6 +409,7 @@ impl InputLabUiState {
         detected_dpi: Option<u16>,
     ) {
         self.poll_background();
+        self.tick_timers(ctx);
 
         // Auto-sync configured DPI from the active detected mouse until the user edits it manually.
         if !self.dpi_manually_edited {
@@ -288,6 +418,23 @@ impl InputLabUiState {
                     self.configured_dpi = u32::from(dpi);
                 }
             }
+        }
+
+        // Hands-free Esc stops capture (or cancels the prep countdown) without moving/clicking the mouse.
+        if self.is_capturing()
+            && !ctx.wants_keyboard_input()
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            let was_countdown = self.is_counting_down();
+            self.stop_capture();
+            self.notice = Some((
+                Severity::Info,
+                if was_countdown {
+                    "Cancelled capture countdown (Esc).".to_string()
+                } else {
+                    "Stopped capture hands-free (Esc).".to_string()
+                },
+            ));
         }
 
         // Allow hands-free Space key toggle during an active DPI ruler slide so you don't nudge
@@ -413,7 +560,15 @@ impl InputLabUiState {
         detected_dpi: Option<u16>,
     ) {
         let inner_w = (card_w - 24.0).max(120.0);
-        let capturing = self.is_capturing();
+        let capturing = self.is_live_capturing();
+        let counting_down = self.is_counting_down();
+        let active_or_armed = capturing || counting_down;
+        let prep_remaining = self
+            .countdown_ends_at
+            .map(|end| end.saturating_duration_since(Instant::now()).as_secs_f32());
+        let cap_remaining = self
+            .capture_ends_at
+            .map(|end| end.saturating_duration_since(Instant::now()).as_secs_f32());
         let mut toggle_capture = false;
         let mut do_reset = false;
         let mut do_copy = false;
@@ -424,12 +579,13 @@ impl InputLabUiState {
         let mut do_clear_a = false;
         let mut do_save_ab_png = false;
         let has_pinned = self.pinned_baseline.is_some();
+        let mut next_mode = self.capture_mode;
         let mut next_target = self.target;
         let mut dpi_val = self.configured_dpi;
         let mut dpi_changed = false;
 
         card_frame(ui, p, card_w, |ui| {
-            let split = inner_w < 960.0;
+            let split = inner_w < 1040.0;
             let has_data = self.last_snapshot.polling.total_motion_packets > 0
                 || self.last_snapshot.clicks.total_presses > 0
                 || self.last_snapshot.dpi_measurement.packet_count > 0
@@ -438,15 +594,40 @@ impl InputLabUiState {
             let has_samples = !self.last_snapshot.polling.recent_samples.is_empty();
 
             let draw_primary_actions =
-                |ui: &mut egui::Ui, toggle_capture: &mut bool, do_reset: &mut bool| {
-                    let cap_label = if capturing {
-                        "Stop Capture"
+                |ui: &mut egui::Ui,
+                 next_mode: &mut CaptureMode,
+                 toggle_capture: &mut bool,
+                 do_reset: &mut bool| {
+                    let cap_label = if counting_down {
+                        "Cancel (Esc)"
+                    } else if capturing {
+                        "Stop (Esc)"
                     } else {
                         "Start Capture"
                     };
-                    if ui.add(primary_btn(cap_label, p)).clicked() {
+                    if ui
+                        .add(primary_btn(cap_label, p))
+                        .on_hover_text(
+                            "Press Esc anytime to stop or cancel capture hands-free without moving or clicking your mouse",
+                        )
+                        .clicked()
+                    {
                         *toggle_capture = true;
                     }
+                    ui.add_enabled_ui(!active_or_armed, |ui| {
+                        egui::ComboBox::from_id_salt("input_lab_capture_mode")
+                            .selected_text(next_mode.label())
+                            .width(86.0)
+                            .show_ui(ui, |ui| {
+                                for m in CaptureMode::ALL {
+                                    ui.selectable_value(next_mode, m, m.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Timed modes wait 3s after clicking Start so your hand can get ready, then auto-stop cleanly without clicking Stop",
+                            );
+                    });
                     if ui.add(secondary_btn("Reset", p)).clicked() {
                         *do_reset = true;
                     }
@@ -549,17 +730,22 @@ impl InputLabUiState {
                     }
                 };
 
+            let (status_text, status_col) = if let Some(rem) = prep_remaining {
+                (format!("STARTING IN {rem:.1}s · ESC"), p.warn)
+            } else if let Some(rem) = cap_remaining {
+                (format!("LIVE · {rem:.1}s LEFT · ESC"), p.ok)
+            } else if capturing {
+                ("LIVE (QPC) · ESC TO STOP".to_string(), p.ok)
+            } else {
+                ("IDLE · 0% CPU".to_string(), p.text_muted)
+            };
+
             if split {
                 ui.horizontal(|ui| {
-                    draw_primary_actions(ui, &mut toggle_capture, &mut do_reset);
+                    draw_primary_actions(ui, &mut next_mode, &mut toggle_capture, &mut do_reset);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (status_text, status_col) = if capturing {
-                            ("LIVE RAW INPUT (QPC)", p.ok)
-                        } else {
-                            ("IDLE · 0% CPU", p.text_muted)
-                        };
                         ui.label(
-                            RichText::new(status_text)
+                            RichText::new(&status_text)
                                 .size(11.0)
                                 .strong()
                                 .monospace()
@@ -585,7 +771,7 @@ impl InputLabUiState {
                 });
             } else {
                 ui.horizontal(|ui| {
-                    draw_primary_actions(ui, &mut toggle_capture, &mut do_reset);
+                    draw_primary_actions(ui, &mut next_mode, &mut toggle_capture, &mut do_reset);
                     ui.add_space(6.0);
                     draw_secondary_actions(
                         ui,
@@ -601,13 +787,8 @@ impl InputLabUiState {
                         &mut do_save_ab_png,
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (status_text, status_col) = if capturing {
-                            ("LIVE RAW INPUT (QPC)", p.ok)
-                        } else {
-                            ("IDLE · 0% CPU", p.text_muted)
-                        };
                         ui.label(
-                            RichText::new(status_text)
+                            RichText::new(&status_text)
                                 .size(11.0)
                                 .strong()
                                 .monospace()
@@ -615,6 +796,40 @@ impl InputLabUiState {
                         );
                     });
                 });
+            }
+
+            if let Some(rem) = prep_remaining {
+                ui.add_space(6.0);
+                let frac = (1.0 - (rem / self.countdown_total_secs.max(0.1))).clamp(0.0, 1.0);
+                render_timed_progress_bar(
+                    ui,
+                    p,
+                    mode,
+                    inner_w,
+                    Severity::Warn,
+                    frac,
+                    &format!(
+                        "Get ready — starting {}s capture in {:.1}s (press Esc to cancel)...",
+                        self.capture_total_secs.round() as u64,
+                        rem
+                    ),
+                );
+            } else if let Some(rem) = cap_remaining {
+                ui.add_space(6.0);
+                let frac = (1.0 - (rem / self.capture_total_secs.max(0.1))).clamp(0.0, 1.0);
+                render_timed_progress_bar(
+                    ui,
+                    p,
+                    mode,
+                    inner_w,
+                    Severity::Ok,
+                    frac,
+                    &format!(
+                        "Recording {}s timed run — {:.1}s left (auto-stops cleanly, or press Esc anytime)",
+                        self.capture_total_secs.round() as u64,
+                        rem
+                    ),
+                );
             }
 
             ui.add_space(6.0);
@@ -673,6 +888,7 @@ impl InputLabUiState {
             render_status_pill_rows(ui, p, inner_w, &pills);
         });
 
+        self.capture_mode = next_mode;
         if dpi_changed {
             self.configured_dpi = dpi_val;
             self.dpi_manually_edited = true;
@@ -681,10 +897,10 @@ impl InputLabUiState {
             self.set_target(next_target);
         }
         if toggle_capture {
-            if capturing {
+            if active_or_armed {
                 self.stop_capture();
             } else {
-                self.start_capture(ctx);
+                self.begin_configured_capture(ctx);
             }
         }
         if do_reset {
@@ -1339,7 +1555,7 @@ impl InputLabUiState {
             ui.add_space(8.0);
             let sev = ps.health_severity.unwrap_or(Severity::Info);
             let msg = if ps.health_summary.is_empty() {
-                "Click Start Capture and move your mouse in brisk, steady circles anywhere on screen to test 1K–8K polling consistency, IPS/G tracking, and wireless dropouts."
+                "Click Start Capture (default: 3s prep -> 10s timed run that stops automatically, or switch to Manual and press Esc anytime) and swipe in brisk, steady circles."
             } else {
                 &ps.health_summary
             };
@@ -2974,6 +3190,42 @@ fn render_status_pill_rows(
             }
         });
     }
+}
+
+fn render_timed_progress_bar(
+    ui: &mut egui::Ui,
+    p: Palette,
+    mode: ThemeMode,
+    outer_w: f32,
+    severity: Severity,
+    fraction: f32,
+    text: &str,
+) {
+    let fg = p.severity_fg(severity);
+    let bg = p.severity_bg(severity, mode);
+    let border = Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 120);
+    let inner_w = (outer_w - 20.0).max(120.0);
+    egui::Frame::NONE
+        .fill(bg)
+        .stroke(Stroke::new(1.0_f32, border))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.set_min_width(inner_w);
+            ui.set_max_width(inner_w);
+            ui.add(egui::Label::new(RichText::new(text).size(12.0).strong().color(p.text)).wrap());
+            ui.add_space(5.0);
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(inner_w, 5.0), egui::Sense::hover());
+            if ui.is_rect_visible(rect) {
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, CornerRadius::same(2), p.border);
+                let fill_w = rect.width() * fraction.clamp(0.0, 1.0);
+                if fill_w > 0.5 {
+                    let fill_rect = Rect::from_min_size(rect.min, Vec2::new(fill_w, rect.height()));
+                    painter.rect_filled(fill_rect, CornerRadius::same(2), fg);
+                }
+            }
+        });
 }
 
 fn semantic_banner(
