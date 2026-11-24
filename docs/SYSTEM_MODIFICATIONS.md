@@ -102,7 +102,7 @@ All persistent files created by Polled live under **`%LOCALAPPDATA%\Polled\`**:
 | `profiles.json` | User-created per-game mouse profiles, per-mouse overrides, and focus debounce delay. |
 | `settings.json` | UI theme (`dark` / `light`), Auto-Switch startup toggle, and optional global hotkey bindings (`RegisterHotKey`, disabled by default). |
 | `custom_tweaks.json` | User-defined custom reversible registry tweaks. |
-| `exports/` | Optional user-triggered Input Lab PNG benchmark cards (`polled_lab_*.png`) and CSV raw interval exports (`polled_lab_*.csv`). |
+| `exports/` | Optional user-triggered Bench PNG benchmark cards (`polled_bench_*.png`) and CSV raw interval exports (`polled_bench_*.csv`). |
 
 **Optional Windows Startup Entry (OFF by default):**
 - When you toggle **Startup: OFF → ON**, Polled writes:

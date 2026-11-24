@@ -2,7 +2,7 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Plain monochrome Black & White UI for the live Input Lab diagnostics tab.
+//! Plain monochrome Black & White UI for the live Bench diagnostics tab.
 //! Only the four semantic statuses (`OK`, `INFO`, `WARN`, `BAD`) carry chroma.
 
 use std::fs;
@@ -28,7 +28,7 @@ use polled_core::{
 
 use crate::theme::{Palette, ThemeMode};
 
-/// Optional 1-click navigation emitted from Input Lab's Recommended Fixes card.
+/// Optional 1-click navigation emitted from Bench's Recommended Fixes card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputLabNavAction {
     OpenHealthCheck,
@@ -959,7 +959,7 @@ impl InputLabUiState {
             ctx.copy_text(report);
             self.notice = Some((
                 Severity::Ok,
-                "Copied Input Lab diagnostic report to clipboard.".to_string(),
+                "Copied Bench diagnostic report to clipboard.".to_string(),
             ));
         }
         if do_save_png {
@@ -973,7 +973,7 @@ impl InputLabUiState {
                 self.timer_benchmark.as_ref(),
                 matches!(mode, ThemeMode::Dark),
             );
-            let filename = format!("polled_lab_{}.png", Local::now().format("%Y%m%d_%H%M%S"));
+            let filename = format!("polled_bench_{}.png", Local::now().format("%Y%m%d_%H%M%S"));
             let path = dir.join(filename);
             match fs::create_dir_all(&dir).and_then(|()| fs::write(&path, &png)) {
                 Ok(()) => {
@@ -990,7 +990,7 @@ impl InputLabUiState {
         if do_save_csv {
             let dir = AppPaths::default_user_dir().exports_dir();
             let csv = format_intervals_csv(&self.last_snapshot, self.configured_dpi);
-            let filename = format!("polled_lab_{}.csv", Local::now().format("%Y%m%d_%H%M%S"));
+            let filename = format!("polled_bench_{}.csv", Local::now().format("%Y%m%d_%H%M%S"));
             let path = dir.join(filename);
             match fs::create_dir_all(&dir).and_then(|()| fs::write(&path, csv)) {
                 Ok(()) => {
@@ -1036,8 +1036,10 @@ impl InputLabUiState {
                     self.configured_dpi,
                     matches!(mode, ThemeMode::Dark),
                 );
-                let filename =
-                    format!("polled_lab_ab_{}.png", Local::now().format("%Y%m%d_%H%M%S"));
+                let filename = format!(
+                    "polled_bench_ab_{}.png",
+                    Local::now().format("%Y%m%d_%H%M%S")
+                );
                 let path = dir.join(filename);
                 match fs::create_dir_all(&dir).and_then(|()| fs::write(&path, &png)) {
                     Ok(()) => {

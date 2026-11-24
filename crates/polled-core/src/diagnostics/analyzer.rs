@@ -1607,7 +1607,7 @@ pub fn format_diagnostic_report(
     let p = &snap.polling;
     let dpi_f = f64::from(configured_dpi.max(1));
     let mut lines = vec![
-        "Polled Input Lab Diagnostic Report".to_string(),
+        "Polled Bench Diagnostic Report".to_string(),
         format!(
             "Polling Rate:   {} Hz target | effective {:.0} Hz | peak {:.0} Hz",
             p.nominal_hz, p.effective_hz, p.peak_hz

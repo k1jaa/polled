@@ -11,7 +11,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Unverified mouse models (`Implemented from docs`):** Only **Pulsar X2 CrazyLight Mini Wireless** (`3710:5406`) and **LAMZU 4K Receiver** (`3554:f510`) have been verified on physical hardware in Polled. Razer, CompX 64B (WLMouse / LAMZU Maya X & Inca / Attack Shark / Vancer / RAWM), Endgame Gear, Finalmouse, VAXEE, Ninjutso, MCHOSE, Incott, Keychron, Logitech HID++ 2.0, and Wave 2 CompX 17B models (VGN, Scyrox V8, ATK/VXE R1, G-Wolves XVI:0, Hitscan Hyperlight) are implemented from open-source protocol documentation and prompt for confirmation before the first write in a session (see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
 - **Onboard flash writes:** Most wireless gaming mice persist settings to onboard memory rather than RAM; Polled mitigates flash wear via register diffing, focus debouncing, and a 4-writes / 60-second sliding-window cap.
 - **No built-in auto-updater:** Portable zip releases are updated manually.
-- **Minimum window size:** The GUI enforces a minimum viewport of `680×540` px to avoid crowding Input Lab plots and Profile editors.
+- **Minimum window size:** The GUI enforces a minimum viewport of `680×540` px to avoid crowding Bench plots and Profile editors.
 - **Version metadata in `v0.2.0`:** The `v0.2.0` tagged binaries reported `0.1.0` from `polled --version` because workspace `Cargo.toml` was not bumped prior to tagging `v0.2.0` (fixed in `v0.2.1`+).
 
 ---
@@ -39,6 +39,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Press **`Esc`** anytime while focused (or use the global `Ctrl+Alt+I` hotkey) to stop capture or cancel the countdown hands-free.
 - **CLI `--audio` Inspection (`polled --audio` / `--audio --json`):**
   - Lists all active playback & capture endpoints with default status, volume/mute, format, WASAPI periods, APO enhancement state, and Bluetooth HFP status.
+
+### Changed
+- Renamed the **Input Lab** tab to **Bench** across the GUI, Global Hotkeys modal, clipboard reports, PNG/CSV exports (`polled_bench_*.png`/`.csv`), and docs to reflect its expanded scope (mouse, keyboard, USB topology, OS timer, and WASAPI audio benchmarking).
 
 ---
 

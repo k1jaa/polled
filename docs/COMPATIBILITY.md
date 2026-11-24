@@ -9,7 +9,7 @@
 
 | OS | Status | Notes |
 | --- | --- | --- |
-| **Windows 11 (22H2 / 23H2 / 24H2+)** | Supported (Primary) | All 25 health checks, Input Lab (up to 8,000 Hz), and Per-Game Profiles supported. |
+| **Windows 11 (22H2 / 23H2 / 24H2+)** | Supported (Primary) | All 29 health checks, Bench (up to 8,000 Hz + WASAPI audio benchmark), and Per-Game Profiles supported. |
 | **Windows 10 (1903+)** | Supported | `windowed_optimizations` and `global_timer_requests` are Windows 11-specific features and are safe to leave untouched on Windows 10. |
 | **Windows 7 / 8 / 8.1** | Unsupported | Not tested; Win32 / power / Raw Input behavior is unsupported. |
 | **Linux / macOS** | Unsupported | Polled targets Windows APIs directly. |
@@ -79,7 +79,7 @@
 - **Battery impact:** Disabling **USB Selective Suspend**, **PCIe ASPM**, or fixing **CPU Maximum Processor State** only modifies **AC (plugged-in)** power indices; **DC (battery)** values are left untouched.
 
 ### 4,000 Hz / 8,000 Hz USB Port & Host Controller Quirks
-- **Symptom:** Input Lab shows high dropout counts or bunched packets (`< 0.5× nominal`) at 4K/8K Hz.
+- **Symptom:** Bench shows high dropout counts or bunched packets (`< 0.35× nominal`) at 4K/8K Hz.
 - **Common causes:** Plugging a 4K/8K dongle into an unpowered hub, monitor USB pass-through, or front-panel USB port; 2.4 GHz Wi-Fi router interference; or PCIe ASPM / USB Selective Suspend enabled. Plug directly into a rear motherboard CPU-lane USB port and keep the dongle extender within ~20 cm of the mousepad.
 
 ---

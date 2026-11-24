@@ -78,7 +78,7 @@ pub fn format_intervals_csv(snap: &DiagnosticsSnapshot, configured_dpi: u32) -> 
     let dpi_f = f64::from(configured_dpi.max(1));
     let mut out = String::with_capacity(512 + p.recent_samples.len() * 48);
 
-    out.push_str("# Polled Input Lab Raw Motion Intervals\n");
+    out.push_str("# Polled Bench Raw Motion Intervals\n");
     out.push_str(&format!(
         "# target_hz={},effective_hz={:.1},peak_hz={:.1},configured_dpi={}\n",
         p.nominal_hz, p.effective_hz, p.peak_hz, configured_dpi
@@ -136,7 +136,7 @@ pub fn render_report_png(
     canvas.stroke_rect(0, 0, IMG_W, IMG_H, C_BORDER);
 
     // --- HEADER BAR (y: 16..56) ---
-    canvas.draw_text_scaled(24, 18, "POLLED INPUT LAB", C_TEXT, 2);
+    canvas.draw_text_scaled(24, 18, "POLLED BENCH", C_TEXT, 2);
     let subtitle = format!("v{} · RAW INPUT DIAGNOSTIC CARD", env!("CARGO_PKG_VERSION"));
     canvas.draw_text(24, 38, &subtitle, C_MUTED);
 
@@ -334,7 +334,7 @@ pub fn render_ab_comparison_png(
     canvas.stroke_rect(0, 0, IMG_W, IMG_H, C_BORDER);
 
     // Header
-    canvas.draw_text_scaled(24, 18, "POLLED INPUT LAB · A/B DIFF", C_TEXT, 2);
+    canvas.draw_text_scaled(24, 18, "POLLED BENCH · A/B DIFF", C_TEXT, 2);
     let sub = format!(
         "v{} · BEFORE (A) VS AFTER (B) BENCHMARK COMPARISON",
         env!("CARGO_PKG_VERSION")
@@ -1334,7 +1334,7 @@ mod tests {
     fn csv_export_contains_metadata_header_and_interval_rows() {
         let snap = sample_snapshot();
         let csv = format_intervals_csv(&snap, 1600);
-        assert!(csv.contains("# Polled Input Lab Raw Motion Intervals"));
+        assert!(csv.contains("# Polled Bench Raw Motion Intervals"));
         assert!(csv.contains("index,dt_us,inst_hz,dx,dy,speed_ips,saturated"));
         let data_rows: Vec<&str> = csv
             .lines()

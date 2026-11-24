@@ -928,9 +928,9 @@ impl eframe::App for PolledApp {
                     }
 
                     let lab_label = if self.input_lab_ui.is_capturing() {
-                        "Input Lab ●"
+                        "Bench ●"
                     } else {
-                        "Input Lab"
+                        "Bench"
                     };
                     let lab_btn = if self.active_view == ActiveView::InputLab {
                         primary_button(lab_label, p)
@@ -1901,7 +1901,7 @@ impl eframe::App for PolledApp {
                                 ui.end_row();
                                 render_hotkey_binding_row(
                                     ui,
-                                    "Start / Stop Input Lab",
+                                    "Start / Stop Bench",
                                     "hk_lab",
                                     &mut self.settings.hotkeys.toggle_input_lab,
                                     "I",
@@ -2249,7 +2249,7 @@ fn render_latency_tips_card(ui: &mut egui::Ui, p: Palette, outer_w: f32) {
                 ),
                 (
                     "Sensor & DPI:",
-                    "1600–3200 DPI cuts motion-initiation latency by ~1–2 ms vs. 400 DPI on micro-adjustments (adjust in-game sensitivity to keep the same cm/360°). Verify 4K/8K saturation & switch debounce in Input Lab.",
+                    "1600–3200 DPI cuts motion-initiation latency by ~1–2 ms vs. 400 DPI on micro-adjustments (adjust in-game sensitivity to keep the same cm/360°). Verify 4K/8K saturation & switch debounce in Bench.",
                 ),
                 (
                     "GPU & Frame Pacing:",
