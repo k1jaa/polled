@@ -438,17 +438,18 @@ mod tests {
         .unwrap();
 
         let engine = HealthEngine::with_default_checks();
-        assert_eq!(engine.checks().len(), 26);
+        assert_eq!(engine.checks().len(), 29);
 
         let initial = engine.scan_all(&env, &paths, true).unwrap();
-        assert_eq!(initial.checks.len(), 26);
+        assert_eq!(initial.checks.len(), 29);
 
-        // `fix_all_safe` fixes safe core issues (pointer_speed, game_bar_capture, windowed_optimizations)
+        // `fix_all_safe` fixes safe core issues (pointer_speed, game_bar_capture, windowed_optimizations, audio_comms_ducking)
         // and intentionally skips optional tweaks (mmcss_gaming, win32_priority_separation, etc.).
         let fixed = engine.fix_all_safe(&env, &paths).unwrap();
         assert!(fixed.iter().any(|r| r.id == "pointer_speed"));
         assert!(fixed.iter().any(|r| r.id == "game_bar_capture"));
         assert!(fixed.iter().any(|r| r.id == "windowed_optimizations"));
+        assert!(fixed.iter().any(|r| r.id == "audio_comms_ducking"));
         assert!(!fixed.iter().any(|r| r.is_optional_tweak));
         assert_eq!(env.get_mouse_speed().unwrap(), 10);
 
@@ -488,7 +489,7 @@ mod tests {
         store.save_atomic(&paths.custom_tweaks_path()).unwrap();
 
         let engine = HealthEngine::with_default_and_custom_checks(&paths);
-        assert_eq!(engine.checks().len(), 27);
+        assert_eq!(engine.checks().len(), 30);
 
         let fixed = engine.fix_check("custom_hover_fast", &env, &paths).unwrap();
         assert_eq!(fixed.severity, Severity::Ok);

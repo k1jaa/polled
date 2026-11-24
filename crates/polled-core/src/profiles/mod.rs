@@ -101,6 +101,27 @@ pub struct GameProfile {
     /// Optional Windows power plan preset switched automatically when this profile activates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows_power_plan: Option<PowerPlanPreset>,
+    /// Optional default Windows audio playback (output) endpoint ID switched on activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_output_device_id: Option<String>,
+    /// Friendly name of the selected playback device (shown even if currently disconnected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_output_device_name: Option<String>,
+    /// Optional playback endpoint volume (`0..=100%`) applied on activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_output_volume: Option<u8>,
+    /// Optional default Windows microphone (capture) endpoint ID switched on activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_input_device_id: Option<String>,
+    /// Friendly name of the selected microphone (shown even if currently disconnected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_input_device_name: Option<String>,
+    /// Optional microphone capture volume (`0..=100%`) applied on activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_input_volume: Option<u8>,
+    /// Periodically enforces `audio_input_volume` every 2s so games/Steam/Discord cannot hijack mic gain.
+    #[serde(default)]
+    pub lock_mic_volume: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +145,13 @@ impl GameProfile {
             device_overrides: BTreeMap::new(),
             windows_pointer_speed: Some(10),
             windows_power_plan: None,
+            audio_output_device_id: None,
+            audio_output_device_name: None,
+            audio_output_volume: None,
+            audio_input_device_id: None,
+            audio_input_device_name: None,
+            audio_input_volume: None,
+            lock_mic_volume: false,
             author: None,
             notes: Some("Fallback profile used whenever no game profile matches.".to_string()),
         }
@@ -167,6 +195,24 @@ impl GameProfile {
             })
             .collect();
         self.windows_pointer_speed = self.windows_pointer_speed.map(|s| s.clamp(1, 20));
+        self.audio_output_device_id = self
+            .audio_output_device_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.audio_output_device_name = self
+            .audio_output_device_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.audio_output_volume = self.audio_output_volume.map(|v| v.min(100));
+        self.audio_input_device_id = self
+            .audio_input_device_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.audio_input_device_name = self
+            .audio_input_device_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.audio_input_volume = self.audio_input_volume.map(|v| v.min(100));
         self
     }
 }
@@ -308,6 +354,13 @@ mod tests {
             )]),
             windows_pointer_speed: Some(10),
             windows_power_plan: Some(PowerPlanPreset::HighPerformance),
+            audio_output_device_id: Some("{0.0.0.00000000}.{1111}".to_string()),
+            audio_output_device_name: Some("Headphones (USB DAC)".to_string()),
+            audio_output_volume: Some(72),
+            audio_input_device_id: Some("{0.0.1.00000000}.{2222}".to_string()),
+            audio_input_device_name: Some("Shure MV7".to_string()),
+            audio_input_volume: Some(85),
+            lock_mic_volume: true,
             author: Some("k1jaa".to_string()),
             notes: Some("Tournament config".to_string()),
         });
@@ -320,6 +373,9 @@ mod tests {
             loaded.profiles[1].windows_power_plan,
             Some(PowerPlanPreset::HighPerformance)
         );
+        assert_eq!(loaded.profiles[1].audio_output_volume, Some(72));
+        assert_eq!(loaded.profiles[1].audio_input_volume, Some(85));
+        assert!(loaded.profiles[1].lock_mic_volume);
         let (lamzu, is_override) = loaded.profiles[1].settings_for_device("lamzu_compx_4k");
         assert!(is_override);
         assert_eq!(lamzu.lod, Some(LiftOffDistance::Mm10));
@@ -348,6 +404,13 @@ mod tests {
             device_overrides: BTreeMap::new(),
             windows_pointer_speed: None,
             windows_power_plan: None,
+            audio_output_device_id: None,
+            audio_output_device_name: None,
+            audio_output_volume: None,
+            audio_input_device_id: None,
+            audio_input_device_name: None,
+            audio_input_volume: None,
+            lock_mic_volume: false,
             author: Some("k1jaa".to_string()),
             notes: Some("Low LOD + 4K".to_string()),
         };

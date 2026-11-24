@@ -24,6 +24,7 @@ pub use export::{format_intervals_csv, render_ab_comparison_png, render_report_p
 pub use raw_capture::RawInputCaptureSession;
 
 use crate::error::Result;
+use crate::win::AudioLatencyBenchmark;
 
 /// Runs an on-demand 1-second Windows 1 ms timer jitter benchmark (non-elevated, RAII cleanup).
 pub fn run_timer_jitter_benchmark(duration_ms: u64) -> Result<TimerJitterBenchmark> {
@@ -47,4 +48,54 @@ pub fn run_timer_jitter_benchmark(duration_ms: u64) -> Result<TimerJitterBenchma
             severity: crate::checks::Severity::Info,
         })
     }
+}
+
+/// Runs an on-demand 1-second strictly silent shared-mode WASAPI audio wake-jitter benchmark.
+pub fn run_audio_latency_benchmark(duration_ms: u64) -> Result<AudioLatencyBenchmark> {
+    #[cfg(windows)]
+    {
+        crate::win::audio::measure_audio_latency_benchmark(duration_ms)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = duration_ms;
+        Ok(AudioLatencyBenchmark {
+            device_name: "Unavailable (non-Windows)".to_string(),
+            sample_rate_hz: 48_000,
+            channels: 2,
+            default_period_ms: 10.0,
+            min_period_ms: 10.0,
+            active_buffer_ms: 10.0,
+            elapsed_ms: 0.0,
+            samples_ms: Vec::new(),
+            min_ms: 0.0,
+            median_ms: 0.0,
+            p95_ms: 0.0,
+            p99_ms: 0.0,
+            max_ms: 0.0,
+            glitch_count: 0,
+            severity: crate::checks::Severity::Info,
+        })
+    }
+}
+
+/// Formats a compact plain-text summary block for a WASAPI audio latency benchmark.
+pub fn format_audio_benchmark_summary(bench: &AudioLatencyBenchmark) -> String {
+    format!(
+        "WASAPI Audio Engine Benchmark (1s silent): {}\n\
+         - Format: {} Hz · {}ch | Engine Period: {:.2} ms (min {:.2} ms) | Active Buffer: {:.2} ms\n\
+         - Wake Intervals: median {:.2} ms | p95 {:.2} ms | p99 {:.2} ms | max {:.2} ms | glitches: {} [{}]",
+        bench.device_name,
+        bench.sample_rate_hz,
+        bench.channels,
+        bench.default_period_ms,
+        bench.min_period_ms,
+        bench.active_buffer_ms,
+        bench.median_ms,
+        bench.p95_ms,
+        bench.p99_ms,
+        bench.max_ms,
+        bench.glitch_count,
+        bench.severity.as_str().to_uppercase(),
+    )
 }

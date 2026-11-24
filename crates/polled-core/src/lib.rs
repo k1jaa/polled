@@ -28,7 +28,8 @@ pub use devices::{
     VaxeeProtocolDriver, WriteMode,
 };
 pub use diagnostics::{
-    format_diagnostic_report, format_intervals_csv, render_ab_comparison_png, render_report_png,
+    format_audio_benchmark_summary, format_diagnostic_report, format_intervals_csv,
+    render_ab_comparison_png, render_report_png, run_audio_latency_benchmark,
     run_timer_jitter_benchmark, ButtonBounceStats, ClickBounceAnalyzer, ClickBounceSnapshot,
     ClickEventRecord, DiagnosticsSnapshot, DpiCalibrationResult, DpiCalibrator,
     DpiMeasurementSnapshot, HistogramBin, IntervalSample, KeyboardPollingAnalyzer,
@@ -48,3 +49,4 @@ pub use settings::{
     format_autostart_command, is_autostart_enabled, set_autostart_enabled, AppSettings,
     HotkeyBinding, HotkeyConfig, ThemePreference,
 };
+pub use win::{AudioEndpointInfo, AudioFlow, AudioLatencyBenchmark};

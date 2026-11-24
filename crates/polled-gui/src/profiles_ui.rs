@@ -91,6 +91,15 @@ pub struct ProfileDraft {
     pub win_speed: u32,
     pub set_power_plan: bool,
     pub power_plan: PowerPlanPreset,
+    pub audio_output_id: Option<String>,
+    pub audio_output_name: Option<String>,
+    pub set_audio_output_vol: bool,
+    pub audio_output_vol: u8,
+    pub audio_input_id: Option<String>,
+    pub audio_input_name: Option<String>,
+    pub set_audio_input_vol: bool,
+    pub audio_input_vol: u8,
+    pub lock_mic_volume: bool,
     pub author: String,
     pub notes: String,
 }
@@ -129,6 +138,15 @@ impl ProfileDraft {
             power_plan: p
                 .windows_power_plan
                 .unwrap_or(PowerPlanPreset::HighPerformance),
+            audio_output_id: p.audio_output_device_id.clone(),
+            audio_output_name: p.audio_output_device_name.clone(),
+            set_audio_output_vol: p.audio_output_volume.is_some(),
+            audio_output_vol: p.audio_output_volume.unwrap_or(75),
+            audio_input_id: p.audio_input_device_id.clone(),
+            audio_input_name: p.audio_input_device_name.clone(),
+            set_audio_input_vol: p.audio_input_volume.is_some(),
+            audio_input_vol: p.audio_input_volume.unwrap_or(85),
+            lock_mic_volume: p.lock_mic_volume,
             author: p.author.clone().unwrap_or_default(),
             notes: p.notes.clone().unwrap_or_default(),
         };
@@ -248,6 +266,17 @@ impl ProfileDraft {
             device_overrides: copy.device_overrides,
             windows_pointer_speed: copy.set_win_speed.then_some(copy.win_speed.clamp(1, 20)),
             windows_power_plan: copy.set_power_plan.then_some(copy.power_plan),
+            audio_output_device_id: copy.audio_output_id,
+            audio_output_device_name: copy.audio_output_name,
+            audio_output_volume: copy
+                .set_audio_output_vol
+                .then_some(copy.audio_output_vol.min(100)),
+            audio_input_device_id: copy.audio_input_id,
+            audio_input_device_name: copy.audio_input_name,
+            audio_input_volume: copy
+                .set_audio_input_vol
+                .then_some(copy.audio_input_vol.min(100)),
+            lock_mic_volume: copy.set_audio_input_vol && copy.lock_mic_volume,
             author: (!copy.author.trim().is_empty()).then(|| copy.author.trim().to_string()),
             notes: (!copy.notes.trim().is_empty()).then(|| copy.notes.trim().to_string()),
         }
@@ -1087,6 +1116,12 @@ impl ProfilesUiState {
                 if let Some(pending) = &s.pending_exe {
                     pills.push(("DEBOUNCING".to_string(), pending.clone()));
                 }
+                if let Some((_, audio_name, _)) = s.audio_outputs.iter().find(|(_, _, def)| *def) {
+                    pills.push(("AUDIO".to_string(), audio_name.clone()));
+                }
+                if let Some(locked_pct) = s.mic_lock_active {
+                    pills.push(("MIC LOCK".to_string(), format!("{locked_pct}%")));
+                }
                 if s.any_flash_only {
                     pills.push((
                         "FLASH WRITES".to_string(),
@@ -1188,6 +1223,13 @@ impl ProfilesUiState {
                             device_overrides: BTreeMap::new(),
                             windows_pointer_speed: None,
                             windows_power_plan: None,
+                            audio_output_device_id: None,
+                            audio_output_device_name: None,
+                            audio_output_volume: None,
+                            audio_input_device_id: None,
+                            audio_input_device_name: None,
+                            audio_input_volume: None,
+                            lock_mic_volume: false,
                             author: None,
                             notes: None,
                         };
@@ -1424,6 +1466,7 @@ impl ProfilesUiState {
             let mut next_target: Option<(Option<String>, Option<DeviceCapabilities>)> = None;
             let mut remove_override = false;
             let mut open_game_picker = false;
+            let mut refresh_audio = false;
 
             egui::ScrollArea::vertical()
                 .id_salt("profile_editor_scroll")
@@ -1737,6 +1780,148 @@ impl ProfilesUiState {
                             });
                             ui.end_row();
 
+                            let audio_combo_w = (field_w - 80.0).clamp(140.0, 300.0);
+
+                            ui.label(RichText::new("Audio Output").color(p.text_muted));
+                            ui.horizontal(|ui| {
+                                let out_selected_label = match &self.editor.audio_output_id {
+                                    None => "Leave unchanged".to_string(),
+                                    Some(sel_id) => snap
+                                        .and_then(|s| {
+                                            s.audio_outputs
+                                                .iter()
+                                                .find(|(id, _, _)| id == sel_id)
+                                                .map(|(_, name, _)| name.clone())
+                                        })
+                                        .or_else(|| {
+                                            self.editor
+                                                .audio_output_name
+                                                .as_ref()
+                                                .map(|n| format!("{n} [offline]"))
+                                        })
+                                        .unwrap_or_else(|| "Saved endpoint [offline]".to_string()),
+                                };
+                                egui::ComboBox::from_id_salt("audio_output_combo")
+                                    .selected_text(out_selected_label)
+                                    .width(audio_combo_w)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                self.editor.audio_output_id.is_none(),
+                                                "Leave unchanged",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.editor.audio_output_id = None;
+                                            self.editor.audio_output_name = None;
+                                        }
+                                        if let Some(s) = snap {
+                                            for (id, name, is_default) in &s.audio_outputs {
+                                                let lbl = if *is_default {
+                                                    format!("{name} (default)")
+                                                } else {
+                                                    name.clone()
+                                                };
+                                                let selected = self
+                                                    .editor
+                                                    .audio_output_id
+                                                    .as_deref()
+                                                    == Some(id.as_str());
+                                                if ui.selectable_label(selected, lbl).clicked() {
+                                                    self.editor.audio_output_id = Some(id.clone());
+                                                    self.editor.audio_output_name =
+                                                        Some(name.clone());
+                                                }
+                                            }
+                                        }
+                                    });
+                                if ui
+                                    .add(secondary_btn("Refresh", p))
+                                    .on_hover_text("Re-scan Windows playback & microphone endpoints")
+                                    .clicked()
+                                {
+                                    refresh_audio = true;
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.checkbox(&mut self.editor.set_audio_output_vol, "Output Volume");
+                            ui.add_enabled(
+                                self.editor.set_audio_output_vol,
+                                egui::DragValue::new(&mut self.editor.audio_output_vol)
+                                    .range(0..=100)
+                                    .speed(1)
+                                    .suffix("%"),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("Microphone").color(p.text_muted));
+                            let in_selected_label = match &self.editor.audio_input_id {
+                                None => "Leave unchanged".to_string(),
+                                Some(sel_id) => snap
+                                    .and_then(|s| {
+                                        s.audio_inputs
+                                            .iter()
+                                            .find(|(id, _, _)| id == sel_id)
+                                            .map(|(_, name, _)| name.clone())
+                                    })
+                                    .or_else(|| {
+                                        self.editor
+                                            .audio_input_name
+                                            .as_ref()
+                                            .map(|n| format!("{n} [offline]"))
+                                    })
+                                    .unwrap_or_else(|| "Saved microphone [offline]".to_string()),
+                            };
+                            egui::ComboBox::from_id_salt("audio_input_combo")
+                                .selected_text(in_selected_label)
+                                .width(audio_combo_w)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            self.editor.audio_input_id.is_none(),
+                                            "Leave unchanged",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.editor.audio_input_id = None;
+                                        self.editor.audio_input_name = None;
+                                    }
+                                    if let Some(s) = snap {
+                                        for (id, name, is_default) in &s.audio_inputs {
+                                            let lbl = if *is_default {
+                                                format!("{name} (default)")
+                                            } else {
+                                                name.clone()
+                                            };
+                                            let selected = self.editor.audio_input_id.as_deref()
+                                                == Some(id.as_str());
+                                            if ui.selectable_label(selected, lbl).clicked() {
+                                                self.editor.audio_input_id = Some(id.clone());
+                                                self.editor.audio_input_name = Some(name.clone());
+                                            }
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+
+                            ui.checkbox(&mut self.editor.set_audio_input_vol, "Mic Volume");
+                            ui.add_enabled_ui(self.editor.set_audio_input_vol, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.editor.audio_input_vol)
+                                            .range(0..=100)
+                                            .speed(1)
+                                            .suffix("%"),
+                                    );
+                                    ui.checkbox(&mut self.editor.lock_mic_volume, "Lock Gain")
+                                        .on_hover_text(
+                                            "Enforces this microphone level every 2 seconds while active so games, Steam Voice, or Discord cannot auto-adjust your mic slider",
+                                        );
+                                });
+                            });
+                            ui.end_row();
+
                             ui.label(RichText::new("Notes (optional)").color(p.text_muted));
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.editor.notes)
@@ -1747,6 +1932,9 @@ impl ProfilesUiState {
                         });
                 });
 
+            if refresh_audio {
+                runtime.send(ProfileRuntimeCmd::RefreshAudioDevices);
+            }
             if open_game_picker {
                 self.game_picker_open = true;
                 self.game_picker_search.clear();

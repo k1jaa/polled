@@ -24,6 +24,7 @@ const ID_SCAN: &str = "scan";
 const ID_AUTO_SWITCH: &str = "auto_switch";
 const ID_LOCK_PROFILE: &str = "lock_profile";
 const ID_PROFILE_PREFIX: &str = "profile::";
+const ID_AUDIO_PREFIX: &str = "audio::";
 const ID_QUIT: &str = "quit";
 
 /// Finds Polled's own top-level `HWND` on the current Win32 UI thread (including when hidden).
@@ -94,6 +95,9 @@ pub struct TrayController {
     profiles_submenu: Submenu,
     profile_menu_items: Vec<MenuItem>,
     last_profile_key: (String, Vec<(String, String)>),
+    audio_submenu: Submenu,
+    audio_menu_items: Vec<MenuItem>,
+    last_audio_key: Vec<(String, String, bool)>,
     auto_switch_item: CheckMenuItem,
     lock_profile_item: CheckMenuItem,
 }
@@ -118,6 +122,7 @@ impl TrayController {
         let scan_item = MenuItem::with_id(ID_SCAN, "Scan Now", true, None);
         let sep_top = PredefinedMenuItem::separator();
         let profiles_submenu = Submenu::new("Switch Profile", true);
+        let audio_submenu = Submenu::new("Audio Output", true);
         let lock_profile_item =
             CheckMenuItem::with_id(ID_LOCK_PROFILE, "Lock Current Profile", true, false, None);
         let auto_switch_item = CheckMenuItem::with_id(
@@ -135,6 +140,7 @@ impl TrayController {
         let _ = menu.append(&scan_item);
         let _ = menu.append(&sep_top);
         let _ = menu.append(&profiles_submenu);
+        let _ = menu.append(&audio_submenu);
         let _ = menu.append(&lock_profile_item);
         let _ = menu.append(&auto_switch_item);
         let _ = menu.append(&sep_bottom);
@@ -183,6 +189,12 @@ impl TrayController {
                         if let Some(prof_id) = id_str.strip_prefix(ID_PROFILE_PREFIX) {
                             let _ = profile_cmd_tx
                                 .send(ProfileRuntimeCmd::ApplyProfileNow(prof_id.to_string()));
+                            ctx.request_repaint();
+                            continue;
+                        }
+                        if let Some(audio_id) = id_str.strip_prefix(ID_AUDIO_PREFIX) {
+                            let _ = profile_cmd_tx
+                                .send(ProfileRuntimeCmd::SwitchAudioOutput(audio_id.to_string()));
                             ctx.request_repaint();
                             continue;
                         }
@@ -252,12 +264,16 @@ impl TrayController {
             profiles_submenu,
             profile_menu_items: Vec::new(),
             last_profile_key: (String::new(), Vec::new()),
+            audio_submenu,
+            audio_menu_items: Vec::new(),
+            last_audio_key: Vec::new(),
             auto_switch_item,
             lock_profile_item,
         }
     }
 
-    /// Synchronizes the tray menu status header, profile quick-switch submenu, checkmarks, and tooltip.
+    /// Synchronizes the tray menu status header, profile & audio submenus, checkmarks, and tooltip.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_status(
         &mut self,
         auto_switch_enabled: bool,
@@ -265,6 +281,7 @@ impl TrayController {
         active_profile_id: &str,
         active_profile_name: &str,
         available_profiles: &[(String, String)],
+        audio_outputs: &[(String, String, bool)],
         battery_summary: Option<&str>,
     ) {
         self.auto_switch_item.set_checked(auto_switch_enabled);
@@ -293,6 +310,31 @@ impl TrayController {
                 self.profile_menu_items.push(item);
             }
             self.last_profile_key = next_key;
+        }
+
+        if audio_outputs != self.last_audio_key.as_slice() {
+            for old in self.audio_menu_items.drain(..) {
+                let _ = self.audio_submenu.remove(&old);
+            }
+            if audio_outputs.is_empty() {
+                let placeholder =
+                    MenuItem::with_id("audio_empty", "No active playback devices", false, None);
+                let _ = self.audio_submenu.append(&placeholder);
+                self.audio_menu_items.push(placeholder);
+            } else {
+                for (id, name, is_default) in audio_outputs {
+                    let label = if *is_default {
+                        format!("● {name}")
+                    } else {
+                        format!("   {name}")
+                    };
+                    let item =
+                        MenuItem::with_id(format!("{ID_AUDIO_PREFIX}{id}"), label, true, None);
+                    let _ = self.audio_submenu.append(&item);
+                    self.audio_menu_items.push(item);
+                }
+            }
+            self.last_audio_key = audio_outputs.to_vec();
         }
 
         if let Some(tray) = &self.tray {

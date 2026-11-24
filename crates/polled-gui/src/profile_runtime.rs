@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 use eframe::egui;
-use polled_core::win::{SystemEnv, WindowsEnv};
+use polled_core::win::{AudioFlow, SystemEnv, WindowsEnv};
 use polled_core::{
     detect_hardware_devices, hid_topology_fingerprint, match_profile, AppPaths, ApplyOutcome,
     BatteryStatus, DeviceCapabilities, DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent,
@@ -25,6 +25,8 @@ use crate::notifications::notify_low_battery;
 const MAX_LOG_ENTRIES: usize = 50;
 const HOTPLUG_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const MIC_LOCK_INTERVAL: Duration = Duration::from_secs(2);
+const AUDIO_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const LOW_BATTERY_WARN_PCT: u8 = 15;
 const LOW_BATTERY_RESET_PCT: u8 = 25;
 
@@ -66,6 +68,12 @@ pub struct ProfileRuntimeSnapshot {
     pub active_profile_id: String,
     pub active_profile_name: String,
     pub available_profiles: Vec<(String, String)>,
+    /// Active playback endpoints as `(id, friendly_name, is_default)`.
+    pub audio_outputs: Vec<(String, String, bool)>,
+    /// Active microphone endpoints as `(id, friendly_name, is_default)`.
+    pub audio_inputs: Vec<(String, String, bool)>,
+    /// Active Mic Gain Lock target (`0..=100%`) when the current profile enforces mic gain.
+    pub mic_lock_active: Option<u8>,
     pub total_flash_writes_session: u64,
     pub log: Vec<ProfileLogEntry>,
 }
@@ -74,6 +82,9 @@ pub enum ProfileRuntimeCmd {
     SetAutoSwitch(bool),
     SetProfileLock(bool),
     CycleNextProfile,
+    SwitchAudioOutput(String),
+    CycleAudioOutput,
+    RefreshAudioDevices,
     UpdateStore(ProfileStore),
     SelectBackend(BackendSelection),
     RedetectHardware,
@@ -174,6 +185,12 @@ struct RuntimeState {
     last_topology: Vec<(u16, u16, u16, u16)>,
     last_topology_check: Instant,
     last_battery_poll: Instant,
+    audio_outputs: Vec<(String, String, bool)>,
+    audio_inputs: Vec<(String, String, bool)>,
+    last_audio_refresh: Instant,
+    /// `(optional_endpoint_id, target_volume_pct)` when Mic Gain Lock is active.
+    mic_lock_target: Option<(Option<String>, u8)>,
+    last_mic_lock_check: Instant,
     debouncer: FocusDebouncer,
     watcher: Option<ForegroundWatcher>,
     focus_rx: Option<Receiver<FocusEvent>>,
@@ -248,6 +265,9 @@ impl RuntimeState {
             active_profile_id: self.active_profile_id.clone(),
             active_profile_name: self.active_profile_name.clone(),
             available_profiles,
+            audio_outputs: self.audio_outputs.clone(),
+            audio_inputs: self.audio_inputs.clone(),
+            mic_lock_active: self.mic_lock_target.as_ref().map(|(_, pct)| *pct),
             total_flash_writes_session,
             log: self.log.clone(),
         }
@@ -398,7 +418,99 @@ impl RuntimeState {
         }
         let sel = self.selection.clone();
         self.rebuild_controllers(sel, "USB hot-plug");
+        self.refresh_audio_devices();
         true
+    }
+
+    fn refresh_audio_devices(&mut self) -> bool {
+        let env = WindowsEnv;
+        let next_outputs: Vec<(String, String, bool)> = env
+            .list_audio_endpoints(AudioFlow::Render)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.id, e.name, e.is_default))
+            .collect();
+        let next_inputs: Vec<(String, String, bool)> = env
+            .list_audio_endpoints(AudioFlow::Capture)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.id, e.name, e.is_default))
+            .collect();
+        self.last_audio_refresh = Instant::now();
+        let changed = next_outputs != self.audio_outputs || next_inputs != self.audio_inputs;
+        self.audio_outputs = next_outputs;
+        self.audio_inputs = next_inputs;
+        changed
+    }
+
+    fn poll_audio_and_mic_lock(&mut self) -> bool {
+        let now = Instant::now();
+        let mut changed = false;
+
+        if let Some((ref target_id, target_pct)) = self.mic_lock_target {
+            if now.saturating_duration_since(self.last_mic_lock_check) >= MIC_LOCK_INTERVAL {
+                self.last_mic_lock_check = now;
+                let env = WindowsEnv;
+                if let Ok(cur) =
+                    env.get_audio_endpoint_volume(AudioFlow::Capture, target_id.as_deref())
+                {
+                    if cur != target_pct {
+                        match env.set_audio_endpoint_volume(
+                            AudioFlow::Capture,
+                            target_id.as_deref(),
+                            target_pct,
+                        ) {
+                            Ok(()) => {
+                                self.push_log(
+                                    Severity::Info,
+                                    format!(
+                                        "Mic Gain Lock restored microphone level {cur}% -> {target_pct}%."
+                                    ),
+                                );
+                                changed = true;
+                            }
+                            Err(e) => {
+                                self.push_log(
+                                    Severity::Warn,
+                                    format!("Mic Gain Lock failed to restore mic level: {e}"),
+                                );
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if now.saturating_duration_since(self.last_audio_refresh) >= AUDIO_REFRESH_INTERVAL
+            && self.refresh_audio_devices()
+        {
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn switch_audio_output(&mut self, endpoint_id: &str, reason: &str) {
+        let env = WindowsEnv;
+        let label = self
+            .audio_outputs
+            .iter()
+            .find(|(id, _, _)| id == endpoint_id)
+            .map(|(_, name, _)| name.clone())
+            .unwrap_or_else(|| endpoint_id.to_string());
+        match env.set_default_audio_endpoint(endpoint_id) {
+            Ok(()) => {
+                self.refresh_audio_devices();
+                self.push_log(Severity::Ok, format!("Audio output -> {label} ({reason})"));
+            }
+            Err(e) => {
+                self.push_log(
+                    Severity::Warn,
+                    format!("Failed to switch audio output to '{label}': {e}"),
+                );
+            }
+        }
     }
 
     fn apply_profile(&mut self, profile: &GameProfile, reason: &str) {
@@ -460,6 +572,129 @@ impl RuntimeState {
                     Severity::Warn,
                     format!("Could not list Windows power plans: {e}"),
                 ),
+            }
+        }
+
+        // --- Per-Game Audio Automation (Output, Mic, Volumes, Mic Gain Lock) ---
+        {
+            let env = WindowsEnv;
+            let mut audio_switched = false;
+
+            if let Some(out_id) = profile.audio_output_device_id.as_deref() {
+                let already_default = self
+                    .audio_outputs
+                    .iter()
+                    .any(|(id, _, is_def)| *is_def && id == out_id);
+                if !already_default {
+                    let out_name = profile
+                        .audio_output_device_name
+                        .as_deref()
+                        .or_else(|| {
+                            self.audio_outputs
+                                .iter()
+                                .find(|(id, _, _)| id == out_id)
+                                .map(|(_, n, _)| n.as_str())
+                        })
+                        .unwrap_or(out_id);
+                    match env.set_default_audio_endpoint(out_id) {
+                        Ok(()) => {
+                            audio_switched = true;
+                            self.push_log(
+                                Severity::Info,
+                                format!("Audio output -> {out_name} ({reason})"),
+                            );
+                        }
+                        Err(e) => self.push_log(
+                            Severity::Warn,
+                            format!("Failed to switch audio output to '{out_name}': {e}"),
+                        ),
+                    }
+                }
+            }
+
+            if let Some(vol) = profile.audio_output_volume {
+                let target_id = profile.audio_output_device_id.as_deref();
+                let current = env
+                    .get_audio_endpoint_volume(AudioFlow::Render, target_id)
+                    .ok();
+                if current != Some(vol) {
+                    match env.set_audio_endpoint_volume(AudioFlow::Render, target_id, vol) {
+                        Ok(()) => self.push_log(
+                            Severity::Info,
+                            format!("Audio output volume -> {vol}% ({reason})"),
+                        ),
+                        Err(e) => self.push_log(
+                            Severity::Warn,
+                            format!("Failed to set audio output volume: {e}"),
+                        ),
+                    }
+                }
+            }
+
+            if let Some(in_id) = profile.audio_input_device_id.as_deref() {
+                let already_default = self
+                    .audio_inputs
+                    .iter()
+                    .any(|(id, _, is_def)| *is_def && id == in_id);
+                if !already_default {
+                    let in_name = profile
+                        .audio_input_device_name
+                        .as_deref()
+                        .or_else(|| {
+                            self.audio_inputs
+                                .iter()
+                                .find(|(id, _, _)| id == in_id)
+                                .map(|(_, n, _)| n.as_str())
+                        })
+                        .unwrap_or(in_id);
+                    match env.set_default_audio_endpoint(in_id) {
+                        Ok(()) => {
+                            audio_switched = true;
+                            self.push_log(
+                                Severity::Info,
+                                format!("Microphone -> {in_name} ({reason})"),
+                            );
+                        }
+                        Err(e) => self.push_log(
+                            Severity::Warn,
+                            format!("Failed to switch microphone to '{in_name}': {e}"),
+                        ),
+                    }
+                }
+            }
+
+            if let Some(vol) = profile.audio_input_volume {
+                let target_id = profile.audio_input_device_id.as_deref();
+                let current = env
+                    .get_audio_endpoint_volume(AudioFlow::Capture, target_id)
+                    .ok();
+                if current != Some(vol) {
+                    match env.set_audio_endpoint_volume(AudioFlow::Capture, target_id, vol) {
+                        Ok(()) => self.push_log(
+                            Severity::Info,
+                            format!("Microphone volume -> {vol}% ({reason})"),
+                        ),
+                        Err(e) => self.push_log(
+                            Severity::Warn,
+                            format!("Failed to set microphone volume: {e}"),
+                        ),
+                    }
+                }
+            }
+
+            if profile.lock_mic_volume {
+                if let Some(vol) = profile.audio_input_volume {
+                    self.mic_lock_target = Some((profile.audio_input_device_id.clone(), vol));
+                    self.last_mic_lock_check = Instant::now();
+                } else {
+                    self.mic_lock_target = None;
+                }
+            } else {
+                self.mic_lock_target = None;
+            }
+
+            if audio_switched {
+                self.refresh_audio_devices();
             }
         }
 
@@ -603,6 +838,11 @@ fn run_runtime_loop(
         last_topology: Vec::new(),
         last_topology_check: Instant::now(),
         last_battery_poll: Instant::now(),
+        audio_outputs: Vec::new(),
+        audio_inputs: Vec::new(),
+        last_audio_refresh: Instant::now(),
+        mic_lock_target: None,
+        last_mic_lock_check: Instant::now(),
         debouncer: FocusDebouncer::new(debounce),
         watcher: None,
         focus_rx: None,
@@ -614,6 +854,7 @@ fn run_runtime_loop(
     };
 
     state.rebuild_controllers(BackendSelection::AutoConnected, "startup auto-detect");
+    state.refresh_audio_devices();
     if initial_auto_switch {
         state.start_watcher();
     }
@@ -622,6 +863,9 @@ fn run_runtime_loop(
     loop {
         let mut changed = state.check_hotplug();
         if state.poll_batteries() {
+            changed = true;
+        }
+        if state.poll_audio_and_mic_lock() {
             changed = true;
         }
 
@@ -752,6 +996,33 @@ fn run_runtime_loop(
                     state.apply_profile(&next_profile, "hotkey cycle");
                     state.emit(&ui_tx, &ctx);
                 }
+            }
+            Ok(ProfileRuntimeCmd::SwitchAudioOutput(endpoint_id)) => {
+                state.switch_audio_output(&endpoint_id, "tray switch");
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::CycleAudioOutput) => {
+                state.refresh_audio_devices();
+                if state.audio_outputs.len() >= 2 {
+                    let cur_idx = state
+                        .audio_outputs
+                        .iter()
+                        .position(|(_, _, is_def)| *is_def)
+                        .unwrap_or(0);
+                    let next_idx = (cur_idx + 1) % state.audio_outputs.len();
+                    let next_id = state.audio_outputs[next_idx].0.clone();
+                    state.switch_audio_output(&next_id, "hotkey cycle");
+                } else {
+                    state.push_log(
+                        Severity::Info,
+                        "Audio output cycle skipped: fewer than 2 active playback devices.",
+                    );
+                }
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::RefreshAudioDevices) => {
+                state.refresh_audio_devices();
+                state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::UpdateStore(new_store)) => {
                 state

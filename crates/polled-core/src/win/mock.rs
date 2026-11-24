@@ -7,9 +7,9 @@ use std::sync::Mutex;
 
 use crate::error::{PolledError, Result};
 use crate::win::{
-    AccessibilityKind, DisplayModeInfo, MouseAccelParams, PowerSchemeInfo, PowerValueIndex,
-    ProcessSample, RegHive, SystemEnv, TimerResolutionSample, UsbControllerInfo, UsbMouseTopology,
-    UsbPowerDevice, WindowsVersion,
+    AccessibilityKind, AudioEndpointInfo, AudioFlow, DisplayModeInfo, MouseAccelParams,
+    PowerSchemeInfo, PowerValueIndex, ProcessSample, RegHive, SystemEnv, TimerResolutionSample,
+    UsbControllerInfo, UsbMouseTopology, UsbPowerDevice, WindowsVersion,
 };
 
 #[derive(Debug, Clone)]
@@ -35,6 +35,7 @@ struct MockState {
     usb_power_devices: Vec<UsbPowerDevice>,
     usb_controllers: Vec<UsbControllerInfo>,
     usb_topology: Vec<UsbMouseTopology>,
+    audio_endpoints: Vec<AudioEndpointInfo>,
     require_elevation_for_power_writes: bool,
 }
 
@@ -97,6 +98,40 @@ impl Default for MockState {
                 msi_supported: Some(true),
             }],
             usb_topology: Vec::new(),
+            audio_endpoints: vec![
+                AudioEndpointInfo {
+                    id: "{0.0.0.00000000}.{mock-render-1}".to_string(),
+                    guid: "{mock-render-1}".to_string(),
+                    name: "Headphones (USB DAC)".to_string(),
+                    flow: AudioFlow::Render,
+                    is_default: true,
+                    volume_percent: Some(60),
+                    muted: Some(false),
+                    sample_rate_hz: Some(48_000),
+                    channels: Some(2),
+                    bits_per_sample: Some(32),
+                    default_period_ms: Some(10.0),
+                    min_period_ms: Some(2.67),
+                    enhancements_enabled: Some(false),
+                    is_bluetooth_hands_free: false,
+                },
+                AudioEndpointInfo {
+                    id: "{0.0.1.00000000}.{mock-capture-1}".to_string(),
+                    guid: "{mock-capture-1}".to_string(),
+                    name: "Microphone (USB Mic)".to_string(),
+                    flow: AudioFlow::Capture,
+                    is_default: true,
+                    volume_percent: Some(80),
+                    muted: Some(false),
+                    sample_rate_hz: Some(48_000),
+                    channels: Some(1),
+                    bits_per_sample: Some(32),
+                    default_period_ms: Some(10.0),
+                    min_period_ms: Some(2.67),
+                    enhancements_enabled: Some(false),
+                    is_bluetooth_hands_free: false,
+                },
+            ],
             require_elevation_for_power_writes: false,
         }
     }
@@ -153,6 +188,10 @@ impl MockEnv {
 
     pub fn set_usb_topology(&self, topology: Vec<UsbMouseTopology>) {
         self.state.lock().unwrap().usb_topology = topology;
+    }
+
+    pub fn set_audio_endpoints(&self, endpoints: Vec<AudioEndpointInfo>) {
+        self.state.lock().unwrap().audio_endpoints = endpoints;
     }
 
     pub fn set_require_elevation_for_power_writes(&self, required: bool) {
@@ -399,5 +438,65 @@ impl SystemEnv for MockEnv {
 
     fn list_usb_topology(&self) -> Result<Vec<UsbMouseTopology>> {
         Ok(self.state.lock().unwrap().usb_topology.clone())
+    }
+
+    fn list_audio_endpoints(&self, flow: AudioFlow) -> Result<Vec<AudioEndpointInfo>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .audio_endpoints
+            .iter()
+            .filter(|e| e.flow == flow)
+            .cloned()
+            .collect())
+    }
+
+    fn set_default_audio_endpoint(&self, endpoint_id: &str) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let target_flow = s
+            .audio_endpoints
+            .iter()
+            .find(|e| e.id == endpoint_id)
+            .map(|e| e.flow);
+        if let Some(flow) = target_flow {
+            for ep in &mut s.audio_endpoints {
+                if ep.flow == flow {
+                    ep.is_default = ep.id == endpoint_id;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn get_audio_endpoint_volume(&self, flow: AudioFlow, endpoint_id: Option<&str>) -> Result<u8> {
+        let s = self.state.lock().unwrap();
+        let found = s.audio_endpoints.iter().find(|e| {
+            e.flow == flow
+                && match endpoint_id {
+                    Some(id) => e.id == id,
+                    None => e.is_default,
+                }
+        });
+        Ok(found.and_then(|e| e.volume_percent).unwrap_or(50))
+    }
+
+    fn set_audio_endpoint_volume(
+        &self,
+        flow: AudioFlow,
+        endpoint_id: Option<&str>,
+        percent: u8,
+    ) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(ep) = s.audio_endpoints.iter_mut().find(|e| {
+            e.flow == flow
+                && match endpoint_id {
+                    Some(id) => e.id == id,
+                    None => e.is_default,
+                }
+        }) {
+            ep.volume_percent = Some(percent.min(100));
+        }
+        Ok(())
     }
 }

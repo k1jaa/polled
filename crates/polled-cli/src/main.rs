@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use polled_core::win::WindowsEnv;
+use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
-    detect_hardware_devices, dump_hid_devices, AppPaths, CheckReport, HealthEngine, PolledError,
-    Severity,
+    detect_hardware_devices, dump_hid_devices, AppPaths, AudioEndpointInfo, AudioFlow, CheckReport,
+    HealthEngine, PolledError, Severity,
 };
 
 #[derive(Debug, Parser)]
@@ -31,6 +31,10 @@ struct Cli {
     #[arg(long)]
     detect: bool,
 
+    /// List active Windows audio playback & capture endpoints, WASAPI formats, and APO status
+    #[arg(long)]
+    audio: bool,
+
     /// Optional hex Vendor ID filter for --dump (e.g. 3710 or 0x3710 for Pulsar)
     #[arg(long, value_name = "HEX_VID")]
     vid: Option<String>,
@@ -39,7 +43,7 @@ struct Cli {
     #[arg(long)]
     include_serials: bool,
 
-    /// Output results as machine-readable JSON (use with --scan, --dump, --fix, or --undo-all)
+    /// Output results as machine-readable JSON (use with --scan, --audio, --detect, --dump, --fix, or --undo-all)
     #[arg(long)]
     json: bool,
 
@@ -93,6 +97,38 @@ fn parse_hex_vid(input: &str) -> polled_core::Result<u16> {
 }
 
 fn run(cli: Cli) -> polled_core::Result<ExitCode> {
+    if cli.audio {
+        let env = WindowsEnv;
+        let playback = env.list_audio_endpoints(AudioFlow::Render)?;
+        let capture = env.list_audio_endpoints(AudioFlow::Capture)?;
+        if cli.json {
+            let out = serde_json::json!({
+                "playback": playback,
+                "capture": capture,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        } else {
+            println!("Playback (Render) Endpoints:");
+            if playback.is_empty() {
+                println!("  (none)");
+            } else {
+                for ep in &playback {
+                    print_audio_endpoint(ep);
+                }
+            }
+            println!();
+            println!("Capture (Microphone) Endpoints:");
+            if capture.is_empty() {
+                println!("  (none)");
+            } else {
+                for ep in &capture {
+                    print_audio_endpoint(ep);
+                }
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     if cli.detect {
         let mut devices = detect_hardware_devices()?;
         if devices.is_empty() {
@@ -332,4 +368,35 @@ fn print_report(r: &CheckReport) {
         println!("       Note:        Requires reboot to take effect.");
     }
     println!();
+}
+
+fn print_audio_endpoint(ep: &AudioEndpointInfo) {
+    let marker = if ep.is_default { "[*]" } else { "[ ]" };
+    let hfp = if ep.is_bluetooth_hands_free {
+        " [BT Hands-Free HFP]"
+    } else {
+        ""
+    };
+    println!("  {} {}{}", marker, ep.name, hfp);
+    let vol = match (ep.volume_percent, ep.muted) {
+        (Some(v), Some(true)) => format!("{v}% (MUTED)"),
+        (Some(v), _) => format!("{v}%"),
+        _ => "n/a".to_string(),
+    };
+    let fmt = match (ep.sample_rate_hz, ep.channels, ep.bits_per_sample) {
+        (Some(hz), Some(ch), Some(bits)) => format!("{hz} Hz · {ch}ch · {bits}-bit"),
+        (Some(hz), Some(ch), None) => format!("{hz} Hz · {ch}ch"),
+        _ => "n/a".to_string(),
+    };
+    let period = match (ep.default_period_ms, ep.min_period_ms) {
+        (Some(def), Some(min)) => format!("{def:.2} ms (min {min:.2} ms)"),
+        (Some(def), None) => format!("{def:.2} ms"),
+        _ => "n/a".to_string(),
+    };
+    let apo = match ep.enhancements_enabled {
+        Some(true) => "Enabled",
+        Some(false) => "Disabled",
+        None => "None/Unknown",
+    };
+    println!("      Volume: {vol} | Format: {fmt} | Period: {period} | APO: {apo}");
 }

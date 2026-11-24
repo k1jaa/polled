@@ -4,6 +4,9 @@
 
 pub mod accel_curves;
 pub mod accessibility_shortcuts;
+pub mod audio_comms_ducking;
+pub mod audio_enhancements;
+pub mod audio_format;
 pub mod cpu_throttle;
 pub mod cursor_sanity;
 pub mod custom_tweaks;
@@ -139,7 +142,7 @@ pub trait HealthCheck: Send + Sync {
     }
 }
 
-/// Returns all 26 registered built-in input health checks and optional tweaks in display order.
+/// Returns all 29 registered built-in input & audio health checks and optional tweaks in display order.
 pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
     vec![
         // --- Core Mouse & Cursor Input ---
@@ -156,6 +159,10 @@ pub fn default_checks() -> Vec<Box<dyn HealthCheck>> {
         Box::new(pcie_aspm::PcieAspmCheck),
         Box::new(power_plan::PowerPlanCheck),
         Box::new(cpu_throttle::CpuProcessorStateCheck),
+        // --- Audio Latency & Output ---
+        Box::new(audio_comms_ducking::AudioCommsDuckingCheck),
+        Box::new(audio_enhancements::AudioEnhancementsCheck),
+        Box::new(audio_format::AudioFormatCheck),
         // --- Timing, Display & Presentation ---
         Box::new(timer_resolution::TimerResolutionCheck),
         Box::new(monitor_refresh::MonitorRefreshCheck),

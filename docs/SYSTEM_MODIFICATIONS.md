@@ -7,7 +7,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 
 ---
 
-## 1. Built-In Health Checks & Optional Tweaks (26 Total)
+## 1. Built-In Health Checks & Optional Tweaks (29 Total)
 
 ### 1.1 Core Mouse & Cursor Input
 
@@ -31,7 +31,15 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 | `power_plan` | Fixable | `powrprof.dll` `PowerSetActiveScheme` | Switches active scheme to High Performance (`8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c`) / Ultimate Performance / Balanced (if on Power Saver) | No admin / Immediate | Calls `PowerSetActiveScheme` with original scheme GUID |
 | `cpu_processor_state` | Fixable | `powrprof.dll` active scheme → Subgroup `54533251-82be-4824-96c1-47b60b740d00` → Setting `bc5038f7-23e0-4960-96da-33abaf5935ec` (`PROCTHROTTLEMAX`) | AC index = `100` (%); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
 
-### 1.3 Timing, Display & Presentation
+### 1.3 Audio Latency & Output
+
+| Check ID | Mode | Exact Windows Target | Value Written on Fix | Admin / Restart | Rollback Behavior |
+| --- | --- | --- | --- | --- | --- |
+| `audio_comms_ducking` | Fixable | `HKCU\Software\Microsoft\Multimedia\Audio\UserDuckingPreference` (`REG_DWORD`) | `3` ("Do nothing" — stops Windows from ducking game volume by 80% during voice comms) | No admin / Immediate | Restores captured `REG_DWORD` (or deletes value if absent) |
+| `audio_enhancements` | **Report-Only** | Reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\{guid}\FxProperties` (`{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},5` and APO CLSID entries) | *None (never modifies `TrustedInstaller`-owned registry ACLs)* | No admin | N/A |
+| `audio_format` | **Report-Only** | Queries active playback & capture endpoints via Win32 MMDevice + WASAPI `IAudioClient`/`IAudioClient3` (`GetMixFormat`, `GetDevicePeriod`, `GetSharedModeEnginePeriod`) | *None (read-only inspection)* | No admin | N/A |
+
+### 1.4 Timing, Display & Presentation
 
 | Check ID | Mode | Exact Windows Target | Value Written on Fix | Admin / Restart | Rollback Behavior |
 | --- | --- | --- | --- | --- | --- |
@@ -43,7 +51,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 | `hags` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\HwSchMode` | *None (never modifies)* | No admin | N/A |
 | `vbs_memory_integrity` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\EnableVirtualizationBasedSecurity` & `...\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled` | *None (Polled never weakens OS security)* | No admin | N/A |
 
-### 1.4 Optional Reversible Low-Latency Tweaks (Opt-In Only)
+### 1.5 Optional Reversible Low-Latency Tweaks (Opt-In Only)
 
 Optional tweaks are **never** applied by **Fix Safe Issues** and always show an explicit confirmation warning before applying.
 
@@ -53,7 +61,7 @@ Optional tweaks are **never** applied by **Fix Safe Issues** and always show an 
 | `win32_priority_separation` | Optional Tweak | `HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl\Win32PrioritySeparation` (`REG_DWORD`) | `0x26` (38 decimal — Short, Variable, 3:1 High foreground boost) | **UAC (Admin)** / Immediate | Restores captured `REG_DWORD` (or deletes value if absent) |
 | `global_timer_requests` | Optional Tweak | `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel\GlobalTimerResolutionRequests` (`REG_DWORD`) | `1` | **UAC (Admin)** / **Reboot** | Restores captured `REG_DWORD` (or deletes value if absent) |
 
-### 1.5 Accessibility & Background Vendor Suites
+### 1.6 Accessibility & Background Vendor Suites
 
 | Check ID | Mode | Exact Windows Target | Value Written on Fix | Admin / Restart | Rollback Behavior |
 | --- | --- | --- | --- | --- | --- |
@@ -111,7 +119,10 @@ When **Auto-Switch** is enabled or you click **Apply Now**, Polled can modify:
 
 1. **Optional Windows Pointer Speed** (only if checked on the profile): calls `SystemParametersInfoW(SPI_SETMOUSESPEED)` with the chosen `1..=20` value.
 2. **Optional Windows Power Plan** (only if checked on the profile): calls `powrprof.dll` `PowerSetActiveScheme` to switch between installed `Balanced`, `High Performance`, or `Ultimate Performance` power schemes (skips gracefully if a scheme is unavailable on Modern Standby laptops).
-3. **Mouse Hardware Settings over USB HID** (only on matching protocol-family devices):
+3. **Optional Windows Audio Output, Microphone & Mic Gain Lock** (only if configured on the profile, switched from the tray **Audio Output** submenu, or cycled via global hotkey):
+   - Uses standard user-mode Windows Core Audio COM (`IPolicyConfig::SetDefaultEndpoint` across Console, Multimedia, and Communications roles; zero admin required) to switch default playback/capture endpoints.
+   - Uses `IAudioEndpointVolume::SetMasterVolumeLevelScalar` to set playback/mic volume (`0..=100%`). When **Lock Gain** is enabled on a profile with a configured Mic Volume, Polled checks and restores the microphone level every 2 seconds while that profile is active so games, Steam Voice, or Discord cannot silently alter your mic slider.
+4. **Mouse Hardware Settings over USB HID** (only on matching protocol-family devices):
    - **CompX / Nordic 17-byte protocol** (`usage_page 0xFF02`, `usage 0x0002`, `Report ID 0x08`, `CMD_MEM_SET = 0x07`, Pulsar / LAMZU / VGN / Scyrox V8 / ATK & VXE R1 / G-Wolves XVI:0 / Hitscan Hyperlight):
      - Writes **only changed registers** among: Polling Rate (`0x0000`), Active DPI Stage X/Y (`0x000C + 4*stage`), Lift-Off Distance (`0x000A`), Debounce (`0x00A9`), Motion Sync (`0x00AB`), Angle Snapping (`0x00AF`), and Ripple Control (`0x00B1`). Reads battery via read-only `CMD_BATTERY = 0x04`. Never sends factory reset (`0x09`).
    - **CompX 64-byte Page-Command protocol** (`Report ID 0x00`, WLMouse / LAMZU Maya X & Inca / Attack Shark / Vancer / RAWM / CRDRAKO / LunaFury):
@@ -171,4 +182,5 @@ Get-Content "$env:LOCALAPPDATA\Polled\baseline_snapshot.json"
 - Never injects DLLs, hooks DirectX/Vulkan, reads game memory, or inspects anti-cheat processes.
 - Never flashes or updates mouse firmware, and never issues HID factory-reset commands.
 - Never disables Windows Defender, VBS, HVCI (Memory Integrity), Firewall, or Windows Update.
+- Never takes ownership of or modifies `TrustedInstaller`-protected registry ACLs (such as `MMDevices\...\FxProperties`).
 - Never makes outbound network connections or collects telemetry.

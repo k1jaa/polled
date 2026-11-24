@@ -687,6 +687,10 @@ impl PolledApp {
                             self.input_lab_ui.start_capture(ctx);
                         }
                     }
+                    HotkeyAction::CycleAudioOutput => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::CycleAudioOutput);
+                    }
                 },
                 WorkerMsg::ScanFinished {
                     result,
@@ -745,6 +749,7 @@ impl PolledApp {
                         &snap.active_profile_id,
                         &snap.active_profile_name,
                         &snap.available_profiles,
+                        &snap.audio_outputs,
                         battery_summary.as_deref(),
                     );
                     if self.settings.auto_switch_on_startup != snap.auto_switch_enabled {
@@ -1881,6 +1886,14 @@ impl eframe::App for PolledApp {
                                     "hk_lab",
                                     &mut self.settings.hotkeys.toggle_input_lab,
                                     "I",
+                                );
+                                ui.end_row();
+                                render_hotkey_binding_row(
+                                    ui,
+                                    "Cycle Audio Output",
+                                    "hk_audio",
+                                    &mut self.settings.hotkeys.cycle_audio_output,
+                                    "A",
                                 );
                                 ui.end_row();
                             });

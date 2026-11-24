@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 #[cfg(windows)]
+pub mod audio;
+#[cfg(windows)]
 pub mod display;
 pub mod mock;
 #[cfg(windows)]
@@ -25,6 +27,7 @@ pub mod usb_topology;
 
 use serde::{Deserialize, Serialize};
 
+use crate::checks::Severity;
 use crate::error::Result;
 
 /// Supported Windows Registry root hives.
@@ -177,6 +180,53 @@ pub struct UsbMouseTopology {
     pub shared_heavy_devices: Vec<UsbSharedDevice>,
 }
 
+/// Direction of a Windows MMDevice audio endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioFlow {
+    Render,
+    Capture,
+}
+
+/// Read-only snapshot of an active Windows audio playback or capture endpoint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioEndpointInfo {
+    pub id: String,
+    pub guid: String,
+    pub name: String,
+    pub flow: AudioFlow,
+    pub is_default: bool,
+    pub volume_percent: Option<u8>,
+    pub muted: Option<bool>,
+    pub sample_rate_hz: Option<u32>,
+    pub channels: Option<u16>,
+    pub bits_per_sample: Option<u16>,
+    pub default_period_ms: Option<f64>,
+    pub min_period_ms: Option<f64>,
+    pub enhancements_enabled: Option<bool>,
+    pub is_bluetooth_hands_free: bool,
+}
+
+/// Result of an on-demand 1-second silent WASAPI audio engine latency & wake-jitter benchmark.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioLatencyBenchmark {
+    pub device_name: String,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub default_period_ms: f64,
+    pub min_period_ms: f64,
+    pub active_buffer_ms: f64,
+    pub elapsed_ms: f64,
+    pub samples_ms: Vec<f64>,
+    pub min_ms: f64,
+    pub median_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    pub glitch_count: usize,
+    pub severity: Severity,
+}
+
 /// Abstraction over all Windows system APIs used by Polled.
 ///
 /// Production code passes `WindowsEnv` (real `windows-rs` + `sysinfo` calls);
@@ -232,6 +282,15 @@ pub trait SystemEnv: Send + Sync {
     fn list_usb_power_devices(&self) -> Result<Vec<UsbPowerDevice>>;
     fn list_usb_controllers(&self) -> Result<Vec<UsbControllerInfo>>;
     fn list_usb_topology(&self) -> Result<Vec<UsbMouseTopology>>;
+    fn list_audio_endpoints(&self, flow: AudioFlow) -> Result<Vec<AudioEndpointInfo>>;
+    fn set_default_audio_endpoint(&self, endpoint_id: &str) -> Result<()>;
+    fn get_audio_endpoint_volume(&self, flow: AudioFlow, endpoint_id: Option<&str>) -> Result<u8>;
+    fn set_audio_endpoint_volume(
+        &self,
+        flow: AudioFlow,
+        endpoint_id: Option<&str>,
+        percent: u8,
+    ) -> Result<()>;
 }
 
 /// Real Windows implementation backed by `windows-rs` and `sysinfo`.
@@ -350,5 +409,26 @@ impl SystemEnv for WindowsEnv {
 
     fn list_usb_topology(&self) -> Result<Vec<UsbMouseTopology>> {
         usb_topology::list_usb_topology()
+    }
+
+    fn list_audio_endpoints(&self, flow: AudioFlow) -> Result<Vec<AudioEndpointInfo>> {
+        audio::list_audio_endpoints(flow)
+    }
+
+    fn set_default_audio_endpoint(&self, endpoint_id: &str) -> Result<()> {
+        audio::set_default_audio_endpoint(endpoint_id)
+    }
+
+    fn get_audio_endpoint_volume(&self, flow: AudioFlow, endpoint_id: Option<&str>) -> Result<u8> {
+        audio::get_audio_endpoint_volume(flow, endpoint_id)
+    }
+
+    fn set_audio_endpoint_volume(
+        &self,
+        flow: AudioFlow,
+        endpoint_id: Option<&str>,
+        percent: u8,
+    ) -> Result<()> {
+        audio::set_audio_endpoint_volume(flow, endpoint_id, percent)
     }
 }

@@ -17,10 +17,12 @@ use eframe::egui::{
 };
 use polled_core::win::{SystemEnv, UsbMouseTopology, WindowsEnv};
 use polled_core::{
-    format_diagnostic_report, format_intervals_csv, render_ab_comparison_png, render_report_png,
-    run_timer_jitter_benchmark, AppPaths, DiagnosticsSnapshot, PinnedBenchmark, PollingStats,
-    PollingTarget, RawInputCaptureSession, Severity, TimerJitterBenchmark, TrackingStats,
-    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, STANDARD_RATES_HZ,
+    format_audio_benchmark_summary, format_diagnostic_report, format_intervals_csv,
+    render_ab_comparison_png, render_report_png, run_audio_latency_benchmark,
+    run_timer_jitter_benchmark, AppPaths, AudioLatencyBenchmark, DiagnosticsSnapshot,
+    PinnedBenchmark, PollingStats, PollingTarget, RawInputCaptureSession, Severity,
+    TimerJitterBenchmark, TrackingStats, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS,
+    KEY_CHATTER_THRESHOLD_MS, STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
@@ -72,6 +74,9 @@ pub struct InputLabUiState {
     timer_benchmark: Option<TimerJitterBenchmark>,
     timer_running: bool,
     timer_rx: Option<Receiver<Result<TimerJitterBenchmark, String>>>,
+    audio_benchmark: Option<AudioLatencyBenchmark>,
+    audio_running: bool,
+    audio_rx: Option<Receiver<Result<AudioLatencyBenchmark, String>>>,
     pinned_baseline: Option<PinnedBenchmark>,
     baseline_label: String,
     current_label: String,
@@ -101,6 +106,9 @@ impl InputLabUiState {
             timer_benchmark: None,
             timer_running: false,
             timer_rx: None,
+            audio_benchmark: None,
+            audio_running: false,
+            audio_rx: None,
             pinned_baseline: None,
             baseline_label: "Baseline (A)".to_string(),
             current_label: "Current (B)".to_string(),
@@ -210,6 +218,21 @@ impl InputLabUiState {
         });
     }
 
+    fn start_audio_benchmark(&mut self, ctx: &egui::Context) {
+        if self.audio_running {
+            return;
+        }
+        self.audio_running = true;
+        let (tx, rx) = mpsc::channel();
+        self.audio_rx = Some(rx);
+        let ctx_bg = ctx.clone();
+        std::thread::spawn(move || {
+            let res = run_audio_latency_benchmark(1_000).map_err(|e| e.to_string());
+            let _ = tx.send(res);
+            ctx_bg.request_repaint();
+        });
+    }
+
     fn poll_background(&mut self) {
         if let Some(session) = &self.session {
             self.last_snapshot = session.snapshot();
@@ -225,6 +248,20 @@ impl InputLabUiState {
                 match result {
                     Ok(bench) => {
                         self.timer_benchmark = Some(bench);
+                    }
+                    Err(err) => {
+                        self.notice = Some((Severity::Bad, err));
+                    }
+                }
+            }
+        }
+        if let Some(rx) = &self.audio_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.audio_running = false;
+                self.audio_rx = None;
+                match result {
+                    Ok(bench) => {
+                        self.audio_benchmark = Some(bench);
                     }
                     Err(err) => {
                         self.notice = Some((Severity::Bad, err));
@@ -357,6 +394,11 @@ impl InputLabUiState {
                     });
                 }
 
+                ui.add_space(10.0);
+
+                // --- 6. WASAPI AUDIO ENGINE LATENCY & WAKE-JITTER BENCHMARK ---
+                self.render_audio_benchmark_card(ctx, ui, p, mode, scroll_w);
+
                 ui.add_space(4.0);
             });
     }
@@ -391,7 +433,8 @@ impl InputLabUiState {
             let has_data = self.last_snapshot.polling.total_motion_packets > 0
                 || self.last_snapshot.clicks.total_presses > 0
                 || self.last_snapshot.dpi_measurement.packet_count > 0
-                || self.timer_benchmark.is_some();
+                || self.timer_benchmark.is_some()
+                || self.audio_benchmark.is_some();
             let has_samples = !self.last_snapshot.polling.recent_samples.is_empty();
 
             let draw_primary_actions =
@@ -650,12 +693,16 @@ impl InputLabUiState {
         if do_copy {
             let ruler_in = (self.last_snapshot.dpi_measurement.packet_count > 0)
                 .then(|| self.ruler_unit.to_inches(self.ruler_distance));
-            let report = format_diagnostic_report(
+            let mut report = format_diagnostic_report(
                 &self.last_snapshot,
                 self.configured_dpi,
                 ruler_in,
                 self.timer_benchmark.as_ref(),
             );
+            if let Some(ab) = &self.audio_benchmark {
+                report.push_str("\n\n");
+                report.push_str(&format_audio_benchmark_summary(ab));
+            }
             ctx.copy_text(report);
             self.notice = Some((
                 Severity::Ok,
@@ -1764,6 +1811,115 @@ impl InputLabUiState {
             self.start_timer_benchmark(ctx);
         }
     }
+
+    fn render_audio_benchmark_card(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(160.0);
+        let mut trigger_bench = false;
+
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("WASAPI Audio Engine Latency & Wake-Jitter (1s Silent Test)")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.audio_running {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Measuring 1s (silent)...")
+                                .size(11.5)
+                                .color(p.text_muted),
+                        );
+                    } else if ui.add(primary_btn("Run 1s Silent Test", p)).clicked() {
+                        trigger_bench = true;
+                    }
+                });
+            });
+
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Opens a strictly silent shared-mode WASAPI stream (using IAudioClient3 low-latency period when supported) for 1 second to measure real audio driver buffer latency and DPC wake-jitter with zero audible sound and no admin rights.",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(8.0);
+
+            if let Some(bench) = &self.audio_benchmark {
+                let pills = vec![
+                    ("DEVICE".to_string(), bench.device_name.clone()),
+                    (
+                        "FORMAT".to_string(),
+                        format!("{} Hz · {}ch", bench.sample_rate_hz, bench.channels),
+                    ),
+                    (
+                        "PERIOD (DEF/MIN)".to_string(),
+                        format!(
+                            "{:.2} / {:.2} ms",
+                            bench.default_period_ms, bench.min_period_ms
+                        ),
+                    ),
+                    (
+                        "ACTIVE BUFFER".to_string(),
+                        format!("{:.2} ms", bench.active_buffer_ms),
+                    ),
+                    (
+                        "MEDIAN / P99".to_string(),
+                        format!("{:.2} / {:.2} ms", bench.median_ms, bench.p99_ms),
+                    ),
+                    ("MAX WAKE".to_string(), format!("{:.2} ms", bench.max_ms)),
+                    ("GLITCHES".to_string(), bench.glitch_count.to_string()),
+                ];
+                render_status_pill_rows(ui, p, inner_w, &pills);
+                ui.add_space(6.0);
+                paint_audio_sparkline(ui, p, inner_w, 124.0, bench);
+                ui.add_space(8.0);
+
+                let verdict = match bench.severity {
+                    Severity::Ok => format!(
+                        "Clean WASAPI audio scheduling across {} callbacks ({:.2} ms active buffer, 0 buffer glitches).",
+                        bench.samples_ms.len(),
+                        bench.active_buffer_ms
+                    ),
+                    Severity::Warn => format!(
+                        "Moderate WASAPI wake jitter detected ({} late callbacks, max {:.2} ms vs {:.2} ms buffer). Background DPC load or USB hub contention can cause subtle audio crackles.",
+                        bench.glitch_count, bench.max_ms, bench.active_buffer_ms
+                    ),
+                    Severity::Bad => format!(
+                        "Severe WASAPI audio glitches ({} late callbacks, max {:.2} ms). Check audio/USB drivers, DPC-heavy software, or disable audio enhancements.",
+                        bench.glitch_count, bench.max_ms
+                    ),
+                    Severity::Info => "WASAPI silent benchmark completed.".to_string(),
+                };
+                semantic_banner(ui, p, mode, inner_w, bench.severity, &verdict);
+            } else {
+                paint_empty_chart_box(
+                    ui,
+                    p,
+                    inner_w,
+                    130.0,
+                    "Click Run 1s Silent Test to measure your default playback device's WASAPI buffer latency and wake jitter (completely silent).",
+                );
+            }
+        });
+
+        if trigger_bench {
+            self.start_audio_benchmark(ctx);
+        }
+    }
 }
 
 fn health_badge_label(sev: Severity) -> &'static str {
@@ -2563,6 +2719,107 @@ fn paint_timer_sparkline(
         Pos2::new(plot.right(), rect.bottom() - 3.0),
         Align2::RIGHT_BOTTOM,
         format!("{n} consecutive 1 ms wakes"),
+        FontId::monospace(9.5),
+        p.text_muted,
+    );
+}
+
+fn paint_audio_sparkline(
+    ui: &mut egui::Ui,
+    p: Palette,
+    width: f32,
+    height: f32,
+    bench: &AudioLatencyBenchmark,
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect(
+        rect,
+        CornerRadius::same(6),
+        p.bg,
+        Stroke::new(1.0_f32, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    if bench.samples_ms.is_empty() {
+        return;
+    }
+
+    let plot = Rect::from_min_max(
+        Pos2::new(rect.left() + 48.0, rect.top() + 10.0),
+        Pos2::new(rect.right() - 10.0, rect.bottom() - 16.0),
+    );
+    if plot.width() <= 10.0 || plot.height() <= 10.0 {
+        return;
+    }
+
+    let target_ms = bench.active_buffer_ms.max(1.0);
+    let warn_ms = target_ms * 1.5;
+    let glitch_ms = target_ms * 2.0;
+    let y_max = bench.max_ms.max(glitch_ms * 1.15).min(target_ms * 6.0);
+    let y_to_px = |ms: f64| -> f32 {
+        let clamped = (ms / y_max).clamp(0.0, 1.0) as f32;
+        plot.bottom() - clamped * plot.height()
+    };
+
+    for (ref_ms, col) in [(target_ms, p.text_muted), (glitch_ms, p.warn)] {
+        if ref_ms <= y_max {
+            let y = y_to_px(ref_ms);
+            painter.line_segment(
+                [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+                Stroke::new(1.0_f32, p.border),
+            );
+            painter.text(
+                Pos2::new(plot.left() - 4.0, y),
+                Align2::RIGHT_CENTER,
+                format!("{ref_ms:.1}ms"),
+                FontId::monospace(9.5),
+                col,
+            );
+        }
+    }
+    painter.text(
+        Pos2::new(plot.left() - 4.0, plot.top()),
+        Align2::RIGHT_TOP,
+        format!("{y_max:.1}ms"),
+        FontId::monospace(9.5),
+        p.text_muted,
+    );
+
+    let n = bench.samples_ms.len();
+    let step_x = if n > 1 {
+        plot.width() / ((n - 1) as f32)
+    } else {
+        0.0
+    };
+
+    let mut prev: Option<Pos2> = None;
+    for (i, &ms) in bench.samples_ms.iter().enumerate() {
+        let pt = Pos2::new(plot.left() + (i as f32) * step_x, y_to_px(ms));
+        let col = if ms > glitch_ms {
+            p.bad
+        } else if ms > warn_ms {
+            p.warn
+        } else {
+            p.text
+        };
+        if let Some(p0) = prev {
+            painter.line_segment([p0, pt], Stroke::new(1.1_f32, col));
+        }
+        if ms > warn_ms {
+            painter.circle_filled(pt, 2.0, col);
+        }
+        prev = Some(pt);
+    }
+
+    painter.text(
+        Pos2::new(plot.right(), rect.bottom() - 3.0),
+        Align2::RIGHT_BOTTOM,
+        format!("{n} silent WASAPI callbacks ({:.2} ms nominal)", target_ms),
         FontId::monospace(9.5),
         p.text_muted,
     );

@@ -16,6 +16,25 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.6.0] - 2026-11-24
+
+### Added
+- **Windows Core Audio / WASAPI Backend (`win/audio.rs`):**
+  - Pure-Rust Win32 COM (`MMDeviceEnumerator`, `IAudioEndpointVolume`, `IAudioClient` / `IAudioClient3`, and user-mode `IPolicyConfig`) for active playback/capture enumeration, default endpoint switching, scalar master volume control, APO `FxProperties` inspection, Bluetooth Hands-Free (HFP/SCO) detection, and silent WASAPI wake-jitter benchmarking with zero administrator rights.
+- **Per-Game Audio Automation, Mic Gain Lock & Tray Audio Switcher:**
+  - Extended `GameProfile` (`profiles/mod.rs`), `ProfileRuntimeHandle`, and the **Profiles** editor with optional per-game **Audio Output** device, **Output Volume (`0..=100%`)**, **Microphone** device, **Mic Volume (`0..=100%`)**, and **Lock Gain** (re-enforces microphone level every 2 seconds while active so games, Steam Voice, or Discord cannot hijack your mic slider).
+  - Added a dynamic **Audio Output** submenu to the system tray for instant one-click speaker/headset switching, plus an optional **Cycle Audio Output** global hotkey (`Ctrl+Alt+A`, Win32 `RegisterHotKey`).
+- **3 New Audio Health Checks (Total Built-In Checks: 26 → 29):**
+  - `audio_comms_ducking` (**Fixable, HKCU, no admin**): detects Windows' default 80% communications volume ducking (`HKCU\Software\Microsoft\Multimedia\Audio\UserDuckingPreference`) and sets it to `3` ("Do nothing") with full `baseline_snapshot.json` undo.
+  - `audio_enhancements` (**Report-Only**): inspects `MMDevices\Audio\Render\{guid}\FxProperties` to flag active Windows APO/DSP audio enhancements without ever tampering with `TrustedInstaller` ACLs.
+  - `audio_format` (**Report-Only**): audits default playback & capture sample rates, channels, bit depths, and WASAPI scheduling periods — flagging Bluetooth Hands-Free (HFP/SCO `<= 16 kHz`) as `Bad`, extreme shared-mode resampling (`>= 192 kHz`) or high periods (`>= 15 ms`) as `Warn`, and playback/mic sample-rate mismatches (`44.1` vs `48 kHz`) as `Info`.
+- **Silent WASAPI Audio Latency & Wake-Jitter Benchmark in Input Lab (`input_lab_ui.rs`):**
+  - On-demand 1-second strictly silent (`AUDCLNT_BUFFERFLAGS_SILENT`) shared-mode WASAPI benchmark (`IAudioClient3` low-latency period when supported) plotting real audio callback wake intervals, driver min/default period, active buffer, p99/max latency, and DPC glitch counts (also appended to **Copy Report**).
+- **CLI `--audio` Inspection (`polled --audio` / `--audio --json`):**
+  - Lists all active playback & capture endpoints with default status, volume/mute, format, WASAPI periods, APO enhancement state, and Bluetooth HFP status.
+
+---
+
 ## [0.5.0] - 2026-11-24
 
 ### Added

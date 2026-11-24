@@ -40,7 +40,7 @@ pub struct HotkeyBinding {
 
 impl HotkeyBinding {
     pub const PRESET_KEYS: &'static [&'static str] = &[
-        "P", "L", "I", "K", "M", "1", "2", "3", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+        "A", "P", "L", "I", "K", "M", "1", "2", "3", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
     ];
 
     pub fn new(ctrl: bool, alt: bool, shift: bool, key: &str) -> Self {
@@ -111,6 +111,8 @@ pub struct HotkeyConfig {
     pub toggle_lock: Option<HotkeyBinding>,
     #[serde(default = "default_hotkey_lab")]
     pub toggle_input_lab: Option<HotkeyBinding>,
+    #[serde(default = "default_hotkey_audio")]
+    pub cycle_audio_output: Option<HotkeyBinding>,
 }
 
 fn default_hotkey_cycle() -> Option<HotkeyBinding> {
@@ -125,6 +127,10 @@ fn default_hotkey_lab() -> Option<HotkeyBinding> {
     Some(HotkeyBinding::new(true, true, false, "I"))
 }
 
+fn default_hotkey_audio() -> Option<HotkeyBinding> {
+    Some(HotkeyBinding::new(true, true, false, "A"))
+}
+
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
@@ -132,6 +138,7 @@ impl Default for HotkeyConfig {
             cycle_profile: default_hotkey_cycle(),
             toggle_lock: default_hotkey_lock(),
             toggle_input_lab: default_hotkey_lab(),
+            cycle_audio_output: default_hotkey_audio(),
         }
     }
 }
@@ -247,6 +254,7 @@ mod tests {
                 cycle_profile: Some(HotkeyBinding::new(true, true, false, "F8")),
                 toggle_lock: Some(HotkeyBinding::new(true, true, false, "L")),
                 toggle_input_lab: None,
+                cycle_audio_output: Some(HotkeyBinding::new(true, true, false, "A")),
             },
         };
         custom.save_atomic(&path).unwrap();
