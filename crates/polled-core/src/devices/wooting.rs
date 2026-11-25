@@ -319,13 +319,24 @@ pub struct WootingGlobalSettingsPatch {
     pub debounce_filter: Option<bool>,
 }
 
-/// One live analog key reading streamed from Wooting's `0xFF53`/`0xFF54` analog HID interface.
+/// One live analog key reading streamed from Wooting's `0xFF53` (V2, 10-bit) or `0xFF54` (V1, 8-bit)
+/// analog HID interface.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WootingAnalogKeyReading {
-    pub usage: u8,
+    /// Stable per-switch identifier (physical `matrix_pos` on V2 `0xFF53`, HID usage on V1 `0xFF54`).
+    pub stable_id: u16,
+    /// USB HID keyboard usage ID (`0x04..=0xE7` when namespace == 0).
+    pub usage: u16,
+    /// Physical switch matrix index `(row << 5) | col` when reported by V2 (`0xFF53`).
+    pub matrix_index: Option<u16>,
     pub key_label: String,
-    pub raw_value: u8,
+    /// Raw hardware analog count (`0..=1023` on V2 `0xFF53`, `0..=255` on V1 `0xFF54`).
+    pub raw_value: u16,
+    /// Full-scale denominator (`1023` on V2 `0xFF53`, `255` on V1 `0xFF54`).
+    pub raw_max: u16,
     pub travel_mm: f32,
+    /// Real-time hardware actuation / Rapid Trigger state reported in V2 (`0xFF53`) bit 0.
+    pub actuated: Option<bool>,
 }
 
 /// Converts a Wooting raw actuation/RT integer to millimetres (`0.0..=4.0`).
@@ -1322,25 +1333,87 @@ pub fn encode_wooting_arm_output_report(cmd_id: u8, flags: u8, payload: &[u8]) -
     Ok(pkt)
 }
 
-/// Decodes one live analog input frame from Wooting's `0xFF53`/`0xFF54` stream (`[hi, usage, value]` triples).
-pub fn decode_wooting_analog_frame(raw: &[u8]) -> Vec<WootingAnalogKeyReading> {
+/// Decodes one live analog input frame from Wooting's V1 `0xFF54` interface (48B, 3-byte `[hi, usage, val_u8]` tuples).
+pub fn decode_wooting_analog_frame_v1(raw: &[u8]) -> Vec<WootingAnalogKeyReading> {
     let mut keys = Vec::new();
-    let mut i = 0usize;
-    while i + 2 < raw.len() {
-        let usage = raw[i + 1];
-        let val = raw[i + 2];
+    for chunk in raw.as_chunks::<3>().0 {
+        let usage = (u16::from(chunk[0]) << 8) | u16::from(chunk[1]);
+        let val = chunk[2];
         if usage != 0 && val != 0 {
+            let label = if chunk[0] == 0 {
+                hid_usage_label(chunk[1])
+            } else {
+                format!("Key 0x{usage:04X}")
+            };
             keys.push(WootingAnalogKeyReading {
+                stable_id: usage,
                 usage,
-                key_label: hid_usage_label(usage),
-                raw_value: val,
+                matrix_index: None,
+                key_label: label,
+                raw_value: u16::from(val),
+                raw_max: 255,
                 travel_mm: (f32::from(val) / 255.0) * (WOOTING_MAX_TRAVEL_MM as f32),
+                actuated: None,
             });
         }
-        i += 3;
     }
-    keys.sort_by_key(|k| k.usage);
+    keys.sort_by_key(|k| k.stable_id);
     keys
+}
+
+/// Decodes one live analog input frame from Wooting's V2 `0xFF53` interface (64B, 4-byte
+/// `[matrix_pos, key, packed, value_hi]` tuples; official `WootingKb/wooting-analog-sdk` V2 format).
+///
+/// Each 4-byte entry provides:
+/// - `matrix_pos`: `(row << 5) | col`
+/// - `key`: 8-bit keycode within `key_namespace = (packed >> 2) & 0x0F`
+/// - `actuated`: `packed & 0x01` (live firmware Rapid Trigger / actuation flag!)
+/// - `raw_10bit`: `(value_hi << 2) | ((packed >> 6) & 0x03)` (`0..=1023` over `0.00..=4.00 mm`)
+pub fn decode_wooting_analog_frame_v2(raw: &[u8]) -> Vec<WootingAnalogKeyReading> {
+    let mut keys = Vec::new();
+    for chunk in raw.as_chunks::<4>().0 {
+        let matrix_pos = chunk[0];
+        let key_lo = chunk[1];
+        let packed = chunk[2];
+        let value_hi = chunk[3];
+
+        let actuated = (packed & 0x01) != 0;
+        let key_namespace = (packed >> 2) & 0x0F;
+        let value_part = (packed >> 6) & 0x03;
+        let raw_10bit = (u16::from(value_hi) << 2) | u16::from(value_part);
+
+        if raw_10bit == 0 {
+            continue;
+        }
+        let usage = (u16::from(key_namespace) << 8) | u16::from(key_lo);
+        let matrix_index = u16::from(matrix_pos);
+        let key_label = if key_namespace == 0 && key_lo != 0 {
+            hid_usage_label_known(key_lo).unwrap_or_else(|| wooting_matrix_label(matrix_index))
+        } else {
+            wooting_matrix_label(matrix_index)
+        };
+        keys.push(WootingAnalogKeyReading {
+            stable_id: 0x8000 | matrix_index,
+            usage,
+            matrix_index: Some(matrix_index),
+            key_label,
+            raw_value: raw_10bit,
+            raw_max: 1023,
+            travel_mm: (f32::from(raw_10bit) / 1023.0).min(1.0) * (WOOTING_MAX_TRAVEL_MM as f32),
+            actuated: Some(actuated),
+        });
+    }
+    keys.sort_by_key(|k| k.stable_id);
+    keys
+}
+
+/// Decodes an analog frame based on the opened HID usage page (`0xFF53` V2 4-byte 10-bit vs `0xFF54` V1 3-byte 8-bit).
+pub fn decode_wooting_analog_frame(raw: &[u8], usage_page: u16) -> Vec<WootingAnalogKeyReading> {
+    if usage_page == 0xFF53 {
+        decode_wooting_analog_frame_v2(raw)
+    } else {
+        decode_wooting_analog_frame_v1(raw)
+    }
 }
 
 /// Maps a Wooting firmware matrix index `(row << 5) | col` to a readable key name (60%/TKL main block)
@@ -1417,49 +1490,67 @@ pub fn wooting_matrix_label(matrix_index: u16) -> String {
     name.to_string()
 }
 
-/// Maps a standard USB HID Keyboard Usage ID (`0x04..=0xE7`) to a crisp label for the live analog stream.
-pub fn hid_usage_label(usage: u8) -> String {
-    match usage {
+/// Maps a standard USB HID Keyboard Usage ID (`0x04..=0xE7`) to a crisp label, returning `None`
+/// for non-standard / vendor usages so V2 (`0xFF53`) can fall back to the physical matrix label.
+fn hid_usage_label_known(usage: u8) -> Option<String> {
+    let s = match usage {
         0x04..=0x1D => {
             let ch = (b'A' + (usage - 0x04)) as char;
-            ch.to_string()
+            return Some(ch.to_string());
         }
         0x1E..=0x26 => {
             let ch = (b'1' + (usage - 0x1E)) as char;
-            ch.to_string()
+            return Some(ch.to_string());
         }
-        0x27 => "0".to_string(),
-        0x28 => "Enter".to_string(),
-        0x29 => "Esc".to_string(),
-        0x2A => "Backspace".to_string(),
-        0x2B => "Tab".to_string(),
-        0x2C => "Space".to_string(),
-        0x2D => "-".to_string(),
-        0x2E => "=".to_string(),
-        0x2F => "[".to_string(),
-        0x30 => "]".to_string(),
-        0x31 => "\\".to_string(),
-        0x33 => ";".to_string(),
-        0x34 => "'".to_string(),
-        0x35 => "`".to_string(),
-        0x36 => ",".to_string(),
-        0x37 => ".".to_string(),
-        0x38 => "/".to_string(),
-        0x39 => "Caps".to_string(),
-        0x3A..=0x45 => format!("F{}", usage - 0x3A + 1),
-        0x4F => "Right".to_string(),
-        0x50 => "Left".to_string(),
-        0x51 => "Down".to_string(),
-        0x52 => "Up".to_string(),
-        0xE0 => "LCtrl".to_string(),
-        0xE1 => "LShift".to_string(),
-        0xE2 => "LAlt".to_string(),
-        0xE3 => "LWin".to_string(),
-        0xE4 => "RCtrl".to_string(),
-        0xE5 => "RShift".to_string(),
-        0xE6 => "RAlt".to_string(),
-        _ => format!("Key 0x{usage:02X}"),
-    }
+        0x27 => "0",
+        0x28 => "Enter",
+        0x29 => "Esc",
+        0x2A => "Backspace",
+        0x2B => "Tab",
+        0x2C => "Space",
+        0x2D => "-",
+        0x2E => "=",
+        0x2F => "[",
+        0x30 => "]",
+        0x31 => "\\",
+        0x33 => ";",
+        0x34 => "'",
+        0x35 => "`",
+        0x36 => ",",
+        0x37 => ".",
+        0x38 => "/",
+        0x39 => "Caps",
+        0x3A..=0x45 => return Some(format!("F{}", usage - 0x3A + 1)),
+        0x46 => "PrtSc",
+        0x47 => "ScrLk",
+        0x48 => "Pause",
+        0x49 => "Ins",
+        0x4A => "Home",
+        0x4B => "PgUp",
+        0x4C => "Del",
+        0x4D => "End",
+        0x4E => "PgDn",
+        0x4F => "Right",
+        0x50 => "Left",
+        0x51 => "Down",
+        0x52 => "Up",
+        0x65 => "Menu",
+        0xE0 => "LCtrl",
+        0xE1 => "LShift",
+        0xE2 => "LAlt",
+        0xE3 => "LWin",
+        0xE4 => "RCtrl",
+        0xE5 => "RShift",
+        0xE6 => "RAlt",
+        0xE7 => "RWin",
+        _ => return None,
+    };
+    Some(s.to_string())
+}
+
+/// Maps a standard USB HID Keyboard Usage ID (`0x04..=0xE7`) to a crisp label for the live analog stream.
+pub fn hid_usage_label(usage: u8) -> String {
+    hid_usage_label_known(usage).unwrap_or_else(|| format!("Key 0x{usage:02X}"))
 }
 
 /// Live handle to a connected Wooting keyboard command interface (`0x1337` Standard or `0xFF55` ARM).
@@ -2014,15 +2105,22 @@ impl WootingAnalogStream {
                         return;
                     }
                 };
-                let analog_dev = api
+                // Prefer V2 (`0xFF53`, 64B 10-bit + hardware actuation flag) over V1 (`0xFF54`, 48B 8-bit).
+                let analog_entry = api
                     .device_list()
-                    .find(|d| {
-                        d.vendor_id() == WOOTING_VID
-                            && WOOTING_ANALOG_USAGE_PAGES.contains(&d.usage_page())
+                    .find(|d| d.vendor_id() == WOOTING_VID && d.usage_page() == 0xFF53)
+                    .or_else(|| {
+                        api.device_list().find(|d| {
+                            (d.vendor_id() == WOOTING_VID || d.vendor_id() == WOOTING_LEGACY_VID)
+                                && d.usage_page() == 0xFF54
+                        })
                     })
-                    .and_then(|d| d.open_device(&api).ok());
+                    .and_then(|d| {
+                        let page = d.usage_page();
+                        d.open_device(&api).ok().map(|h| (h, page))
+                    });
 
-                let Some(dev) = analog_dev else {
+                let Some((dev, usage_page)) = analog_entry else {
                     if let Ok(mut g) = err_bg.lock() {
                         *g = Some(
                             "No Wooting analog stream interface (0xFF53/0xFF54) found. Make sure your Wooting keyboard is connected."
@@ -2034,10 +2132,21 @@ impl WootingAnalogStream {
                 };
 
                 let mut buf = [0u8; 64];
+                let mut drain = [0u8; 64];
                 while run_bg.load(Ordering::SeqCst) {
-                    match dev.read_timeout(&mut buf, 40) {
-                        Ok(n) if n > 0 => {
-                            let decoded = decode_wooting_analog_frame(&buf[..n]);
+                    match dev.read_timeout(&mut buf, 16) {
+                        Ok(mut n) if n > 0 => {
+                            // Drain any queued HID reports so we always show the freshest frame with zero backlog lag.
+                            for _ in 0..32 {
+                                match dev.read_timeout(&mut drain, 0) {
+                                    Ok(m) if m > 0 => {
+                                        buf[..m].copy_from_slice(&drain[..m]);
+                                        n = m;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            let decoded = decode_wooting_analog_frame(&buf[..n], usage_page);
                             if let Ok(mut g) = keys_bg.lock() {
                                 *g = decoded;
                             }
@@ -2225,14 +2334,29 @@ mod tests {
         assert!((groups[0].primary_sensitivity_mm.unwrap() - 0.20).abs() < 0.01);
         assert_eq!(groups[0].continuous_mode, Some(true));
 
-        // Analog stream frame: W (0x1A) @ 128 (~2.0mm) + A (0x04) @ 255 (4.0mm)
-        let frame = [0x00, 0x1A, 128, 0x00, 0x04, 255, 0x00, 0x00, 0x00];
-        let keys = decode_wooting_analog_frame(&frame);
-        assert_eq!(keys.len(), 2);
-        assert_eq!(keys[0].key_label, "A");
-        assert!((keys[0].travel_mm - 4.0).abs() < 0.01);
-        assert_eq!(keys[1].key_label, "W");
-        assert!((keys[1].travel_mm - 2.0).abs() < 0.05);
+        // V1 (0xFF54) 3-byte analog stream frame: W (0x1A) @ 128 (~2.0mm) + A (0x04) @ 255 (4.0mm)
+        let frame_v1 = [0x00, 0x1A, 128, 0x00, 0x04, 255, 0x00, 0x00, 0x00];
+        let keys_v1 = decode_wooting_analog_frame(&frame_v1, 0xFF54);
+        assert_eq!(keys_v1.len(), 2);
+        assert_eq!(keys_v1[0].key_label, "A");
+        assert!((keys_v1[0].travel_mm - 4.0).abs() < 0.01);
+        assert_eq!(keys_v1[1].key_label, "W");
+        assert!((keys_v1[1].travel_mm - 2.0).abs() < 0.05);
+
+        // V2 (0xFF53) 4-byte 10-bit analog stream frame:
+        // Key 1: matrix 0x42 (W), usage 0x1A, packed=0xC1 (actuated=1, ns=0, lo2=3), hi=0xFF -> raw=1023 (4.00mm)
+        // Key 2: matrix 0x80 (LShift), usage 0xE1, packed=0x00 (actuated=0, ns=0, lo2=0), hi=0x80 -> raw=512 (2.00mm)
+        let frame_v2 = [0x42, 0x1A, 0xC1, 0xFF, 0x80, 0xE1, 0x00, 0x80, 0, 0, 0, 0];
+        let keys_v2 = decode_wooting_analog_frame(&frame_v2, 0xFF53);
+        assert_eq!(keys_v2.len(), 2);
+        assert_eq!(keys_v2[0].key_label, "W");
+        assert_eq!(keys_v2[0].raw_value, 1023);
+        assert_eq!(keys_v2[0].actuated, Some(true));
+        assert!((keys_v2[0].travel_mm - 4.0).abs() < 0.01);
+        assert_eq!(keys_v2[1].key_label, "LShift");
+        assert_eq!(keys_v2[1].raw_value, 512);
+        assert_eq!(keys_v2[1].actuated, Some(false));
+        assert!((keys_v2[1].travel_mm - 2.0).abs() < 0.02);
     }
 
     #[test]

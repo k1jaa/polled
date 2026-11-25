@@ -10,6 +10,9 @@
 //! - Opt-in live analog key-travel visualizer (`0xFF53` / `0xFF54` stream, 0% CPU when stopped)
 //! - Confirm-gated ARM Base Analog & Global Settings tuning with mandatory read-back verification
 
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
+
 use chrono::Local;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Stroke, Vec2,
@@ -23,10 +26,28 @@ use polled_core::{
 use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::theme::{Palette, ThemeMode};
 
+const ANALOG_SMOOTH_RATE: f32 = 18.0;
+const ANALOG_RELEASE_HOLD: Duration = Duration::from_millis(1000);
+
+#[derive(Debug, Clone)]
+struct SmoothedAnalogKey {
+    label: String,
+    matrix_index: Option<u16>,
+    target_mm: f32,
+    display_mm: f32,
+    peak_mm: f32,
+    raw_value: u16,
+    raw_max: u16,
+    actuated: Option<bool>,
+    is_pressed: bool,
+    last_active: Instant,
+}
+
 pub struct KeyboardUiState {
     selected_index: usize,
     analog_stream: Option<WootingAnalogStream>,
-    live_keys: Vec<WootingAnalogKeyReading>,
+    smoothed_keys: BTreeMap<u16, SmoothedAnalogKey>,
+    last_analog_frame: Instant,
     stream_error: Option<String>,
     // Draft values for ARM base analog tuning (synced when keyboard or active profile changes).
     synced_key: Option<(String, Option<u8>)>,
@@ -56,7 +77,8 @@ impl KeyboardUiState {
         Self {
             selected_index: 0,
             analog_stream: None,
-            live_keys: Vec::new(),
+            smoothed_keys: BTreeMap::new(),
+            last_analog_frame: Instant::now(),
             stream_error: None,
             synced_key: None,
             draft_actuation_mm: 0.40,
@@ -81,7 +103,73 @@ impl KeyboardUiState {
         if let Some(mut s) = self.analog_stream.take() {
             s.stop();
         }
-        self.live_keys.clear();
+        self.smoothed_keys.clear();
+    }
+
+    fn update_smoothed_analog(&mut self, ctx: &egui::Context, live: &[WootingAnalogKeyReading]) {
+        let now = Instant::now();
+        let dt = now
+            .saturating_duration_since(self.last_analog_frame)
+            .as_secs_f32()
+            .clamp(0.001, 0.08);
+        self.last_analog_frame = now;
+        let alpha = 1.0 - (-dt * ANALOG_SMOOTH_RATE).exp();
+
+        let incoming: HashMap<u16, &WootingAnalogKeyReading> =
+            live.iter().map(|k| (k.stable_id, k)).collect();
+
+        for (id, entry) in self.smoothed_keys.iter_mut() {
+            if let Some(sample) = incoming.get(id) {
+                entry.label = sample.key_label.clone();
+                entry.matrix_index = sample.matrix_index;
+                entry.target_mm = sample.travel_mm;
+                entry.raw_value = sample.raw_value;
+                entry.raw_max = sample.raw_max;
+                entry.actuated = sample.actuated;
+                if !entry.is_pressed || sample.travel_mm > entry.peak_mm {
+                    entry.peak_mm = sample.travel_mm;
+                }
+                entry.is_pressed = true;
+                entry.last_active = now;
+            } else {
+                entry.target_mm = 0.0;
+                entry.raw_value = 0;
+                entry.actuated = Some(false);
+                entry.is_pressed = false;
+            }
+            entry.display_mm += (entry.target_mm - entry.display_mm) * alpha;
+            if entry.display_mm < 0.005 && !entry.is_pressed {
+                entry.display_mm = 0.0;
+            }
+        }
+
+        for sample in live {
+            self.smoothed_keys
+                .entry(sample.stable_id)
+                .or_insert_with(|| SmoothedAnalogKey {
+                    label: sample.key_label.clone(),
+                    matrix_index: sample.matrix_index,
+                    target_mm: sample.travel_mm,
+                    display_mm: sample.travel_mm * alpha.max(0.25),
+                    peak_mm: sample.travel_mm,
+                    raw_value: sample.raw_value,
+                    raw_max: sample.raw_max,
+                    actuated: sample.actuated,
+                    is_pressed: true,
+                    last_active: now,
+                });
+        }
+
+        self.smoothed_keys.retain(|_, entry| {
+            entry.is_pressed
+                || entry.display_mm > 0.01
+                || now.saturating_duration_since(entry.last_active) < ANALOG_RELEASE_HOLD
+        });
+
+        // Keep rendering at smooth monitor refresh while any key is active or gliding back to 0.
+        if !self.smoothed_keys.is_empty() {
+            ctx.request_repaint();
+        }
     }
 
     pub fn on_action_result(&mut self, ok: bool, message: String) {
@@ -138,10 +226,11 @@ impl KeyboardUiState {
     ) {
         if let Some(stream) = &self.analog_stream {
             let (keys, err) = stream.snapshot();
-            self.live_keys = keys;
             if let Some(e) = err {
                 self.stream_error = Some(e);
                 self.stop_analog_stream();
+            } else {
+                self.update_smoothed_analog(ctx, &keys);
             }
         }
 
@@ -158,24 +247,9 @@ impl KeyboardUiState {
             self.sync_drafts_from(kb);
         }
 
-        // --- SINGLE-ROW PAGE HEADER ---
+        // --- RESPONSIVE PAGE HEADER ---
         let mut report_clicked = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Keyboard").size(20.0).strong().color(p.text));
-            if let Some(ref kb) = active_kb {
-                ui.add_space(8.0);
-                let meta = format!(
-                    "{} ({}) · {}{}",
-                    kb.name,
-                    kb.vid_pid,
-                    kb.chip_type,
-                    kb.firmware_version
-                        .as_deref()
-                        .map(|v| format!(" · v{v}"))
-                        .unwrap_or_default()
-                );
-                ui.label(RichText::new(meta).size(12.5).color(p.text_muted));
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(secondary_btn("Refresh", p)).clicked() {
                     self.synced_key = None;
@@ -190,6 +264,26 @@ impl KeyboardUiState {
                 {
                     report_clicked = true;
                 }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(RichText::new("Keyboard").size(20.0).strong().color(p.text));
+                    if let Some(ref kb) = active_kb {
+                        ui.add_space(6.0);
+                        let meta = format!(
+                            "{} ({}) · {}{}",
+                            kb.name,
+                            kb.vid_pid,
+                            kb.chip_type,
+                            kb.firmware_version
+                                .as_deref()
+                                .map(|v| format!(" · v{v}"))
+                                .unwrap_or_default()
+                        );
+                        ui.add(
+                            egui::Label::new(RichText::new(meta).size(12.0).color(p.text_muted))
+                                .truncate(),
+                        );
+                    }
+                });
             });
         });
 
@@ -265,7 +359,7 @@ impl KeyboardUiState {
                 ui.add_space(12.0);
 
                 // --- TWO-COLUMN DETAIL CARDS: PROFILE TUNING & AKC | GLOBAL SETTINGS, RGB & DIAGNOSTICS ---
-                if scroll_w < 740.0 {
+                if scroll_w < 840.0 {
                     self.render_profile_tuning_card(ui, p, mode, scroll_w, &kb, runtime);
                     ui.add_space(12.0);
                     self.render_device_settings_card(ui, p, scroll_w, &kb, runtime);
@@ -503,19 +597,21 @@ impl KeyboardUiState {
         ];
 
         let gap = 10.0;
-        if card_w < 680.0 {
-            let half = ((card_w - gap) * 0.5).max(140.0);
-            for pair in tiles.chunks(2) {
+        if card_w < 820.0 {
+            let half = ((card_w - gap) * 0.5).max(160.0);
+            for (row_idx, pair) in tiles.chunks(2).enumerate() {
+                if row_idx > 0 {
+                    ui.add_space(8.0);
+                }
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
                     for (lbl, val, sub, col) in pair {
                         render_kpi_tile(ui, p, half, lbl, val, sub, *col);
                     }
                 });
-                ui.add_space(8.0);
             }
         } else {
-            let tile_w = ((card_w - gap * 3.0) / 4.0).max(140.0);
+            let tile_w = ((card_w - gap * 3.0) / 4.0).max(150.0);
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
                 for (lbl, val, sub, col) in &tiles {
@@ -534,21 +630,22 @@ impl KeyboardUiState {
         runtime: &ProfileRuntimeHandle,
     ) {
         card_frame(ui, p, card_w, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new("Onboard Profile Switcher")
-                        .size(14.0)
-                        .strong()
-                        .color(p.text),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("Volatile RAM switch · zero flash wear · bind per-game in Profiles → Keyboard")
-                            .size(11.5)
-                            .color(p.text_muted),
-                    );
-                });
-            });
+            ui.label(
+                RichText::new("Onboard Profile Switcher")
+                    .size(14.0)
+                    .strong()
+                    .color(p.text),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Volatile RAM switch · zero flash wear · bind per-game in Profiles -> Keyboard",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                )
+                .wrap(),
+            );
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 for slot in &kb.profiles {
@@ -581,26 +678,14 @@ impl KeyboardUiState {
     ) {
         let inner_w = (card_w - 24.0).max(160.0);
         let streaming = self.analog_stream.is_some();
-        let act_mm = kb
+        let base_act_mm = kb
             .analog_profile
             .as_ref()
             .and_then(|a| a.actuation_mm)
             .unwrap_or(self.draft_actuation_mm);
 
         card_frame(ui, p, card_w, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new("Live Analog Key-Travel Visualizer")
-                        .size(14.0)
-                        .strong()
-                        .color(p.text),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Real-time 0.00–4.00 mm Hall-Effect depth (0xFF53/0xFF54 · zero keystrokes stored)")
-                        .size(11.5)
-                        .color(p.text_muted),
-                );
+            ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if streaming {
                         if ui.add(primary_btn("Stop Analog Test", p)).clicked() {
@@ -608,13 +693,33 @@ impl KeyboardUiState {
                         }
                     } else if ui.add(primary_btn("Start Analog Test", p)).clicked() {
                         self.stream_error = None;
+                        self.smoothed_keys.clear();
+                        self.last_analog_frame = Instant::now();
                         let ctx_bg = ctx.clone();
                         self.analog_stream = Some(WootingAnalogStream::start(move || {
                             ctx_bg.request_repaint();
                         }));
                     }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("Live Analog Key-Travel Visualizer")
+                                .size(14.0)
+                                .strong()
+                                .color(p.text),
+                        );
+                    });
                 });
             });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Real-time 0.00-4.00 mm Hall-Effect depth (10-bit V2 0xFF53 / V1 0xFF54 · live actuation & peak hold · zero keystrokes stored)",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                )
+                .wrap(),
+            );
 
             if let Some(err) = self.stream_error.clone() {
                 ui.add_space(8.0);
@@ -623,64 +728,117 @@ impl KeyboardUiState {
 
             if streaming {
                 ui.add_space(10.0);
-                if self.live_keys.is_empty() {
+                if self.smoothed_keys.is_empty() {
                     ui.label(
-                        RichText::new("Press and partially hold any keys on your Wooting keyboard to see real-time actuation depth...")
-                            .size(12.0)
-                            .color(p.text_muted),
+                        RichText::new(
+                            "Press and hold one or multiple keys on your Wooting keyboard to see smooth real-time actuation depth...",
+                        )
+                        .size(12.0)
+                        .color(p.text_muted),
                     );
                 } else {
-                    for k in &self.live_keys {
+                    for entry in self.smoothed_keys.values() {
+                        // Use per-key actuation override if configured for this physical switch.
+                        let key_act_mm = entry
+                            .matrix_index
+                            .and_then(|idx| {
+                                kb.per_key_actuation
+                                    .iter()
+                                    .find(|ov| ov.matrix_index == idx)
+                                    .map(|ov| ov.actuation_mm)
+                            })
+                            .unwrap_or(base_act_mm);
+
+                        let is_actuated = entry
+                            .actuated
+                            .unwrap_or(entry.display_mm >= key_act_mm && entry.is_pressed);
+
                         ui.horizontal(|ui| {
-                            let badge_w = 62.0;
-                            let val_w = 88.0;
-                            let bar_w = (inner_w - badge_w - val_w - 16.0).max(80.0);
+                            let badge_w = 66.0;
+                            let val_w = if inner_w < 500.0 { 116.0 } else { 166.0 };
+                            let bar_w = (inner_w - badge_w - val_w - 18.0).max(80.0);
+
+                            // Keycap pill
                             let (badge_rect, _) = ui.allocate_exact_size(
-                                Vec2::new(badge_w, 22.0),
+                                Vec2::new(badge_w, 24.0),
                                 egui::Sense::hover(),
                             );
                             let bp = ui.painter_at(badge_rect);
-                            bp.rect_filled(badge_rect, CornerRadius::same(4), p.surface_alt);
+                            bp.rect_filled(badge_rect, CornerRadius::same(5), p.surface_alt);
                             bp.rect_stroke(
                                 badge_rect,
-                                CornerRadius::same(4),
-                                Stroke::new(1.0_f32, p.border),
+                                CornerRadius::same(5),
+                                Stroke::new(1.0_f32, if is_actuated { p.ok } else { p.border }),
                                 egui::StrokeKind::Inside,
                             );
                             bp.text(
                                 badge_rect.center(),
                                 Align2::CENTER_CENTER,
-                                &k.key_label,
+                                &entry.label,
                                 FontId::monospace(11.5),
-                                p.text,
+                                if entry.is_pressed {
+                                    p.text
+                                } else {
+                                    p.text_muted
+                                },
                             );
 
+                            // Smooth depth progress bar with 1/2/3mm ticks, peak marker, and per-key actuation line
                             let (bar_rect, _) = ui
-                                .allocate_exact_size(Vec2::new(bar_w, 16.0), egui::Sense::hover());
+                                .allocate_exact_size(Vec2::new(bar_w, 18.0), egui::Sense::hover());
                             let painter = ui.painter_at(bar_rect);
                             painter.rect_filled(bar_rect, CornerRadius::same(4), p.surface_alt);
-                            let frac = (k.travel_mm / 4.0).clamp(0.0, 1.0);
-                            let actuated = k.travel_mm >= act_mm;
-                            let fill_rect = Rect::from_min_max(
-                                bar_rect.min,
-                                Pos2::new(
-                                    bar_rect.left() + bar_rect.width() * frac,
-                                    bar_rect.bottom(),
-                                ),
-                            );
-                            painter.rect_filled(
-                                fill_rect,
-                                CornerRadius::same(4),
-                                if actuated { p.text } else { p.text_muted },
-                            );
-                            // Draw active actuation-point threshold tick
-                            let act_x =
-                                bar_rect.left() + bar_rect.width() * (act_mm / 4.0).clamp(0.0, 1.0);
+
+                            // Subtle 1.0 / 2.0 / 3.0 mm grid ticks
+                            for mm_tick in [1.0_f32, 2.0, 3.0] {
+                                let tx = bar_rect.left() + bar_rect.width() * (mm_tick / 4.0);
+                                painter.vline(
+                                    tx,
+                                    (bar_rect.top() + 2.0)..=(bar_rect.bottom() - 2.0),
+                                    Stroke::new(1.0_f32, p.border_subtle),
+                                );
+                            }
+
+                            // Smoothly interpolated live fill
+                            let frac = (entry.display_mm / 4.0).clamp(0.0, 1.0);
+                            if frac > 0.002 {
+                                let fill_rect = Rect::from_min_max(
+                                    bar_rect.min,
+                                    Pos2::new(
+                                        bar_rect.left() + bar_rect.width() * frac,
+                                        bar_rect.bottom(),
+                                    ),
+                                );
+                                let fill_col = if is_actuated {
+                                    p.text
+                                } else if entry.is_pressed {
+                                    p.text_muted
+                                } else {
+                                    p.border
+                                };
+                                painter.rect_filled(fill_rect, CornerRadius::same(4), fill_col);
+                            }
+
+                            // Peak hold marker line
+                            let peak_frac = (entry.peak_mm / 4.0).clamp(0.0, 1.0);
+                            if peak_frac > frac + 0.015 {
+                                let px = bar_rect.left() + bar_rect.width() * peak_frac;
+                                painter.vline(
+                                    px,
+                                    (bar_rect.top() + 1.0)..=(bar_rect.bottom() - 1.0),
+                                    Stroke::new(1.5_f32, p.text_muted),
+                                );
+                            }
+
+                            // Per-key (or base) actuation threshold tick line
+                            let act_x = bar_rect.left()
+                                + bar_rect.width() * (key_act_mm / 4.0).clamp(0.0, 1.0);
                             painter.vline(
                                 act_x,
                                 bar_rect.top()..=bar_rect.bottom(),
                                 Stroke::new(1.5_f32, p.ok),
                             );
+
                             painter.rect_stroke(
                                 bar_rect,
                                 CornerRadius::same(4),
@@ -688,11 +846,32 @@ impl KeyboardUiState {
                                 egui::StrokeKind::Inside,
                             );
 
-                            ui.label(
-                                RichText::new(format!("{:.2} mm ({})", k.travel_mm, k.raw_value))
-                                    .size(11.5)
-                                    .monospace()
-                                    .color(if actuated { p.text } else { p.text_muted }),
+                            // Crisp, fixed-width readable readout (smoothed mm + peak mm + ACT flag)
+                            let shown_mm = if entry.is_pressed {
+                                entry.display_mm
+                            } else {
+                                0.0
+                            };
+                            let readout = if inner_w < 500.0 {
+                                format!("{shown_mm:4.2}mm  pk {pk:4.2}", pk = entry.peak_mm)
+                            } else {
+                                let tag = if is_actuated { " ACT" } else { "    " };
+                                format!("{shown_mm:4.2} mm · pk {pk:4.2}{tag}", pk = entry.peak_mm)
+                            };
+                            ui.add_sized(
+                                Vec2::new(val_w, 20.0),
+                                egui::Label::new(
+                                    RichText::new(readout).size(11.5).monospace().color(
+                                        if is_actuated {
+                                            p.ok
+                                        } else if entry.is_pressed {
+                                            p.text
+                                        } else {
+                                            p.text_muted
+                                        },
+                                    ),
+                                )
+                                .extend(),
                             );
                         });
                         ui.add_space(4.0);
@@ -1199,27 +1378,45 @@ fn render_kpi_tile(
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(11, 10))
         .show(ui, |ui| {
-            ui.set_min_width(inner_w);
-            ui.set_max_width(inner_w);
-            ui.label(RichText::new(label).size(10.0).strong().color(p.text_muted));
-            ui.add_space(3.0);
-            ui.add(
-                egui::Label::new(RichText::new(value).size(16.0).strong().color(val_col))
-                    .truncate(),
+            // Explicitly use top-down vertical layout so tiles inside `horizontal_top` stack cleanly.
+            ui.allocate_ui_with_layout(
+                Vec2::new(inner_w, 54.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_min_width(inner_w);
+                    ui.set_max_width(inner_w);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(label).size(10.0).strong().color(p.text_muted),
+                        )
+                        .truncate(),
+                    );
+                    ui.add_space(3.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(value).size(16.0).strong().color(val_col))
+                            .truncate(),
+                    );
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(sub).size(11.0).color(p.text_muted))
+                            .truncate(),
+                    );
+                },
             );
-            ui.add(egui::Label::new(RichText::new(sub).size(11.0).color(p.text_muted)).truncate());
         });
 }
 
 fn mono_chip(ui: &mut egui::Ui, p: Palette, text: &str) {
-    egui::Frame::NONE
-        .fill(p.surface_alt)
-        .stroke(Stroke::new(1.0_f32, p.border))
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.0).monospace().color(p.text));
-        });
+    // Use `TextWrapMode::Extend` on a non-interactive pill button so `horizontal_wrapped`
+    // always measures full chip width and jumps to the next row instead of splitting letters vertically.
+    ui.add(
+        egui::Button::new(RichText::new(text).size(11.0).monospace().color(p.text))
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .fill(p.surface_alt)
+            .stroke(Stroke::new(1.0_f32, p.border))
+            .corner_radius(CornerRadius::same(4))
+            .sense(egui::Sense::hover()),
+    );
 }
 
 fn primary_btn<'a>(label: &'a str, p: Palette) -> egui::Button<'a> {
