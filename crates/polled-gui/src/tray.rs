@@ -162,7 +162,7 @@ impl TrayController {
         let sep_top = PredefinedMenuItem::separator();
         let profiles_submenu = Submenu::new("Switch Profile", true);
         let mouse_submenu = Submenu::new("Mouse Quick Controls", true);
-        let wooting_submenu = Submenu::new("Wooting Keyboard", true);
+        let wooting_submenu = Submenu::new("Keyboard", true);
         let audio_submenu = Submenu::new("Audio Output", true);
         let lock_profile_item =
             CheckMenuItem::with_id(ID_LOCK_PROFILE, "Lock Current Profile", true, false, None);
@@ -572,7 +572,7 @@ impl TrayController {
             } else {
                 let empty = MenuItem::with_id(
                     "wooting_empty",
-                    "No Wooting keyboard connected",
+                    "No supported keyboard connected",
                     false,
                     None,
                 );
@@ -580,8 +580,7 @@ impl TrayController {
                 self.wooting_menu_items.push(empty);
             }
 
-            let refresh =
-                MenuItem::with_id(ID_WOOTING_REFRESH, "Refresh Wooting Keyboard", true, None);
+            let refresh = MenuItem::with_id(ID_WOOTING_REFRESH, "Refresh Keyboards", true, None);
             let _ = self.wooting_submenu.append(&refresh);
             self.wooting_menu_items.push(refresh);
 

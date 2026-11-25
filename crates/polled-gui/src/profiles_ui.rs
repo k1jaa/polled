@@ -1512,8 +1512,8 @@ impl ProfilesUiState {
                 if let Some(disp) = &s.active_display_override {
                     status_chunks.push(format!("Display: {disp} (temp)"));
                 }
-                for kb in &s.wooting_keyboards {
-                    status_chunks.push(kb.compact_status_summary());
+                for kb in &s.keyboards {
+                    status_chunks.push(format!("{} · {}", kb.name, kb.compact_status_summary()));
                 }
                 if s.any_flash_only && s.total_flash_writes_session > 0 {
                     status_chunks.push(format!("Flash writes: {}", s.total_flash_writes_session));
@@ -2287,8 +2287,8 @@ impl ProfilesUiState {
                             }
 
                             if self.editor_tab == ProfileEditorTab::Keyboard {
-                                let primary_kb = snap.and_then(|s| s.wooting_keyboards.first());
-                                ui.label(RichText::new("Wooting Profile").color(p.text_muted));
+                                let primary_kb = snap.and_then(|s| s.keyboards.first());
+                                ui.label(RichText::new("Keyboard Profile").color(p.text_muted));
                                 ui.vertical(|ui| {
                                     let wooting_lbl = match self.editor.wooting_profile {
                                         None => "Leave unchanged".to_string(),
@@ -2311,7 +2311,7 @@ impl ProfilesUiState {
                                             {
                                                 self.editor.wooting_profile = None;
                                             }
-                                            if let Some(kb) = primary_kb {
+                                            if let Some(kb) = primary_kb.filter(|k| !k.profiles.is_empty()) {
                                                 for slot in &kb.profiles {
                                                     let lbl = format!(
                                                         "P{} · {}",
@@ -2349,7 +2349,7 @@ impl ProfilesUiState {
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(
-                                                "Volatile RAM onboard profile switch (zero flash wear) triggered automatically when this game takes focus.",
+                                                "Automatically switches onboard keyboard profile slot when this game takes focus (Wooting RAM-only, Wuque/SparkLink, Keychron HE, Arbiter PRO).",
                                             )
                                             .size(11.0)
                                             .color(p.text_muted),
@@ -2364,31 +2364,39 @@ impl ProfilesUiState {
                                     if let Some(kb) = primary_kb {
                                         ui.add(
                                             egui::Label::new(
-                                                RichText::new(kb.compact_status_summary())
-                                                    .size(12.0)
-                                                    .strong()
-                                                    .color(p.text),
+                                                RichText::new(format!(
+                                                    "{} ({}) · {}",
+                                                    kb.name,
+                                                    kb.brand.display_name(),
+                                                    kb.compact_status_summary()
+                                                ))
+                                                .size(12.0)
+                                                .strong()
+                                                .color(p.text),
                                             )
                                             .wrap(),
                                         );
                                         let mut details = Vec::new();
+                                        details.push(kb.support_tier.label().to_string());
                                         if let Some(fw) = &kb.firmware_version {
                                             details.push(format!("FW v{fw}"));
                                         }
                                         if let Some(layout) = &kb.layout {
                                             details.push(layout.clone());
                                         }
-                                        if !kb.per_key_actuation.is_empty() {
-                                            details.push(format!(
-                                                "{} per-key actuation overrides",
-                                                kb.per_key_actuation.len()
-                                            ));
-                                        }
-                                        if !kb.advanced_keys.is_empty() {
-                                            details.push(format!(
-                                                "{} AKC/SOCD bindings",
-                                                kb.advanced_keys.len()
-                                            ));
+                                        if let Some(w) = &kb.wooting {
+                                            if !w.per_key_actuation.is_empty() {
+                                                details.push(format!(
+                                                    "{} per-key actuation overrides",
+                                                    w.per_key_actuation.len()
+                                                ));
+                                            }
+                                            if !w.advanced_keys.is_empty() {
+                                                details.push(format!(
+                                                    "{} AKC/SOCD bindings",
+                                                    w.advanced_keys.len()
+                                                ));
+                                            }
                                         }
                                         if !details.is_empty() {
                                             ui.add(
@@ -2404,7 +2412,7 @@ impl ProfilesUiState {
                                         ui.add(
                                             egui::Label::new(
                                                 RichText::new(
-                                                    "No Wooting keyboard connected. Supports 60HE / 60HE+ / 80HE / Two HE / UwU / One / Two over open HID.",
+                                                    "No supported keyboard connected. Supports Wooting, Wuque/SparkLink HE, Keychron HE, SteelSeries Apex Pro, Razer, Arbiter Studio, Logitech HID++ 2.0, Kochi HB68, Geonworks Venom, and Universal QMK/VIA.",
                                                 )
                                                 .size(11.5)
                                                 .color(p.text_muted),
@@ -2416,7 +2424,7 @@ impl ProfilesUiState {
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(
-                                                "Open the dedicated Keyboard tab in the left sidebar for live analog key-travel testing, actuation & Rapid Trigger tuning, per-key overrides, SOCD/AKC inspection, and Global Settings.",
+                                                "Open the dedicated Keyboard tab in the left sidebar for brand-specific actuation, Rapid Trigger, polling rate, SOCD, debounce, and Wooting visual keymap controls.",
                                             )
                                             .size(11.0)
                                             .color(p.text_muted),

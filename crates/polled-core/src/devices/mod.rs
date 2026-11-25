@@ -10,6 +10,7 @@ pub mod endgame_gear;
 pub mod finalmouse;
 pub mod hidpp20;
 pub mod incott;
+pub mod keyboards;
 pub mod keychron;
 pub mod mchose;
 pub mod ninjutso;
@@ -32,6 +33,10 @@ pub use endgame_gear::{EndgameGearOp1Device, EndgameGearOp1ProtocolDriver};
 pub use finalmouse::{FinalmouseDevice, FinalmouseProtocolDriver};
 pub use hidpp20::{Hidpp20Device, Hidpp20ProtocolDriver};
 pub use incott::{IncottDevice, IncottProtocolDriver};
+pub use keyboards::{
+    detect_all_keyboards, KeyboardBrand, KeyboardCapabilities, KeyboardDevice, KeyboardProfileSlot,
+    KeyboardStatus,
+};
 pub use keychron::{KeychronDevice, KeychronProtocolDriver};
 pub use mchose::{MchoseDevice, MchoseProtocolDriver};
 pub use ninjutso::{NinjutsoDevice, NinjutsoProtocolDriver};

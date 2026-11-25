@@ -19,9 +19,28 @@ use eframe::egui::{
 };
 use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
-    dump_hid_devices, format_unsupported_mouse_issue, AppPaths, Severity, WootingAnalogBasePatch,
-    WootingAnalogKeyReading, WootingAnalogStream, WootingGlobalSettingsPatch, WootingKeyboardInfo,
+    dump_hid_devices, format_unsupported_mouse_issue, AppPaths, KeyboardStatus, Severity,
+    SupportTier, WootingAnalogBasePatch, WootingAnalogKeyReading, WootingAnalogStream,
+    WootingGlobalSettingsPatch, WootingKeyboardInfo,
 };
+
+#[derive(Debug, Clone, PartialEq)]
+enum GenericConfirmAction {
+    SwitchProfile(u8),
+    SetPollingRate(u16),
+    SetBaseActuation {
+        actuation_mm: f32,
+        rt_enabled: Option<bool>,
+        rt_mm: Option<f32>,
+    },
+    SetRapidTrigger(bool),
+    SetSystemMode(bool),
+    SetSocd(bool),
+    SetDebounce {
+        typing_mode: bool,
+        debounce_ms: u8,
+    },
+}
 
 use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::theme::{Palette, ThemeMode};
@@ -186,6 +205,10 @@ pub struct KeyboardUiState {
     draft_rgb_dim_min: u32,
     draft_rgb_off_min: u32,
     draft_rgb_turn_off: bool,
+    // Draft values & confirm gate for non-Wooting multi-brand keyboards (ImplementedFromDocs).
+    draft_venom_typing: bool,
+    draft_venom_debounce_ms: u8,
+    pending_generic_confirm: Option<GenericConfirmAction>,
     // Serial-redacted keyboard/HID report modal.
     report_modal: Option<String>,
     pub notice: Option<(Severity, String)>,
@@ -219,6 +242,9 @@ impl KeyboardUiState {
             draft_rgb_dim_min: 5,
             draft_rgb_off_min: 10,
             draft_rgb_turn_off: true,
+            draft_venom_typing: false,
+            draft_venom_debounce_ms: 5,
+            pending_generic_confirm: None,
             report_modal: None,
             notice: None,
         }
@@ -334,8 +360,33 @@ impl KeyboardUiState {
     pub fn on_action_result(&mut self, ok: bool, message: String) {
         self.confirm_analog_flash = false;
         self.confirm_per_key_action = None;
+        self.pending_generic_confirm = None;
         self.synced_key = None; // Force re-sync from refreshed hardware read-back.
         self.notice = Some((if ok { Severity::Ok } else { Severity::Warn }, message));
+    }
+
+    fn sync_generic_drafts_from(&mut self, kb: &KeyboardStatus) {
+        let key = (kb.id.clone(), kb.active_profile);
+        if self.synced_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.synced_key = Some(key);
+        self.pending_generic_confirm = None;
+        if let Some(mm) = kb.actuation_mm {
+            self.draft_actuation_mm = (mm * 100.0).round() / 100.0;
+        }
+        if let Some(rt) = kb.rapid_trigger_enabled {
+            self.draft_rt_enabled = rt;
+        }
+        if let Some(rt_mm) = kb.rapid_trigger_mm {
+            self.draft_rt_sens_mm = (rt_mm * 100.0).round() / 100.0;
+        }
+        if let Some(db) = kb.debounce_mode.as_deref() {
+            self.draft_venom_typing = db.eq_ignore_ascii_case("Typing");
+        }
+        if let Some(ms) = kb.debounce_ms {
+            self.draft_venom_debounce_ms = ms.clamp(5, 40);
+        }
     }
 
     fn sync_drafts_from(&mut self, kb: &WootingKeyboardInfo) {
@@ -385,12 +436,12 @@ impl KeyboardUiState {
         snap: Option<&ProfileRuntimeSnapshot>,
         runtime: &ProfileRuntimeHandle,
     ) {
-        let boards: &[WootingKeyboardInfo] =
-            snap.map(|s| s.wooting_keyboards.as_slice()).unwrap_or(&[]);
+        let boards: &[KeyboardStatus] = snap.map(|s| s.keyboards.as_slice()).unwrap_or(&[]);
         if !boards.is_empty() && self.selected_index >= boards.len() {
             self.selected_index = 0;
         }
         let active_kb = boards.get(self.selected_index).cloned();
+        let active_wooting = active_kb.as_ref().and_then(|k| k.wooting.as_ref());
 
         if let Some(stream) = &self.analog_stream {
             let (keys, err) = stream.snapshot();
@@ -398,7 +449,7 @@ impl KeyboardUiState {
                 self.stream_error = Some(e);
                 self.stop_analog_stream();
             } else {
-                self.update_smoothed_analog(ctx, &keys, active_kb.as_ref());
+                self.update_smoothed_analog(ctx, &keys, active_wooting);
             }
         }
 
@@ -406,7 +457,11 @@ impl KeyboardUiState {
         ui.set_max_width(content_w);
 
         if let Some(ref kb) = active_kb {
-            self.sync_drafts_from(kb);
+            if let Some(ref w) = kb.wooting {
+                self.sync_drafts_from(w);
+            } else {
+                self.sync_generic_drafts_from(kb);
+            }
         }
 
         // --- RESPONSIVE PAGE HEADER ---
@@ -488,7 +543,7 @@ impl KeyboardUiState {
                     return;
                 };
 
-                // Optional multi-keyboard switcher if user has > 1 Wooting board (e.g. 60HE+ + UwU)
+                // Optional multi-keyboard switcher if user has > 1 supported board connected
                 if boards.len() > 1 {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("Keyboard:").size(12.0).color(p.text_muted));
@@ -502,53 +557,57 @@ impl KeyboardUiState {
                             if ui.add(btn).clicked() {
                                 self.selected_index = idx;
                                 self.synced_key = None;
+                                self.pending_generic_confirm = None;
                             }
                         }
                     });
                     ui.add_space(10.0);
                 }
 
-                // --- 4 HERO TELEMETRY TILES ---
-                self.render_hero_strip(ui, p, scroll_w, &kb);
-                ui.add_space(12.0);
-
-                // --- ONBOARD PROFILE SWITCHER (RAM-ONLY, ZERO FLASH WEAR) ---
-                self.render_profile_switcher_card(ui, p, scroll_w, &kb, runtime);
-                ui.add_space(12.0);
-
-                // --- INTERACTIVE MULTI-LAYOUT VISUAL KEYMAP & LIVE ANALOG HEATMAP ---
-                self.render_visual_keymap_card(ui, p, mode, scroll_w, &kb, runtime);
-                ui.add_space(12.0);
-
-                // --- LIVE ANALOG KEY-TRAVEL VISUALIZER & A/D COUNTER-STRAFE TIMING ---
-                self.render_analog_stream_card(ctx, ui, p, mode, scroll_w, &kb);
-                ui.add_space(12.0);
-
-                // --- TWO-COLUMN DETAIL CARDS: PROFILE TUNING & AKC | GLOBAL SETTINGS, RGB & DIAGNOSTICS ---
-                if scroll_w < 840.0 {
-                    self.render_profile_tuning_card(ui, p, mode, scroll_w, &kb, runtime);
+                if let Some(ref wkb) = kb.wooting {
+                    // --- FULL HARDWARE-VERIFIED WOOTING EXPERIENCE (100% PRESERVED) ---
+                    self.render_hero_strip(ui, p, scroll_w, wkb);
                     ui.add_space(12.0);
-                    self.render_device_settings_card(ui, p, scroll_w, &kb, runtime);
+
+                    self.render_profile_switcher_card(ui, p, scroll_w, wkb, runtime);
+                    ui.add_space(12.0);
+
+                    self.render_visual_keymap_card(ui, p, mode, scroll_w, wkb, runtime);
+                    ui.add_space(12.0);
+
+                    self.render_analog_stream_card(ctx, ui, p, mode, scroll_w, wkb);
+                    ui.add_space(12.0);
+
+                    if scroll_w < 840.0 {
+                        self.render_profile_tuning_card(ui, p, mode, scroll_w, wkb, runtime);
+                        ui.add_space(12.0);
+                        self.render_device_settings_card(ui, p, scroll_w, wkb, runtime);
+                    } else {
+                        let gap = 12.0;
+                        let half_w = ((scroll_w - gap) * 0.5).max(260.0);
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(half_w, 0.0),
+                                egui::Layout::top_down(egui::Align::LEFT),
+                                |ui| {
+                                    self.render_profile_tuning_card(
+                                        ui, p, mode, half_w, wkb, runtime,
+                                    );
+                                },
+                            );
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(half_w, 0.0),
+                                egui::Layout::top_down(egui::Align::LEFT),
+                                |ui| {
+                                    self.render_device_settings_card(ui, p, half_w, wkb, runtime);
+                                },
+                            );
+                        });
+                    }
                 } else {
-                    let gap = 12.0;
-                    let half_w = ((scroll_w - gap) * 0.5).max(260.0);
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(half_w, 0.0),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                self.render_profile_tuning_card(ui, p, mode, half_w, &kb, runtime);
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(half_w, 0.0),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                self.render_device_settings_card(ui, p, half_w, &kb, runtime);
-                            },
-                        );
-                    });
+                    // --- MULTI-BRAND OPEN-SOURCE KEYBOARD DASHBOARD ---
+                    self.render_generic_keyboard_dashboard(ui, p, mode, scroll_w, &kb, runtime);
                 }
 
                 ui.add_space(8.0);
@@ -632,7 +691,7 @@ impl KeyboardUiState {
     ) {
         card_frame(ui, p, card_w, |ui| {
             ui.label(
-                RichText::new("No Wooting Keyboard Detected")
+                RichText::new("No Supported Keyboard Detected")
                     .size(15.0)
                     .strong()
                     .color(p.text),
@@ -641,7 +700,7 @@ impl KeyboardUiState {
             ui.add(
                 egui::Label::new(
                     RichText::new(
-                        "Connect a supported Wooting keyboard over USB to inspect live actuation, Rapid Trigger, Tachyon mode, per-key overrides, SOCD / AKC bindings, onboard profile names, RGB core, global settings, and real-time analog key travel.",
+                        "Connect a supported keyboard over USB (or LIGHTSPEED receiver for Logitech) to inspect live settings, switch onboard profiles, and apply read-back verified tuning.",
                     )
                     .size(12.5)
                     .color(p.text_muted),
@@ -652,9 +711,20 @@ impl KeyboardUiState {
             ui.add(
                 egui::Label::new(
                     RichText::new(
-                        "Supported models: Wooting 60HE, 60HE+, 60HE v2, 80HE, 80HE+, Two HE (ARM / AVR), Two Lekker, UwU / UwU RGB, One, and Two. Close Wootility (desktop or web tab) if it is currently open.",
+                        "Supported brands: Wooting (60HE / 60HE+ / 80HE / Two HE / UwU - tested on hardware), Wuque Studio / SparkLink HE (BABAO60/80, ZOOM TIGA), Keychron Hall Effect (Q/K/V/J/C HE & TMR), SteelSeries Apex Pro TKL, Razer Keyboards (Huntsman V3 Pro / BlackWidow V4), Arbiter Studio (Polar 65/75 PRO, Nimbus 65), Logitech HID++ 2.0 (PRO X TKL RAPID, G915 X, G715), Kochi HB68, Geonworks Venom (60MX/80MX/WISH45-8K), and Universal QMK / VIA.",
                     )
                     .size(11.5)
+                    .color(p.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Using a closed-firmware board (e.g. Geonworks Venom HE RISC-V or Tekkusai Titan 75 HE)? Click 'Report Keyboard' above to generate a serial-redacted HID dump.",
+                    )
+                    .size(11.0)
                     .color(p.text_muted),
                 )
                 .wrap(),
@@ -665,6 +735,683 @@ impl KeyboardUiState {
                     runtime.send(ProfileRuntimeCmd::RefreshWooting);
                 }
             });
+        });
+    }
+
+    fn render_generic_keyboard_dashboard(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        scroll_w: f32,
+        kb: &KeyboardStatus,
+        runtime: &ProfileRuntimeHandle,
+    ) {
+        if kb.support_tier == SupportTier::ImplementedFromDocs {
+            let note = kb.status_note.as_deref().unwrap_or(
+                "Implemented from verified open-source protocol documentation; not yet tested on physical hardware by the Polled author. All writes are confirm-gated and verified by read-back.",
+            );
+            semantic_banner(ui, p, mode, scroll_w, Severity::Info, note);
+            ui.add_space(12.0);
+        }
+
+        // --- 4 HERO KPI TILES ---
+        let gap = 10.0;
+        let cols: usize = if scroll_w >= 760.0 { 4 } else { 2 };
+        let tile_w = ((scroll_w - gap * (cols as f32 - 1.0)) / cols as f32).max(130.0);
+
+        let t1_val = kb.brand.display_name().to_string();
+        let t1_sub = kb.protocol_label.clone();
+
+        let (t2_lbl, t2_val, t2_sub, t2_col) = if let Some(slot) = kb.active_profile {
+            (
+                "ACTIVE PROFILE",
+                kb.profile_display_name(slot),
+                format!("{} onboard slots", kb.profiles.len()),
+                p.text,
+            )
+        } else if let Some(sys) = &kb.system_mode {
+            (
+                "SYSTEM MODE",
+                sys.clone(),
+                "Host OS layout mode".to_string(),
+                p.info,
+            )
+        } else if let Some(db) = &kb.debounce_mode {
+            (
+                "DEBOUNCE MODE",
+                db.clone(),
+                kb.debounce_ms
+                    .map(|m| format!("{m} ms threshold"))
+                    .unwrap_or_else(|| "Venom 8K".to_string()),
+                p.ok,
+            )
+        } else {
+            (
+                "FIRMWARE",
+                kb.firmware_version
+                    .as_deref()
+                    .map(|v| format!("v{v}"))
+                    .unwrap_or_else(|| "Detected".to_string()),
+                kb.vid_pid.clone(),
+                p.text,
+            )
+        };
+
+        let (t3_lbl, t3_val, t3_sub, t3_col) = if let Some(mm) = kb.actuation_mm {
+            let rt_sub = match (kb.rapid_trigger_enabled, kb.rapid_trigger_mm) {
+                (Some(true), Some(rt)) => format!("RT ON · {rt:.2} mm"),
+                (Some(true), None) => "Rapid Trigger ON".to_string(),
+                (Some(false), _) => "Rapid Trigger OFF".to_string(),
+                _ => kb.switch_tech.clone(),
+            };
+            ("ACTUATION", format!("{mm:.2} mm"), rt_sub, p.text)
+        } else if let Some(hz) = kb.polling_rate_hz {
+            (
+                "POLLING RATE",
+                format!("{hz} Hz"),
+                if kb.capabilities.supports_polling_rate_write {
+                    "Configurable".to_string()
+                } else {
+                    "Reported by firmware".to_string()
+                },
+                if hz >= 4000 { p.ok } else { p.text },
+            )
+        } else if let Some(rt) = kb.rapid_trigger_enabled {
+            (
+                "RAPID TRIGGER",
+                if rt { "ON" } else { "OFF" }.to_string(),
+                kb.socd_enabled
+                    .map(|s| format!("SOCD {}", if s { "ON" } else { "OFF" }))
+                    .unwrap_or_else(|| kb.switch_tech.clone()),
+                if rt { p.ok } else { p.text_muted },
+            )
+        } else {
+            (
+                "SWITCH TECH",
+                kb.switch_tech.clone(),
+                kb.chip_type.clone(),
+                p.text,
+            )
+        };
+
+        let (t4_lbl, t4_val, t4_sub, t4_col) = if let Some(bat) = kb.battery {
+            (
+                "BATTERY",
+                bat.compact_label(),
+                if bat.charging {
+                    "Charging".to_string()
+                } else {
+                    "Wireless".to_string()
+                },
+                if bat.percent <= 20 && !bat.charging {
+                    p.warn
+                } else {
+                    p.ok
+                },
+            )
+        } else if let Some(socd) = kb.socd_enabled {
+            (
+                "SOCD / PRIORITY",
+                if socd { "ON" } else { "OFF" }.to_string(),
+                kb.capabilities
+                    .socd_label
+                    .clone()
+                    .unwrap_or_else(|| "Last Input Priority".to_string()),
+                if socd { p.info } else { p.text_muted },
+            )
+        } else {
+            (
+                "SUPPORT TIER",
+                kb.support_tier.label().to_string(),
+                "Confirm-gated writes".to_string(),
+                p.info,
+            )
+        };
+
+        if cols == 4 {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                render_kpi_tile(ui, p, tile_w, "BRAND & PROTOCOL", &t1_val, &t1_sub, p.text);
+                render_kpi_tile(ui, p, tile_w, t2_lbl, &t2_val, &t2_sub, t2_col);
+                render_kpi_tile(ui, p, tile_w, t3_lbl, &t3_val, &t3_sub, t3_col);
+                render_kpi_tile(ui, p, tile_w, t4_lbl, &t4_val, &t4_sub, t4_col);
+            });
+        } else {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                render_kpi_tile(ui, p, tile_w, "BRAND & PROTOCOL", &t1_val, &t1_sub, p.text);
+                render_kpi_tile(ui, p, tile_w, t2_lbl, &t2_val, &t2_sub, t2_col);
+            });
+            ui.add_space(gap);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                render_kpi_tile(ui, p, tile_w, t3_lbl, &t3_val, &t3_sub, t3_col);
+                render_kpi_tile(ui, p, tile_w, t4_lbl, &t4_val, &t4_sub, t4_col);
+            });
+        }
+        ui.add_space(12.0);
+
+        // --- ONBOARD PROFILE SWITCHER (Wuque / Keychron HE / Arbiter PRO) ---
+        if kb.capabilities.supports_profile_switch && !kb.profiles.is_empty() {
+            card_frame(ui, p, scroll_w, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Onboard Profile Switcher")
+                            .size(13.5)
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("Confirm-gated · bind per-game in Profiles -> Keyboard")
+                                .size(11.0)
+                                .color(p.text_muted),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    for slot in &kb.profiles {
+                        let label = format!("P{} · {}", slot.index + 1, slot.name);
+                        let is_active = kb.active_profile == Some(slot.index);
+                        let btn = if is_active {
+                            primary_btn(&label, p)
+                        } else {
+                            secondary_btn(&label, p)
+                        };
+                        if ui.add(btn).clicked() && !is_active {
+                            self.pending_generic_confirm =
+                                Some(GenericConfirmAction::SwitchProfile(slot.index));
+                        }
+                    }
+                });
+            });
+            ui.add_space(12.0);
+        }
+
+        // --- TWO-COLUMN CONTROLS & DIAGNOSTICS ---
+        let has_controls = kb.capabilities.supports_polling_rate_write
+            || kb.capabilities.supports_base_actuation_write
+            || kb.capabilities.supports_rapid_trigger_toggle
+            || kb.capabilities.supports_socd_toggle
+            || kb.capabilities.supports_system_mode_toggle
+            || kb.capabilities.supports_debounce_tuning;
+
+        if has_controls && scroll_w >= 820.0 {
+            let col_gap = 12.0;
+            let half_w = ((scroll_w - col_gap) * 0.5).max(260.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = col_gap;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(half_w, 0.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        self.render_generic_controls_card(ui, p, mode, half_w, kb, runtime);
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    Vec2::new(half_w, 0.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        self.render_generic_diagnostics_card(ui, p, half_w, kb);
+                    },
+                );
+            });
+        } else {
+            if has_controls {
+                self.render_generic_controls_card(ui, p, mode, scroll_w, kb, runtime);
+                ui.add_space(12.0);
+            }
+            self.render_generic_diagnostics_card(ui, p, scroll_w, kb);
+        }
+
+        // --- CONFIRMATION BAR FOR IMPLEMENTED-FROM-DOCS WRITES ---
+        if let Some(pending) = self.pending_generic_confirm.clone() {
+            ui.add_space(12.0);
+            let desc = match &pending {
+                GenericConfirmAction::SwitchProfile(slot) => {
+                    format!(
+                        "Switch {} to onboard {}?",
+                        kb.name,
+                        kb.profile_display_name(*slot)
+                    )
+                }
+                GenericConfirmAction::SetPollingRate(hz) => {
+                    format!("Set {} polling rate to {hz} Hz?", kb.name)
+                }
+                GenericConfirmAction::SetBaseActuation {
+                    actuation_mm,
+                    rt_enabled,
+                    ..
+                } => format!(
+                    "Write actuation {:.2} mm{} to {}?",
+                    actuation_mm,
+                    match rt_enabled {
+                        Some(true) => " + Rapid Trigger ON",
+                        Some(false) => " + Rapid Trigger OFF",
+                        None => "",
+                    },
+                    kb.name
+                ),
+                GenericConfirmAction::SetRapidTrigger(on) => format!(
+                    "Set {} Rapid Trigger to {}?",
+                    kb.name,
+                    if *on { "ON" } else { "OFF" }
+                ),
+                GenericConfirmAction::SetSystemMode(mac) => format!(
+                    "Switch {} host mode to {}?",
+                    kb.name,
+                    if *mac { "macOS" } else { "Windows" }
+                ),
+                GenericConfirmAction::SetSocd(on) => format!(
+                    "Set {} {} to {}?",
+                    kb.name,
+                    kb.capabilities.socd_label.as_deref().unwrap_or("SOCD"),
+                    if *on { "ON" } else { "OFF" }
+                ),
+                GenericConfirmAction::SetDebounce {
+                    typing_mode,
+                    debounce_ms,
+                } => format!(
+                    "Save {} debounce to {} · {debounce_ms} ms (EEPROM)?",
+                    kb.name,
+                    if *typing_mode { "Typing" } else { "Gaming" }
+                ),
+            };
+            card_frame(ui, p, scroll_w, |ui| {
+                ui.label(
+                    RichText::new("Confirm Hardware Write (Read-Back Verified)")
+                        .size(13.0)
+                        .strong()
+                        .color(p.warn),
+                );
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(desc).size(12.0).color(p.text)).wrap());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add(primary_btn("Confirm & Write", p)).clicked() {
+                        let dev_id = Some(kb.id.clone());
+                        match pending {
+                            GenericConfirmAction::SwitchProfile(slot) => {
+                                runtime.send(ProfileRuntimeCmd::SwitchWootingProfile {
+                                    device_id: dev_id,
+                                    slot,
+                                });
+                            }
+                            GenericConfirmAction::SetPollingRate(hz) => {
+                                runtime.send(ProfileRuntimeCmd::SetKeyboardPollingRate {
+                                    device_id: dev_id,
+                                    hz,
+                                });
+                            }
+                            GenericConfirmAction::SetBaseActuation {
+                                actuation_mm,
+                                rt_enabled,
+                                rt_mm,
+                            } => {
+                                runtime.send(ProfileRuntimeCmd::SetKeyboardBaseActuation {
+                                    device_id: dev_id,
+                                    actuation_mm,
+                                    rt_enabled,
+                                    rt_mm,
+                                });
+                            }
+                            GenericConfirmAction::SetRapidTrigger(enabled) => {
+                                runtime.send(ProfileRuntimeCmd::SetKeyboardRapidTrigger {
+                                    device_id: dev_id,
+                                    enabled,
+                                });
+                            }
+                            GenericConfirmAction::SetSystemMode(mac_mode) => {
+                                runtime.send(ProfileRuntimeCmd::SetKeyboardSystemMode {
+                                    device_id: dev_id,
+                                    mac_mode,
+                                });
+                            }
+                            GenericConfirmAction::SetSocd(enabled) => {
+                                runtime.send(ProfileRuntimeCmd::SetKeyboardSocd {
+                                    device_id: dev_id,
+                                    enabled,
+                                });
+                            }
+                            GenericConfirmAction::SetDebounce {
+                                typing_mode,
+                                debounce_ms,
+                            } => {
+                                runtime.send(ProfileRuntimeCmd::SetKeyboardDebounce {
+                                    device_id: dev_id,
+                                    typing_mode,
+                                    debounce_ms,
+                                });
+                            }
+                        }
+                        self.pending_generic_confirm = None;
+                    }
+                    if ui.add(secondary_btn("Cancel", p)).clicked() {
+                        self.pending_generic_confirm = None;
+                    }
+                });
+            });
+        }
+    }
+
+    fn render_generic_controls_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        _mode: ThemeMode,
+        card_w: f32,
+        kb: &KeyboardStatus,
+        _runtime: &ProfileRuntimeHandle,
+    ) {
+        card_frame(ui, p, card_w, |ui| {
+            ui.label(
+                RichText::new("Keyboard Tuning & Controls")
+                    .size(13.5)
+                    .strong()
+                    .color(p.text),
+            );
+            ui.add_space(8.0);
+
+            if kb.capabilities.supports_polling_rate_write
+                && !kb.capabilities.supported_polling_rates_hz.is_empty()
+            {
+                ui.label(
+                    RichText::new("USB POLLING RATE")
+                        .size(10.5)
+                        .strong()
+                        .color(p.text_muted),
+                );
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    for &hz in &kb.capabilities.supported_polling_rates_hz {
+                        let active = kb.polling_rate_hz == Some(hz);
+                        let lbl = format!("{hz} Hz");
+                        let btn = if active {
+                            primary_btn(&lbl, p)
+                        } else {
+                            secondary_btn(&lbl, p)
+                        };
+                        if ui.add(btn).clicked() && !active {
+                            self.pending_generic_confirm =
+                                Some(GenericConfirmAction::SetPollingRate(hz));
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            if kb.capabilities.supports_base_actuation_write {
+                let (min_mm, max_mm) = kb.actuation_range_mm.unwrap_or((0.1, 3.8));
+                ui.label(
+                    RichText::new("GLOBAL ACTUATION & RAPID TRIGGER")
+                        .size(10.5)
+                        .strong()
+                        .color(p.text_muted),
+                );
+                ui.add_space(6.0);
+                egui::Grid::new("generic_kb_actuation_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Actuation").color(p.text_muted));
+                        ui.add(
+                            egui::DragValue::new(&mut self.draft_actuation_mm)
+                                .range(min_mm..=max_mm)
+                                .speed(0.05)
+                                .fixed_decimals(2)
+                                .suffix(" mm"),
+                        );
+                        ui.end_row();
+
+                        if kb.capabilities.supports_rapid_trigger_toggle {
+                            ui.label(RichText::new("Rapid Trigger").color(p.text_muted));
+                            ui.checkbox(&mut self.draft_rt_enabled, "Enabled");
+                            ui.end_row();
+                        }
+
+                        if kb.rapid_trigger_mm.is_some()
+                            || kb.capabilities.supports_rapid_trigger_toggle
+                        {
+                            ui.label(RichText::new("RT Sensitivity").color(p.text_muted));
+                            ui.add(
+                                egui::DragValue::new(&mut self.draft_rt_sens_mm)
+                                    .range(0.10..=2.40)
+                                    .speed(0.05)
+                                    .fixed_decimals(2)
+                                    .suffix(" mm"),
+                            );
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(6.0);
+                if ui
+                    .add(secondary_btn("Apply Actuation Settings...", p))
+                    .clicked()
+                {
+                    self.pending_generic_confirm = Some(GenericConfirmAction::SetBaseActuation {
+                        actuation_mm: self.draft_actuation_mm,
+                        rt_enabled: kb
+                            .capabilities
+                            .supports_rapid_trigger_toggle
+                            .then_some(self.draft_rt_enabled),
+                        rt_mm: Some(self.draft_rt_sens_mm),
+                    });
+                }
+                ui.add_space(10.0);
+            } else if kb.capabilities.supports_rapid_trigger_toggle {
+                ui.label(
+                    RichText::new("FIRMWARE RAPID TRIGGER")
+                        .size(10.5)
+                        .strong()
+                        .color(p.text_muted),
+                );
+                ui.add_space(4.0);
+                let cur = kb.rapid_trigger_enabled.unwrap_or(false);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(if cur {
+                            primary_btn("Rapid Trigger ON", p)
+                        } else {
+                            secondary_btn("Rapid Trigger ON", p)
+                        })
+                        .clicked()
+                        && !cur
+                    {
+                        self.pending_generic_confirm =
+                            Some(GenericConfirmAction::SetRapidTrigger(true));
+                    }
+                    if ui
+                        .add(if !cur {
+                            primary_btn("Rapid Trigger OFF", p)
+                        } else {
+                            secondary_btn("Rapid Trigger OFF", p)
+                        })
+                        .clicked()
+                        && cur
+                    {
+                        self.pending_generic_confirm =
+                            Some(GenericConfirmAction::SetRapidTrigger(false));
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            if kb.capabilities.supports_socd_toggle {
+                let lbl = kb
+                    .capabilities
+                    .socd_label
+                    .as_deref()
+                    .unwrap_or("SOCD / Key Priority");
+                ui.label(
+                    RichText::new(lbl.to_uppercase())
+                        .size(10.5)
+                        .strong()
+                        .color(p.text_muted),
+                );
+                ui.add_space(4.0);
+                let cur = kb.socd_enabled.unwrap_or(false);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(if cur {
+                            primary_btn("Enabled", p)
+                        } else {
+                            secondary_btn("Enabled", p)
+                        })
+                        .clicked()
+                        && !cur
+                    {
+                        self.pending_generic_confirm = Some(GenericConfirmAction::SetSocd(true));
+                    }
+                    if ui
+                        .add(if !cur {
+                            primary_btn("Disabled", p)
+                        } else {
+                            secondary_btn("Disabled", p)
+                        })
+                        .clicked()
+                        && cur
+                    {
+                        self.pending_generic_confirm = Some(GenericConfirmAction::SetSocd(false));
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            if kb.capabilities.supports_system_mode_toggle {
+                ui.label(
+                    RichText::new("HOST OS SYSTEM MODE")
+                        .size(10.5)
+                        .strong()
+                        .color(p.text_muted),
+                );
+                ui.add_space(4.0);
+                let is_mac = kb
+                    .system_mode
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("macOS"));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(if !is_mac {
+                            primary_btn("Windows Mode", p)
+                        } else {
+                            secondary_btn("Windows Mode", p)
+                        })
+                        .clicked()
+                        && is_mac
+                    {
+                        self.pending_generic_confirm =
+                            Some(GenericConfirmAction::SetSystemMode(false));
+                    }
+                    if ui
+                        .add(if is_mac {
+                            primary_btn("macOS Mode", p)
+                        } else {
+                            secondary_btn("macOS Mode", p)
+                        })
+                        .clicked()
+                        && !is_mac
+                    {
+                        self.pending_generic_confirm =
+                            Some(GenericConfirmAction::SetSystemMode(true));
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            if kb.capabilities.supports_debounce_tuning {
+                ui.label(
+                    RichText::new("GEONWORKS VENOM 8K DEBOUNCE")
+                        .size(10.5)
+                        .strong()
+                        .color(p.text_muted),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(if !self.draft_venom_typing {
+                            primary_btn("Gaming (Eager)", p)
+                        } else {
+                            secondary_btn("Gaming (Eager)", p)
+                        })
+                        .clicked()
+                    {
+                        self.draft_venom_typing = false;
+                    }
+                    if ui
+                        .add(if self.draft_venom_typing {
+                            primary_btn("Typing (Defer)", p)
+                        } else {
+                            secondary_btn("Typing (Defer)", p)
+                        })
+                        .clicked()
+                    {
+                        self.draft_venom_typing = true;
+                    }
+                    ui.add(
+                        egui::DragValue::new(&mut self.draft_venom_debounce_ms)
+                            .range(5..=40)
+                            .suffix(" ms"),
+                    );
+                });
+                ui.add_space(6.0);
+                if ui
+                    .add(secondary_btn("Save Debounce to EEPROM...", p))
+                    .clicked()
+                {
+                    self.pending_generic_confirm = Some(GenericConfirmAction::SetDebounce {
+                        typing_mode: self.draft_venom_typing,
+                        debounce_ms: self.draft_venom_debounce_ms,
+                    });
+                }
+            }
+        });
+    }
+
+    fn render_generic_diagnostics_card(
+        &self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        card_w: f32,
+        kb: &KeyboardStatus,
+    ) {
+        card_frame(ui, p, card_w, |ui| {
+            ui.label(
+                RichText::new("Hardware Diagnostics & Telemetry")
+                    .size(13.5)
+                    .strong()
+                    .color(p.text),
+            );
+            ui.add_space(8.0);
+            let mut rows = vec![
+                ("Brand", kb.brand.display_name().to_string()),
+                ("Model", kb.name.clone()),
+                ("USB VID:PID", kb.vid_pid.clone()),
+                ("Protocol", kb.protocol_label.clone()),
+                ("Controller", kb.chip_type.clone()),
+                ("Switch Tech", kb.switch_tech.clone()),
+                ("Verification Tier", kb.support_tier.label().to_string()),
+            ];
+            if let Some(fw) = &kb.firmware_version {
+                rows.push(("Firmware", fw.clone()));
+            }
+            if let Some(bat) = kb.battery {
+                rows.push(("Battery", bat.detail_label()));
+            }
+            for (k, v) in &kb.extra_telemetry {
+                rows.push((k.as_str(), v.clone()));
+            }
+            egui::Grid::new("generic_kb_diag_grid")
+                .num_columns(2)
+                .spacing([14.0, 5.0])
+                .show(ui, |ui| {
+                    for (k, v) in rows {
+                        ui.label(RichText::new(k).size(11.5).color(p.text_muted));
+                        ui.label(RichText::new(v).size(11.5).monospace().color(p.text));
+                        ui.end_row();
+                    }
+                });
         });
     }
 

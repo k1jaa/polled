@@ -1744,6 +1744,19 @@ impl WootingDevice {
         self.protocol
     }
 
+    pub fn vendor_product_ids(&self) -> (u16, u16) {
+        let mut parts = self.vid_pid.split(':');
+        let vid = parts
+            .next()
+            .and_then(|s| u16::from_str_radix(s, 16).ok())
+            .unwrap_or(0x31E3);
+        let pid = parts
+            .next()
+            .and_then(|s| u16::from_str_radix(s, 16).ok())
+            .unwrap_or(0);
+        (vid, pid)
+    }
+
     /// Quiet-drains any buffered notifications/duplicate replies, sends an 8-byte feature report,
     /// and reads back the matching response echoing `cmd_id`.
     fn exchange(&self, pkt: [u8; 8]) -> Result<Vec<u8>> {

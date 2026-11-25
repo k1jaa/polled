@@ -9,12 +9,12 @@ use std::process::ExitCode;
 use clap::Parser;
 use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
-    check_latest_github_release, detect_hardware_devices, detect_wooting_keyboards,
-    dump_hid_devices, export_setup_bundle_json, format_network_benchmark_summary,
-    format_unsupported_mouse_issue, parse_setup_bundle_json, restore_setup_bundle,
-    run_network_jitter_benchmark, AppPaths, ApplyOutcome, AudioEndpointInfo, AudioFlow,
-    CheckReport, HealthEngine, NetworkAdapterInfo, PolledError, ProfileStore, SafeDeviceController,
-    Severity, WootingKeyboardInfo,
+    check_latest_github_release, detect_all_keyboards, detect_hardware_devices,
+    detect_wooting_keyboards, dump_hid_devices, export_setup_bundle_json,
+    format_network_benchmark_summary, format_unsupported_mouse_issue, parse_setup_bundle_json,
+    restore_setup_bundle, run_network_jitter_benchmark, AppPaths, ApplyOutcome, AudioEndpointInfo,
+    AudioFlow, CheckReport, HealthEngine, KeyboardStatus, NetworkAdapterInfo, PolledError,
+    ProfileStore, SafeDeviceController, Severity, WootingKeyboardInfo,
 };
 
 #[derive(Debug, Parser)]
@@ -35,6 +35,10 @@ struct Cli {
     /// Detect supported mice and read their current settings (read-only, zero writes)
     #[arg(long)]
     detect: bool,
+
+    /// Detect all supported multi-brand keyboards (Wooting, Wuque, Keychron HE, SteelSeries, Razer, Arbiter, Logitech, Kochi, Geonworks Venom, QMK/VIA)
+    #[arg(long)]
+    keyboards: bool,
 
     /// Detect connected Wooting keyboards and read their active onboard profile (read-only)
     #[arg(long)]
@@ -157,6 +161,54 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
                 "Polled v{} is up to date (latest release: v{}).",
                 res.current_version, res.latest_version
             );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if cli.keyboards {
+        let boards = detect_all_keyboards()?;
+        let statuses: Vec<KeyboardStatus> = boards.iter().map(|b| b.read_status()).collect();
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&statuses)?);
+        } else if statuses.is_empty() {
+            println!("No supported keyboards detected.");
+            println!("Run `polled --dump` to inspect USB HID interfaces.");
+        } else {
+            for kb in &statuses {
+                let fw = kb
+                    .firmware_version
+                    .as_deref()
+                    .map(|v| format!(" · fw v{v}"))
+                    .unwrap_or_default();
+                println!(
+                    "{} ({}) [{} · {} · {}{}]",
+                    kb.name,
+                    kb.vid_pid,
+                    kb.brand.display_name(),
+                    kb.protocol_label,
+                    kb.support_tier.label(),
+                    fw
+                );
+                println!("  Summary:    {}", kb.compact_status_summary());
+                if !kb.profiles.is_empty() {
+                    let list: Vec<String> = kb
+                        .profiles
+                        .iter()
+                        .map(|p| {
+                            if p.is_active {
+                                format!("*P{}:{}", p.index + 1, p.name)
+                            } else {
+                                format!("P{}:{}", p.index + 1, p.name)
+                            }
+                        })
+                        .collect();
+                    println!("  Profiles:   {}", list.join("  "));
+                }
+                for (k, v) in &kb.extra_telemetry {
+                    println!("  {k:<11} {v}");
+                }
+                println!();
+            }
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -625,27 +677,29 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
         }
 
         if let Some(slot) = profile.wooting_profile {
-            match detect_wooting_keyboards() {
+            match detect_all_keyboards() {
                 Ok(boards) if boards.is_empty() => {
-                    warnings.push("No connected Wooting keyboard detected.".to_string());
+                    warnings.push("No connected supported keyboard detected.".to_string());
                 }
                 Ok(boards) => {
                     for kb in boards {
+                        let before = kb.read_status();
+                        if !before.capabilities.supports_profile_switch {
+                            continue;
+                        }
                         let name = kb.name().to_string();
                         match kb.switch_profile(slot) {
-                            Ok(true) => actions.push(format!(
-                                "{name} -> {}",
-                                WootingKeyboardInfo::profile_label(slot)
-                            )),
+                            Ok(true) => actions
+                                .push(format!("{name} -> {}", before.profile_display_name(slot))),
                             Ok(false) => actions.push(format!(
                                 "{name} already on {}",
-                                WootingKeyboardInfo::profile_label(slot)
+                                before.profile_display_name(slot)
                             )),
                             Err(e) => warnings.push(format!("{name} failed: {e}")),
                         }
                     }
                 }
-                Err(e) => warnings.push(format!("Wooting detection failed: {e}")),
+                Err(e) => warnings.push(format!("Keyboard detection failed: {e}")),
             }
         }
 

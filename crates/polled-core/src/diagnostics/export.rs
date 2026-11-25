@@ -9,7 +9,7 @@
 use chrono::Local;
 
 use crate::checks::{CheckReport, Severity};
-use crate::devices::WootingKeyboardInfo;
+use crate::devices::KeyboardStatus;
 use crate::diagnostics::{
     DiagnosticsSnapshot, DpcMonitorSnapshot, PinnedBenchmark, ReactionTestSummary,
     TimerJitterBenchmark, BOUNCE_THRESHOLD_MS,
@@ -32,7 +32,7 @@ pub struct RigScorecardInput<'a> {
     pub timer: Option<&'a TimerJitterBenchmark>,
     pub audio: Option<&'a AudioLatencyBenchmark>,
     pub network: Option<&'a NetworkJitterBenchmark>,
-    pub wooting: Option<&'a WootingKeyboardInfo>,
+    pub keyboard: Option<&'a KeyboardStatus>,
     pub dpc: Option<&'a DpcMonitorSnapshot>,
     pub reaction: Option<&'a ReactionTestSummary>,
 }
@@ -1326,59 +1326,60 @@ pub fn render_rig_scorecard_png(input: &RigScorecardInput<'_>, dark_mode: bool) 
     let r3_y = r2_y + r2_h + 14;
     let r3_h = RIG_H - r3_y - 36;
 
-    // 6. Wooting Keyboard
-    let wooting_sev = input.wooting.map(|_| Severity::Ok);
-    draw_card(
-        &mut c,
-        c1_x,
-        r3_y,
-        col_w,
-        r3_h,
-        "6. WOOTING KEYBOARD",
-        wooting_sev,
-    );
-    if let Some(kb) = input.wooting {
+    // 6. Keyboard (Wooting + Multi-Brand)
+    let kb_sev = input.keyboard.map(|_| Severity::Ok);
+    draw_card(&mut c, c1_x, r3_y, col_w, r3_h, "6. KEYBOARD", kb_sev);
+    if let Some(kb) = input.keyboard {
         let fw = kb
             .firmware_version
             .as_deref()
             .map(|v| format!("v{v}"))
-            .unwrap_or_else(|| kb.protocol.label().to_string());
+            .unwrap_or_else(|| kb.protocol_label.clone());
         let title_ln = format!("{} ({fw})", kb.name);
         c.draw_text_clipped(c1_x + 14, r3_y + 44, &title_ln, C_TEXT, col_w - 28);
-        let slot_ln = kb
-            .active_profile
-            .map(|s| format!("Profile: {}", kb.profile_display_name(s)))
-            .unwrap_or_else(|| "Profile: Active".to_string());
-        c.draw_text_clipped(c1_x + 14, r3_y + 64, &slot_ln, C_MUTED, col_w - 28);
-        if let Some(ap) = &kb.analog_profile {
-            let act_ln = format!(
-                "Act {:.2}mm | RT {} ({:.2}mm)",
-                ap.actuation_mm.unwrap_or(0.0),
-                if ap.rapid_trigger_enabled == Some(true) {
-                    "ON"
-                } else {
-                    "OFF"
-                },
-                ap.rapid_trigger_sensitivity_mm.unwrap_or(0.0)
-            );
-            c.draw_text_clipped(c1_x + 14, r3_y + 84, &act_ln, C_TEXT, col_w - 28);
-            let tach_ln = format!(
-                "Tachyon {} | {} overrides | {} AKC",
-                if ap.tachyon_enabled == Some(true) {
-                    "ON"
-                } else {
-                    "OFF"
-                },
-                kb.per_key_actuation.len(),
-                kb.advanced_keys.len()
-            );
-            c.draw_text_clipped(c1_x + 14, r3_y + 104, &tach_ln, C_OK, col_w - 28);
+        if let Some(w) = &kb.wooting {
+            let slot_ln = w
+                .active_profile
+                .map(|s| format!("Profile: {}", w.profile_display_name(s)))
+                .unwrap_or_else(|| "Profile: Active".to_string());
+            c.draw_text_clipped(c1_x + 14, r3_y + 64, &slot_ln, C_MUTED, col_w - 28);
+            if let Some(ap) = &w.analog_profile {
+                let act_ln = format!(
+                    "Act {:.2}mm | RT {} ({:.2}mm)",
+                    ap.actuation_mm.unwrap_or(0.0),
+                    if ap.rapid_trigger_enabled == Some(true) {
+                        "ON"
+                    } else {
+                        "OFF"
+                    },
+                    ap.rapid_trigger_sensitivity_mm.unwrap_or(0.0)
+                );
+                c.draw_text_clipped(c1_x + 14, r3_y + 84, &act_ln, C_TEXT, col_w - 28);
+                let tach_ln = format!(
+                    "Tachyon {} | {} overrides | {} AKC",
+                    if ap.tachyon_enabled == Some(true) {
+                        "ON"
+                    } else {
+                        "OFF"
+                    },
+                    w.per_key_actuation.len(),
+                    w.advanced_keys.len()
+                );
+                c.draw_text_clipped(c1_x + 14, r3_y + 104, &tach_ln, C_OK, col_w - 28);
+            }
+        } else {
+            let brand_ln = format!("{} · {}", kb.brand.display_name(), kb.switch_tech);
+            c.draw_text_clipped(c1_x + 14, r3_y + 64, &brand_ln, C_MUTED, col_w - 28);
+            let sum_ln = kb.compact_status_summary();
+            c.draw_text_clipped(c1_x + 14, r3_y + 84, &sum_ln, C_TEXT, col_w - 28);
+            let tier_ln = format!("{} · {}", kb.vid_pid, kb.support_tier.label());
+            c.draw_text_clipped(c1_x + 14, r3_y + 104, &tier_ln, C_OK, col_w - 28);
         }
     } else {
         c.draw_text(
             c1_x + 14,
             r3_y + 50,
-            "No Wooting keyboard connected.",
+            "No supported keyboard connected.",
             C_DIM,
         );
     }
@@ -1987,7 +1988,7 @@ mod tests {
             timer: None,
             audio: None,
             network: None,
-            wooting: None,
+            keyboard: None,
             dpc: None,
             reaction: None,
         };

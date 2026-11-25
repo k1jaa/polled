@@ -24,12 +24,11 @@ use polled_core::{
     format_watchdog_report, render_ab_comparison_png, render_report_png, render_rig_scorecard_png,
     run_audio_latency_benchmark, run_network_jitter_benchmark, run_timer_jitter_benchmark,
     AppPaths, AudioLatencyBenchmark, BenchHistoryStore, CheckReport, CoreDpcMetrics,
-    DiagnosticAdvice, DiagnosticsSnapshot, DpcMonitorSession, DpcMonitorSnapshot,
+    DiagnosticAdvice, DiagnosticsSnapshot, DpcMonitorSession, DpcMonitorSnapshot, KeyboardStatus,
     MatchWatchdogSession, NetworkJitterBenchmark, PinnedBenchmark, PollingStats, PollingTarget,
     RawInputCaptureSession, ReactionTestSummary, RigScorecardInput, SavedBenchRun, SensitivityGame,
-    Severity, TimerJitterBenchmark, TrackingStats, WatchdogSnapshot, WootingKeyboardInfo,
-    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, SCROLL_DOUBLE_NOTCH_MS,
-    STANDARD_RATES_HZ,
+    Severity, TimerJitterBenchmark, TrackingStats, WatchdogSnapshot, BOUNCE_THRESHOLD_MS,
+    HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, SCROLL_DOUBLE_NOTCH_MS, STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
@@ -718,7 +717,7 @@ impl InputLabUiState {
         detected_dpi: Option<u16>,
         health_checks: &[CheckReport],
         windows_version: Option<&str>,
-        wooting_kb: Option<&WootingKeyboardInfo>,
+        keyboard: Option<&KeyboardStatus>,
     ) -> Option<InputLabNavAction> {
         self.poll_background();
         self.tick_timers(ctx);
@@ -787,7 +786,7 @@ impl InputLabUiState {
             &advice,
             health_checks,
             windows_version,
-            wooting_kb,
+            keyboard,
         );
 
         ui.add_space(10.0);
@@ -975,7 +974,7 @@ impl InputLabUiState {
                                     );
                                     ui.label(
                                         RichText::new(
-                                            "Export a single 1040×760 monochrome PNG combining Health Check, 4K/8K Polling + OS Stalls, USB Topology, WASAPI Audio, Dual-Hop Ping, Wooting Keyboard, Per-Core DPC/IRQ, and Raw-Input Reaction.",
+                                            "Export a single 1040×760 monochrome PNG combining Health Check, 4K/8K Polling + OS Stalls, USB Topology, WASAPI Audio, Dual-Hop Ping, Keyboard, Per-Core DPC/IRQ, and Raw-Input Reaction.",
                                         )
                                         .size(11.5)
                                         .color(p.text_muted),
@@ -992,7 +991,7 @@ impl InputLabUiState {
                                                 mode,
                                                 health_checks,
                                                 windows_version,
-                                                wooting_kb,
+                                                keyboard,
                                             );
                                         }
                                     },
@@ -1193,7 +1192,7 @@ impl InputLabUiState {
         mode: ThemeMode,
         health_checks: &[CheckReport],
         windows_version: Option<&str>,
-        wooting_kb: Option<&WootingKeyboardInfo>,
+        keyboard: Option<&KeyboardStatus>,
     ) {
         let dir = AppPaths::default_user_dir().exports_dir();
         let reaction_summary = (!self.reaction_trials.is_empty())
@@ -1208,7 +1207,7 @@ impl InputLabUiState {
             timer: self.timer_benchmark.as_ref(),
             audio: self.audio_benchmark.as_ref(),
             network: self.network_benchmark.as_ref(),
-            wooting: wooting_kb,
+            keyboard,
             dpc: dpc_opt,
             reaction: reaction_summary.as_ref(),
         };
@@ -1245,7 +1244,7 @@ impl InputLabUiState {
         advice: &[DiagnosticAdvice],
         health_checks: &[CheckReport],
         windows_version: Option<&str>,
-        wooting_kb: Option<&WootingKeyboardInfo>,
+        keyboard: Option<&KeyboardStatus>,
     ) {
         let capturing = self.is_live_capturing();
         let counting_down = self.is_counting_down();
@@ -1500,7 +1499,7 @@ impl InputLabUiState {
             }
         }
         if do_save_scorecard {
-            self.save_rig_scorecard_png(mode, health_checks, windows_version, wooting_kb);
+            self.save_rig_scorecard_png(mode, health_checks, windows_version, keyboard);
         }
         if do_save_csv {
             let dir = AppPaths::default_user_dir().exports_dir();

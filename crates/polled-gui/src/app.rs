@@ -862,15 +862,18 @@ impl PolledApp {
                 polling_rates_hz: d.caps.polling_rates_hz.clone(),
                 battery: d.battery,
             });
-        let primary_wooting = snap.wooting_keyboards.first().map(|kb| TrayWootingState {
+        let primary_wooting = snap.keyboards.first().map(|kb| TrayWootingState {
             device_id: kb.id.clone(),
             name: kb.name.clone(),
             active_profile: kb.active_profile,
-            profiles: kb
-                .profiles
-                .iter()
-                .map(|slot| (slot.index, slot.name.clone()))
-                .collect(),
+            profiles: if kb.capabilities.supports_profile_switch {
+                kb.profiles
+                    .iter()
+                    .map(|slot| (slot.index, slot.name.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
         });
         self.tray.update_status(
             snap.auto_switch_enabled,
@@ -1106,14 +1109,9 @@ impl eframe::App for PolledApp {
                         self.profiles_ui
                             .runtime_snapshot
                             .as_ref()
-                            .and_then(|s| s.wooting_keyboards.first())
-                            .map(|kb| {
-                                let txt = kb
-                                    .active_profile
-                                    .map(|i| format!("P{}", i + 1))
-                                    .unwrap_or_else(|| "OK".to_string());
-                                (txt, p.info)
-                            })
+                            .and_then(|s| s.keyboards.first())
+                            .and_then(|kb| kb.sidebar_badge())
+                            .map(|txt| (txt, p.info))
                     };
                     if nav_rail_item(
                         ui,
@@ -1194,7 +1192,7 @@ impl eframe::App for PolledApp {
                         .profiles_ui
                         .runtime_snapshot
                         .as_ref()
-                        .and_then(|s| s.wooting_keyboards.first())
+                        .and_then(|s| s.keyboards.first())
                     {
                         ui.add(
                             egui::Label::new(
@@ -1287,11 +1285,11 @@ impl eframe::App for PolledApp {
                         .map(|s| s.checks.as_slice())
                         .unwrap_or(&[]);
                     let win_ver = self.summary.as_ref().map(|s| s.windows_version.as_str());
-                    let wooting_kb = self
+                    let primary_kb = self
                         .profiles_ui
                         .runtime_snapshot
                         .as_ref()
-                        .and_then(|s| s.wooting_keyboards.first());
+                        .and_then(|s| s.keyboards.first());
                     if let Some(nav) = self.input_lab_ui.render(
                         ctx,
                         ui,
@@ -1300,7 +1298,7 @@ impl eframe::App for PolledApp {
                         detected_dpi,
                         health_checks,
                         win_ver,
-                        wooting_kb,
+                        primary_kb,
                     ) {
                         match nav {
                             InputLabNavAction::OpenHealthCheck => {
@@ -2292,7 +2290,7 @@ impl eframe::App for PolledApp {
                                 ui.end_row();
                                 render_hotkey_binding_row(
                                     ui,
-                                    "Cycle Wooting Profile",
+                                    "Cycle Keyboard Profile",
                                     "hk_wooting",
                                     &mut self.settings.hotkeys.cycle_wooting_profile,
                                     "K",

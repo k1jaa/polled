@@ -25,11 +25,12 @@ pub use checks::{
     UndoSummary,
 };
 pub use devices::{
-    detect_hardware_devices, detect_wooting_keyboards, hid_topology_fingerprint, ApplyOutcome,
-    BatteryStatus, Compx64Device, Compx64ProtocolDriver, CompxDevice, CompxProtocolDriver,
-    DeviceCapabilities, DeviceDriver, DeviceInfo, DryRunDevice, EndgameGearOp1Device,
-    EndgameGearOp1ProtocolDriver, FinalmouseDevice, FinalmouseProtocolDriver, Hidpp20Device,
-    Hidpp20ProtocolDriver, IncottDevice, IncottProtocolDriver, KeychronDevice,
+    detect_all_keyboards, detect_hardware_devices, detect_wooting_keyboards,
+    hid_topology_fingerprint, ApplyOutcome, BatteryStatus, Compx64Device, Compx64ProtocolDriver,
+    CompxDevice, CompxProtocolDriver, DeviceCapabilities, DeviceDriver, DeviceInfo, DryRunDevice,
+    EndgameGearOp1Device, EndgameGearOp1ProtocolDriver, FinalmouseDevice, FinalmouseProtocolDriver,
+    Hidpp20Device, Hidpp20ProtocolDriver, IncottDevice, IncottProtocolDriver, KeyboardBrand,
+    KeyboardCapabilities, KeyboardDevice, KeyboardProfileSlot, KeyboardStatus, KeychronDevice,
     KeychronProtocolDriver, LiftOffDistance, MchoseDevice, MchoseProtocolDriver, MouseDevice,
     MouseSettings, NinjutsoDevice, NinjutsoProtocolDriver, RazerDevice, RazerProtocolDriver,
     SafeDeviceController, SupportTier, VaxeeDevice, VaxeeProtocolDriver, WootingAkcSummary,

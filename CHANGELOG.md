@@ -16,6 +16,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Multi-Brand Keyboard Architecture & 9 New Open-Source Keyboard Backends (`devices/keyboards/*`, `keyboard_ui.rs`, `profile_runtime.rs`, `profiles_ui.rs`, `tray.rs`, `diagnostics/export.rs`, `polled-cli`):**
+  - Introduced a pluggable `KeyboardDevice` trait, `KeyboardStatus`, `KeyboardCapabilities`, and collision-safe ordered detection registry (`detect_all_keyboards()`) wrapping Wooting (`SupportTier::TestedOnHardware`) with zero regressions while opening Polled's Keyboard Hub, Profiles, Tray, Global Hotkey (`Cycle Keyboard Profile`), Rig Scorecard PNG v2 (`6. KEYBOARD`), and CLI (`polled --keyboards`) to 10 keyboard ecosystems.
+  - Added verified open-source backends (`SupportTier::ImplementedFromDocs`, confirm-gated + read-back verified, zero destructive opcodes) independently implemented from `OpenMouse-Project/keyboard-protocol` (AGPL-3.0-or-later) and `chcbaram/baram-qmk-8k`:
+    - **Wuque Studio / SparkLink HE** (`1ca6:1b10/1b0a/1b09`, `36b5:75d4/75d2` — BABAO60/80 HE, ZOOM TIGA HE): Config slots 1–4, polling rate (`250–8000 Hz`), Win/Mac mode, RT precision, sleep & shake optimization telemetry.
+    - **Keychron Hall Effect / TMR** (`3434:*`, 160+ Q/K/V/J/C HE & Lemokey PIDs, `KC_HE 0xA9 v1–v5`): profile names & slot switching, global actuation & Rapid Trigger (`setTravel` + `saveProfile`), DKS & Snap Tap counts.
+    - **SteelSeries Apex Pro TKL** (`1038:1628/1642/1630/1632`, `0xFFC0:0x0001`): firmware, 12.5 KB STM32 CRC-32 profile validation, live RAM hall actuation, Rapid Trigger & Rapid Tap (SOCD).
+    - **Razer Keyboards** (`1532:*`, 42 standalone keyboard PIDs — Huntsman V3 Pro / TKL / Mini / 8KHz, BlackWidow V4, DeathStalker V2): strict keyboard PID catalog (excludes mice), firmware, backlight, polling rate (`125–8000 Hz`), Huntsman V3 Rapid Trigger.
+    - **Arbiter Studio** (`1a81:*`, `371c:*` — Polar 65 / 65+ / 65 PRO / 75 PRO, Nimbus 65): firmware, actuation & RT travel table, PRO onboard profiles, SuperTap (SOCD).
+    - **Logitech HID++ 2.0 Keyboards** (`046d:*` — PRO X TKL RAPID, PRO X 60, G915 X, G715, G515 wired/LIGHTSPEED): strict keyboard PID catalog + receiver pairing verification, firmware, unified battery (`0x1004`), extended polling rate (`0x8061`), backlight, and `0x1B08` analog switches (Rapid Trigger & Key Priority / Snap Tap).
+    - **Kochi Hummingbird 68** (`1ca2:0901`, `0xFFA0:0x0001`): verified `KOCHI68` identity + Windows/macOS mode toggle.
+    - **Geonworks Venom 8K** (`0483:5204/5205/5206/5207/520b` — VENOM-60MX/80MX/WISH45-8K): `baram-qmk-8k` `0xB0` firmware, matrix, USB SOF heartbeat & error counters, plus VIA channel 13 Gaming/Typing debounce (`5–40 ms`).
+    - **Universal QMK / VIA** (`0xFF60:0x61`, unclaimed boards): read-only VIA protocol version, layer count, firmware/keycodes rev, board uptime, macro slots & buffer size.
+
+---
+
 ## [0.13.0] - 2026-11-26
 
 ### Added

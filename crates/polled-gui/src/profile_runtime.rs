@@ -16,12 +16,13 @@ use polled_core::win::{
     AudioFlow, DisplayModeInfo, DisplayResolutionMode, RegHive, SystemEnv, WindowsEnv,
 };
 use polled_core::{
-    detect_hardware_devices, detect_wooting_keyboards, duck_app_audio_sessions,
-    hid_topology_fingerprint, match_profile, normalize_exe_name, restore_app_audio_sessions,
-    AppPaths, ApplyOutcome, BatteryStatus, DeviceCapabilities, DeviceInfo, DryRunDevice,
-    FocusDebouncer, FocusEvent, ForegroundWatcher, GameProfile, MouseSettings, PolledError,
-    ProfileStore, SafeDeviceController, SavedAppAudioVolume, Severity, SupportTier,
-    TrayAlertConfig, WootingAnalogBasePatch, WootingGlobalSettingsPatch, WootingKeyboardInfo,
+    detect_all_keyboards, detect_hardware_devices, detect_wooting_keyboards,
+    duck_app_audio_sessions, hid_topology_fingerprint, match_profile, normalize_exe_name,
+    restore_app_audio_sessions, AppPaths, ApplyOutcome, BatteryStatus, DeviceCapabilities,
+    DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent, ForegroundWatcher, GameProfile,
+    KeyboardStatus, MouseSettings, PolledError, ProfileStore, SafeDeviceController,
+    SavedAppAudioVolume, Severity, SupportTier, TrayAlertConfig, WootingAnalogBasePatch,
+    WootingGlobalSettingsPatch,
 };
 
 use crate::app::WorkerMsg;
@@ -78,8 +79,9 @@ pub struct ProfileRuntimeSnapshot {
     pub selection: BackendSelection,
     pub detected_hardware: Vec<DeviceInfo>,
     pub active_devices: Vec<ConnectedDeviceStatus>,
-    /// Connected Wooting keyboards and their full verified live telemetry snapshot.
-    pub wooting_keyboards: Vec<WootingKeyboardInfo>,
+    /// Connected supported keyboards (Wooting, Wuque/SparkLink, Keychron HE, SteelSeries, Razer,
+    /// Arbiter, Logitech, Kochi, Geonworks Venom, QMK/VIA) and their live telemetry snapshots.
+    pub keyboards: Vec<KeyboardStatus>,
     pub any_flash_only: bool,
     pub flash_warning: Option<String>,
     pub foreground_exe: Option<String>,
@@ -137,6 +139,33 @@ pub enum ProfileRuntimeCmd {
     WriteWootingGlobalSettings {
         device_id: Option<String>,
         patch: WootingGlobalSettingsPatch,
+    },
+    SetKeyboardPollingRate {
+        device_id: Option<String>,
+        hz: u16,
+    },
+    SetKeyboardBaseActuation {
+        device_id: Option<String>,
+        actuation_mm: f32,
+        rt_enabled: Option<bool>,
+        rt_mm: Option<f32>,
+    },
+    SetKeyboardRapidTrigger {
+        device_id: Option<String>,
+        enabled: bool,
+    },
+    SetKeyboardSystemMode {
+        device_id: Option<String>,
+        mac_mode: bool,
+    },
+    SetKeyboardSocd {
+        device_id: Option<String>,
+        enabled: bool,
+    },
+    SetKeyboardDebounce {
+        device_id: Option<String>,
+        typing_mode: bool,
+        debounce_ms: u8,
     },
     ReadFromMouseForEditor(Option<String>),
     UpdateAlertConfig(TrayAlertConfig),
@@ -260,7 +289,7 @@ struct RuntimeState {
     selection: BackendSelection,
     detected_hardware_info: Vec<DeviceInfo>,
     controllers: Vec<ManagedController>,
-    wooting_keyboards: Vec<WootingKeyboardInfo>,
+    keyboards: Vec<KeyboardStatus>,
     last_topology: Vec<(u16, u16, u16, u16)>,
     last_topology_check: Instant,
     pending_hotplug_at: Option<Instant>,
@@ -354,7 +383,7 @@ impl RuntimeState {
             selection: self.selection.clone(),
             detected_hardware: self.detected_hardware_info.clone(),
             active_devices,
-            wooting_keyboards: self.wooting_keyboards.clone(),
+            keyboards: self.keyboards.clone(),
             any_flash_only,
             flash_warning,
             foreground_exe: self.foreground_exe.clone(),
@@ -408,18 +437,18 @@ impl RuntimeState {
         self.focus_rx = None;
     }
 
-    fn refresh_wooting_keyboards(&mut self) {
-        self.wooting_keyboards = detect_wooting_keyboards()
+    fn refresh_keyboards(&mut self) {
+        self.keyboards = detect_all_keyboards()
             .unwrap_or_default()
             .into_iter()
-            .map(|kb| kb.read_full_status())
+            .map(|kb| kb.read_status())
             .collect();
     }
 
     fn rebuild_controllers(&mut self, selection: BackendSelection, reason: &str) {
         let mut hardware = detect_hardware_devices().unwrap_or_default();
         self.detected_hardware_info = hardware.iter().map(|d| d.info()).collect();
-        self.refresh_wooting_keyboards();
+        self.refresh_keyboards();
         self.last_topology = hid_topology_fingerprint();
         self.last_topology_check = Instant::now();
 
@@ -1368,47 +1397,54 @@ impl RuntimeState {
             }
         }
 
-        // --- Wooting Keyboard Volatile Profile Switching (0..=7, zero flash wear) ---
+        // --- Keyboard Onboard Profile Switching (Wooting RAM-only, Wuque, Keychron HE, Arbiter PRO) ---
         if let Some(slot) = profile.wooting_profile {
-            match detect_wooting_keyboards() {
+            match detect_all_keyboards() {
                 Ok(boards) if !boards.is_empty() => {
                     let mut updated_infos = Vec::with_capacity(boards.len());
                     for kb in boards {
+                        let before = kb.read_status();
+                        if !before.capabilities.supports_profile_switch {
+                            updated_infos.push(before);
+                            continue;
+                        }
                         let kb_name = kb.name().to_string();
                         match kb.switch_profile(slot) {
                             Ok(true) => {
-                                let full = kb.read_full_status();
+                                let full = kb.read_status();
+                                let mode_note = if full.capabilities.profile_switch_volatile {
+                                    "volatile RAM"
+                                } else {
+                                    "onboard slot"
+                                };
                                 self.push_log(
                                     Severity::Ok,
                                     format!(
-                                        "[{kb_name}] Switched to {} ({reason}, volatile RAM).",
+                                        "[{kb_name}] Switched to {} ({reason}, {mode_note}).",
                                         full.profile_display_name(slot)
                                     ),
                                 );
                                 updated_infos.push(full);
                             }
                             Ok(false) => {
-                                updated_infos.push(kb.read_full_status());
+                                updated_infos.push(kb.read_status());
                             }
                             Err(err) => {
                                 self.push_log(
                                     Severity::Warn,
-                                    format!("[{kb_name}] Wooting switch failed: {err}"),
+                                    format!("[{kb_name}] Keyboard profile switch failed: {err}"),
                                 );
-                                updated_infos.push(kb.read_full_status());
+                                updated_infos.push(kb.read_status());
                             }
                         }
                     }
-                    self.wooting_keyboards = updated_infos;
+                    self.keyboards = updated_infos;
                 }
                 Ok(_) => {
-                    self.wooting_keyboards.clear();
+                    self.keyboards.clear();
                 }
                 Err(err) => {
-                    self.push_log(
-                        Severity::Warn,
-                        format!("Wooting keyboard detection failed: {err}"),
-                    );
+                    self.push_log(Severity::Warn, format!("Keyboard detection failed: {err}"));
                 }
             }
         }
@@ -1671,6 +1707,65 @@ fn upsert_gpu_preference_high_perf(existing: Option<&str>) -> String {
     format!("{};", tokens.join(";"))
 }
 
+fn run_generic_keyboard_action<F>(
+    state: &mut RuntimeState,
+    ui_tx: &Sender<WorkerMsg>,
+    device_id: Option<&str>,
+    action: F,
+) where
+    F: Fn(&dyn polled_core::KeyboardDevice) -> polled_core::Result<String>,
+{
+    match detect_all_keyboards() {
+        Ok(boards) if !boards.is_empty() => {
+            let mut updated = Vec::with_capacity(boards.len());
+            let mut any_ok = false;
+            let mut messages = Vec::new();
+            for kb in boards {
+                let target = device_id.is_none_or(|wanted| kb.id() == wanted);
+                if target {
+                    match action(kb.as_ref()) {
+                        Ok(msg) => {
+                            state.push_log(Severity::Ok, msg.clone());
+                            messages.push(msg);
+                            any_ok = true;
+                        }
+                        Err(err) => {
+                            let msg = format!("[{}] Keyboard update failed: {err}", kb.name());
+                            state.push_log(Severity::Warn, msg.clone());
+                            messages.push(msg);
+                        }
+                    }
+                }
+                updated.push(kb.read_status());
+            }
+            state.keyboards = updated;
+            let _ = ui_tx.send(WorkerMsg::WootingActionResult {
+                ok: any_ok,
+                message: if messages.is_empty() {
+                    "Target keyboard was not found.".to_string()
+                } else {
+                    messages.join(" ")
+                },
+            });
+        }
+        Ok(_) => {
+            state.keyboards.clear();
+            let _ = ui_tx.send(WorkerMsg::WootingActionResult {
+                ok: false,
+                message: "No supported keyboard detected.".to_string(),
+            });
+        }
+        Err(err) => {
+            let msg = format!("Keyboard detection failed: {err}");
+            state.push_log(Severity::Warn, msg.clone());
+            let _ = ui_tx.send(WorkerMsg::WootingActionResult {
+                ok: false,
+                message: msg,
+            });
+        }
+    }
+}
+
 fn run_runtime_loop(
     initial_store: ProfileStore,
     initial_auto_switch: bool,
@@ -1695,7 +1790,7 @@ fn run_runtime_loop(
         selection: BackendSelection::AutoConnected,
         detected_hardware_info: Vec::new(),
         controllers: Vec::new(),
-        wooting_keyboards: Vec::new(),
+        keyboards: Vec::new(),
         last_topology: Vec::new(),
         last_topology_check: Instant::now(),
         pending_hotplug_at: None,
@@ -1955,13 +2050,14 @@ fn run_runtime_loop(
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::RefreshWooting) => {
-                state.refresh_wooting_keyboards();
-                let count = state.wooting_keyboards.len();
+                state.refresh_keyboards();
+                let count = state.keyboards.len();
                 let msg = if count == 0 {
-                    "No Wooting keyboards detected (close Wootility if open).".to_string()
+                    "No supported keyboards detected (close vendor web/desktop apps if open)."
+                        .to_string()
                 } else {
                     format!(
-                        "Refreshed {count} Wooting keyboard{}.",
+                        "Refreshed {count} supported keyboard{}.",
                         if count == 1 { "" } else { "s" }
                     )
                 };
@@ -1973,27 +2069,25 @@ fn run_runtime_loop(
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::CycleWootingProfile) => {
-                match detect_wooting_keyboards() {
+                match detect_all_keyboards() {
                     Ok(boards) if !boards.is_empty() => {
                         let mut updated = Vec::with_capacity(boards.len());
                         let mut osd_sub: Option<String> = None;
                         let mut any_ok = false;
                         let mut messages = Vec::new();
                         for kb in boards {
-                            let before = kb.read_full_status();
+                            let before = kb.read_status();
                             let slots: Vec<u8> = before.profiles.iter().map(|p| p.index).collect();
-                            if slots.len() >= 2 {
+                            if before.capabilities.supports_profile_switch && slots.len() >= 2 {
                                 let cur = before.active_profile.unwrap_or(slots[0]);
                                 let pos = slots.iter().position(|&s| s == cur).unwrap_or(0);
                                 let next_slot = slots[(pos + 1) % slots.len()];
                                 let kb_name = kb.name().to_string();
                                 match kb.switch_profile(next_slot) {
                                     Ok(_) => {
-                                        let full = kb.read_full_status();
+                                        let full = kb.read_status();
                                         let lbl = full.profile_display_name(next_slot);
-                                        let msg = format!(
-                                            "[{kb_name}] Cycled to {lbl} (hotkey, volatile RAM)."
-                                        );
+                                        let msg = format!("[{kb_name}] Cycled to {lbl} (hotkey).");
                                         state.push_log(Severity::Ok, msg.clone());
                                         messages.push(msg);
                                         osd_sub = Some(format!("{kb_name} -> {lbl}"));
@@ -2002,7 +2096,7 @@ fn run_runtime_loop(
                                     }
                                     Err(err) => {
                                         let msg =
-                                            format!("[{kb_name}] Wooting cycle failed: {err}");
+                                            format!("[{kb_name}] Keyboard cycle failed: {err}");
                                         state.push_log(Severity::Warn, msg.clone());
                                         messages.push(msg);
                                         updated.push(before);
@@ -2012,11 +2106,11 @@ fn run_runtime_loop(
                                 updated.push(before);
                             }
                         }
-                        state.wooting_keyboards = updated;
+                        state.keyboards = updated;
                         if let Some(sub) = osd_sub {
                             if state.alerts.osd_pill_enabled {
                                 let _ = ui_tx.send(WorkerMsg::ShowOsdPill {
-                                    title: "Polled · Wooting Keyboard".to_string(),
+                                    title: "Polled · Keyboard".to_string(),
                                     subtitle: sub,
                                 });
                             }
@@ -2029,19 +2123,19 @@ fn run_runtime_loop(
                         }
                     }
                     Ok(_) => {
-                        state.wooting_keyboards.clear();
+                        state.keyboards.clear();
                     }
                     Err(err) => {
                         state.push_log(
                             Severity::Warn,
-                            format!("Wooting detection failed on hotkey cycle: {err}"),
+                            format!("Keyboard detection failed on hotkey cycle: {err}"),
                         );
                     }
                 }
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::SwitchWootingProfile { device_id, slot }) => {
-                match detect_wooting_keyboards() {
+                match detect_all_keyboards() {
                     Ok(boards) if !boards.is_empty() => {
                         let mut updated = Vec::with_capacity(boards.len());
                         let mut any_ok = false;
@@ -2054,12 +2148,15 @@ fn run_runtime_loop(
                                 let kb_name = kb.name().to_string();
                                 match kb.switch_profile(slot) {
                                     Ok(switched) => {
-                                        let full = kb.read_full_status();
+                                        let full = kb.read_status();
                                         let slot_name = full.profile_display_name(slot);
+                                        let note = if full.capabilities.profile_switch_volatile {
+                                            "volatile RAM, zero flash wear"
+                                        } else {
+                                            "verified read-back"
+                                        };
                                         let msg = if switched {
-                                            format!(
-                                                "[{kb_name}] Switched to {slot_name} (volatile RAM, zero flash wear)."
-                                            )
+                                            format!("[{kb_name}] Switched to {slot_name} ({note}).")
                                         } else {
                                             format!("[{kb_name}] Already on {slot_name}.")
                                         };
@@ -2075,18 +2172,18 @@ fn run_runtime_loop(
                                         let msg = format!("[{kb_name}] Switch failed: {err}");
                                         state.push_log(Severity::Warn, msg.clone());
                                         messages.push(msg);
-                                        updated.push(kb.read_full_status());
+                                        updated.push(kb.read_status());
                                     }
                                 }
                             } else {
-                                updated.push(kb.read_full_status());
+                                updated.push(kb.read_status());
                             }
                         }
-                        state.wooting_keyboards = updated;
+                        state.keyboards = updated;
                         if let Some(sub) = osd_sub {
                             if state.alerts.osd_pill_enabled {
                                 let _ = ui_tx.send(WorkerMsg::ShowOsdPill {
-                                    title: "Polled · Wooting Keyboard".to_string(),
+                                    title: "Polled · Keyboard".to_string(),
                                     subtitle: sub,
                                 });
                             }
@@ -2094,21 +2191,21 @@ fn run_runtime_loop(
                         let _ = ui_tx.send(WorkerMsg::WootingActionResult {
                             ok: any_ok,
                             message: if messages.is_empty() {
-                                "Target Wooting keyboard was not found.".to_string()
+                                "Target keyboard was not found.".to_string()
                             } else {
                                 messages.join(" ")
                             },
                         });
                     }
                     Ok(_) => {
-                        state.wooting_keyboards.clear();
+                        state.keyboards.clear();
                         let _ = ui_tx.send(WorkerMsg::WootingActionResult {
                             ok: false,
-                            message: "No Wooting keyboard detected.".to_string(),
+                            message: "No supported keyboard detected.".to_string(),
                         });
                     }
                     Err(err) => {
-                        let msg = format!("Wooting detection failed: {err}");
+                        let msg = format!("Keyboard detection failed: {err}");
                         state.push_log(Severity::Warn, msg.clone());
                         let _ = ui_tx.send(WorkerMsg::WootingActionResult {
                             ok: false,
@@ -2121,7 +2218,6 @@ fn run_runtime_loop(
             Ok(ProfileRuntimeCmd::WriteWootingAnalogBase { device_id, patch }) => {
                 match detect_wooting_keyboards() {
                     Ok(boards) if !boards.is_empty() => {
-                        let mut updated = Vec::with_capacity(boards.len());
                         let mut any_ok = false;
                         let mut messages = Vec::new();
                         for kb in boards {
@@ -2142,20 +2238,16 @@ fn run_runtime_loop(
                                         state.push_log(Severity::Ok, msg.clone());
                                         messages.push(msg);
                                         any_ok = true;
-                                        updated.push(full);
                                     }
                                     Err(err) => {
                                         let msg = format!("[{kb_name}] Analog save failed: {err}");
                                         state.push_log(Severity::Warn, msg.clone());
                                         messages.push(msg);
-                                        updated.push(kb.read_full_status());
                                     }
                                 }
-                            } else {
-                                updated.push(kb.read_full_status());
                             }
                         }
-                        state.wooting_keyboards = updated;
+                        state.refresh_keyboards();
                         let _ = ui_tx.send(WorkerMsg::WootingActionResult {
                             ok: any_ok,
                             message: if messages.is_empty() {
@@ -2166,7 +2258,7 @@ fn run_runtime_loop(
                         });
                     }
                     Ok(_) => {
-                        state.wooting_keyboards.clear();
+                        state.refresh_keyboards();
                         let _ = ui_tx.send(WorkerMsg::WootingActionResult {
                             ok: false,
                             message: "No Wooting keyboard detected.".to_string(),
@@ -2186,7 +2278,6 @@ fn run_runtime_loop(
             Ok(ProfileRuntimeCmd::WriteWootingPerKeyActuation { device_id, updates }) => {
                 match detect_wooting_keyboards() {
                     Ok(boards) if !boards.is_empty() => {
-                        let mut updated = Vec::with_capacity(boards.len());
                         let mut any_ok = false;
                         let mut messages = Vec::new();
                         for kb in boards {
@@ -2209,7 +2300,6 @@ fn run_runtime_loop(
                                         state.push_log(Severity::Ok, msg.clone());
                                         messages.push(msg);
                                         any_ok = true;
-                                        updated.push(full);
                                     }
                                     Err(err) => {
                                         let msg = format!(
@@ -2217,14 +2307,11 @@ fn run_runtime_loop(
                                         );
                                         state.push_log(Severity::Warn, msg.clone());
                                         messages.push(msg);
-                                        updated.push(kb.read_full_status());
                                     }
                                 }
-                            } else {
-                                updated.push(kb.read_full_status());
                             }
                         }
-                        state.wooting_keyboards = updated;
+                        state.refresh_keyboards();
                         let _ = ui_tx.send(WorkerMsg::WootingActionResult {
                             ok: any_ok,
                             message: if messages.is_empty() {
@@ -2235,7 +2322,7 @@ fn run_runtime_loop(
                         });
                     }
                     Ok(_) => {
-                        state.wooting_keyboards.clear();
+                        state.refresh_keyboards();
                         let _ = ui_tx.send(WorkerMsg::WootingActionResult {
                             ok: false,
                             message: "No Wooting keyboard detected.".to_string(),
@@ -2255,7 +2342,6 @@ fn run_runtime_loop(
             Ok(ProfileRuntimeCmd::WriteWootingGlobalSettings { device_id, patch }) => {
                 match detect_wooting_keyboards() {
                     Ok(boards) if !boards.is_empty() => {
-                        let mut updated = Vec::with_capacity(boards.len());
                         let mut any_ok = false;
                         let mut messages = Vec::new();
                         for kb in boards {
@@ -2265,14 +2351,12 @@ fn run_runtime_loop(
                                 let kb_name = kb.name().to_string();
                                 match kb.write_global_settings(&patch) {
                                     Ok(()) => {
-                                        let full = kb.read_full_status();
                                         let msg = format!(
                                             "[{kb_name}] Applied Global Settings (read-back verified)."
                                         );
                                         state.push_log(Severity::Ok, msg.clone());
                                         messages.push(msg);
                                         any_ok = true;
-                                        updated.push(full);
                                     }
                                     Err(err) => {
                                         let msg = format!(
@@ -2280,14 +2364,11 @@ fn run_runtime_loop(
                                         );
                                         state.push_log(Severity::Warn, msg.clone());
                                         messages.push(msg);
-                                        updated.push(kb.read_full_status());
                                     }
                                 }
-                            } else {
-                                updated.push(kb.read_full_status());
                             }
                         }
-                        state.wooting_keyboards = updated;
+                        state.refresh_keyboards();
                         let _ = ui_tx.send(WorkerMsg::WootingActionResult {
                             ok: any_ok,
                             message: if messages.is_empty() {
@@ -2298,7 +2379,7 @@ fn run_runtime_loop(
                         });
                     }
                     Ok(_) => {
-                        state.wooting_keyboards.clear();
+                        state.refresh_keyboards();
                         let _ = ui_tx.send(WorkerMsg::WootingActionResult {
                             ok: false,
                             message: "No Wooting keyboard detected.".to_string(),
@@ -2313,6 +2394,82 @@ fn run_runtime_loop(
                         });
                     }
                 }
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::SetKeyboardPollingRate { device_id, hz }) => {
+                run_generic_keyboard_action(&mut state, &ui_tx, device_id.as_deref(), |kb| {
+                    let confirmed = kb.set_polling_rate(hz)?;
+                    Ok(format!(
+                        "[{}] Polling rate -> {confirmed} Hz (read-back verified).",
+                        kb.name()
+                    ))
+                });
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::SetKeyboardBaseActuation {
+                device_id,
+                actuation_mm,
+                rt_enabled,
+                rt_mm,
+            }) => {
+                run_generic_keyboard_action(&mut state, &ui_tx, device_id.as_deref(), |kb| {
+                    kb.set_base_actuation(actuation_mm, rt_enabled, rt_mm)?;
+                    Ok(format!(
+                        "[{}] Saved actuation {:.2} mm (read-back verified).",
+                        kb.name(),
+                        actuation_mm
+                    ))
+                });
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::SetKeyboardRapidTrigger { device_id, enabled }) => {
+                run_generic_keyboard_action(&mut state, &ui_tx, device_id.as_deref(), |kb| {
+                    let confirmed = kb.set_rapid_trigger_enabled(enabled)?;
+                    Ok(format!(
+                        "[{}] Rapid Trigger -> {} (read-back verified).",
+                        kb.name(),
+                        if confirmed { "ON" } else { "OFF" }
+                    ))
+                });
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::SetKeyboardSystemMode {
+                device_id,
+                mac_mode,
+            }) => {
+                run_generic_keyboard_action(&mut state, &ui_tx, device_id.as_deref(), |kb| {
+                    let mode = kb.set_system_mode(mac_mode)?;
+                    Ok(format!(
+                        "[{}] System mode -> {mode} (read-back verified).",
+                        kb.name()
+                    ))
+                });
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::SetKeyboardSocd { device_id, enabled }) => {
+                run_generic_keyboard_action(&mut state, &ui_tx, device_id.as_deref(), |kb| {
+                    let confirmed = kb.set_socd(enabled)?;
+                    Ok(format!(
+                        "[{}] SOCD / Key Priority -> {} (read-back verified).",
+                        kb.name(),
+                        if confirmed { "ON" } else { "OFF" }
+                    ))
+                });
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::SetKeyboardDebounce {
+                device_id,
+                typing_mode,
+                debounce_ms,
+            }) => {
+                run_generic_keyboard_action(&mut state, &ui_tx, device_id.as_deref(), |kb| {
+                    kb.set_debounce_mode(typing_mode, debounce_ms)?;
+                    Ok(format!(
+                        "[{}] Debounce -> {} · {debounce_ms} ms (read-back verified).",
+                        kb.name(),
+                        if typing_mode { "Typing" } else { "Gaming" }
+                    ))
+                });
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::ReadFromMouseForEditor(dev_id)) => {
