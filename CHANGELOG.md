@@ -16,6 +16,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Dedicated `Keyboard` Tab & `Profiles → Keyboard` Sub-Tab (`keyboard_ui.rs`, `app.rs`, `profiles_ui.rs`):**
+  - Promoted Wooting keyboard management into its own top-level **Keyboard** workspace in the left rail (with live `P#` / `LIVE` badge and `RIG STATUS` summary) plus a dedicated **Keyboard** sub-tab inside the Profile Editor showing real firmware profile names instead of generic `Profile 1–4`.
+- **Deep Open-Source-Verified Wooting ARM & Standard HID Protocol (`devices/wooting.rs`, `profile_runtime.rs`, `polled-cli`):**
+  - Audited directly from `OpenMouse-Project/keyboard-protocol` (`AGPL-3.0-or-later`) and `clemenscodes/wootswitch` (`MIT`): fixed ARM (`0xFF55`, report ID `0x01`, magic `0xD1 0xDA`, slot byte 4, runtime slot `data[2]`) vs Standard (`0x1337`, report ID `0x00`, magic `0xD0 0xDA`, slot byte 7, runtime slot `data[0]`) framing, added `WootDevInit (0x21)` + `100 ms` settle delays, quiet drain, and command-echo matching across all 13 Wooting base PIDs (including 60HE+, 60HE v2, 80HE, Two HE, UwU, One, Two).
+  - Grabs firmware version (`0x01`), physical layout (`0x13`), real onboard custom profile names (`0x37`, up to 8 slots), active profile base actuation mm / Rapid Trigger / RT sensitivity / Tachyon / tick rate (`0x27`), per-key actuation overrides (`0x31`), per-key Rapid Trigger groups (`0x3D`), Advanced Keys / AKC (`0x34` — SOCD pairs & mode, Rappy Snappy, DKS, Mod Tap, Toggle Key), Global Device Settings (`0x33`), RGB Core brightness & effect layers (`0x32`), and hardware/flash stats (`0x10`/`0x04`/`0x0A`/`0x38`/`0x3A`).
+  - Added an opt-in **Live Analog Key-Travel Visualizer (`0xFF53`/`0xFF54`)** rendering real-time `0.00–4.00 mm` depth bars with an active actuation threshold marker (0% CPU when stopped, auto-stops on minimize-to-tray, zero keystrokes stored).
+  - Added confirm-gated, field-preserving protobuf ARM writes for Base Analog (`OUT 0x11` verified via `0x27`) and Global Settings (`OUT 0x17` verified via `0x33`), plus upgraded CLI `polled --wooting` (text & `--json`) to dump the full telemetry snapshot.
+
+---
+
 ## [0.12.0] - 2026-11-25
 
 ### Added

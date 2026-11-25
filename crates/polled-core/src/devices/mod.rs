@@ -38,7 +38,11 @@ pub use ninjutso::{NinjutsoDevice, NinjutsoProtocolDriver};
 pub use razer::{RazerDevice, RazerProtocolDriver};
 pub use vaxee::{VaxeeDevice, VaxeeProtocolDriver};
 pub use wooting::{
-    detect_wooting_keyboards, WootingDevice, WootingKeyboardInfo, WOOTING_MAX_PROFILE_INDEX,
+    detect_wooting_keyboards, WootingAkcSummary, WootingAnalogBasePatch, WootingAnalogKeyReading,
+    WootingAnalogProfile, WootingAnalogStream, WootingDevice, WootingDiagnostics,
+    WootingGlobalSettings, WootingGlobalSettingsPatch, WootingKeyActuationOverride,
+    WootingKeyboardInfo, WootingProfileSlot, WootingProtocol, WootingRapidTriggerGroupInfo,
+    WootingRgbSummary, WOOTING_MAX_PROFILE_INDEX,
 };
 
 /// Explicitly communicates how a device backend was verified (surfaced in UI and README).

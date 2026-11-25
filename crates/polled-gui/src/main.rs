@@ -11,6 +11,7 @@ mod hotkeys;
 mod hotplug;
 mod icon;
 mod input_lab_ui;
+mod keyboard_ui;
 mod notifications;
 mod osd;
 mod profile_runtime;

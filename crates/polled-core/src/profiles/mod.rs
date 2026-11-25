@@ -134,7 +134,7 @@ pub struct GameProfile {
     /// Optional temporary display refresh rate override in Hz (e.g. `240`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_refresh_hz: Option<u32>,
-    /// Optional Wooting keyboard onboard profile slot (`0..=3`, displayed as Profile 1–4; zero flash wear).
+    /// Optional Wooting keyboard onboard profile slot (`0..=7`, displayed as Profile 1–8; zero flash wear).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wooting_profile: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -259,7 +259,9 @@ impl GameProfile {
             self.display_height = None;
             self.display_refresh_hz = None;
         }
-        self.wooting_profile = self.wooting_profile.map(|idx| idx.min(3));
+        self.wooting_profile = self
+            .wooting_profile
+            .map(|idx| idx.min(crate::devices::WOOTING_MAX_PROFILE_INDEX));
         self
     }
 }

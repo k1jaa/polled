@@ -12,3 +12,4 @@ Thumbs.db
 # Local test & release artifacts
 *.log
 /release-stage/
+/dist/

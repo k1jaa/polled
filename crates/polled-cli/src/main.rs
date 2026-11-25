@@ -163,10 +163,7 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
 
     if cli.wooting {
         let boards = detect_wooting_keyboards()?;
-        let infos: Vec<WootingKeyboardInfo> = boards
-            .iter()
-            .map(|b| b.info(b.read_active_profile().ok()))
-            .collect();
+        let infos: Vec<WootingKeyboardInfo> = boards.iter().map(|b| b.read_full_status()).collect();
         if cli.json {
             println!("{}", serde_json::to_string_pretty(&infos)?);
         } else if infos.is_empty() {
@@ -174,11 +171,93 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
             println!("Close Wootility if open and run `polled --dump --vid 31e3` to inspect HID interfaces.");
         } else {
             for kb in &infos {
-                let slot = kb
+                let fw = kb.firmware_version.as_deref().unwrap_or("unknown");
+                let layout = kb.layout.as_deref().unwrap_or("unknown");
+                println!(
+                    "{} ({}) [{} · {} · fw v{} · {}]",
+                    kb.name, kb.vid_pid, kb.chip_type, kb.switch_tech, fw, layout
+                );
+                let active_label = kb
                     .active_profile
-                    .map(WootingKeyboardInfo::profile_label)
-                    .unwrap_or("Unknown");
-                println!("{} ({}) — Active: {}", kb.name, kb.vid_pid, slot);
+                    .map(|idx| kb.profile_display_name(idx))
+                    .unwrap_or_else(|| "Unknown".to_string());
+                println!("  Active:     {active_label}");
+                if !kb.profiles.is_empty() {
+                    let list: Vec<String> = kb
+                        .profiles
+                        .iter()
+                        .map(|p| {
+                            if p.is_active {
+                                format!("*P{}:{}", p.index + 1, p.name)
+                            } else {
+                                format!("P{}:{}", p.index + 1, p.name)
+                            }
+                        })
+                        .collect();
+                    println!("  Profiles:   {}", list.join("  "));
+                }
+                if let Some(ap) = &kb.analog_profile {
+                    let act = ap
+                        .actuation_mm
+                        .map(|m| format!("{m:.2} mm"))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let rt = match (ap.rapid_trigger_enabled, ap.rapid_trigger_sensitivity_mm) {
+                        (Some(true), Some(s)) => format!("ON ({s:.2} mm)"),
+                        (Some(true), None) => "ON".to_string(),
+                        (Some(false), _) => "OFF".to_string(),
+                        _ => "n/a".to_string(),
+                    };
+                    let tach = match ap.tachyon_enabled {
+                        Some(true) => "ON",
+                        Some(false) => "OFF",
+                        None => "n/a",
+                    };
+                    println!("  Analog:     Actuation {act} | Rapid Trigger {rt} | Tachyon {tach}");
+                }
+                if !kb.per_key_actuation.is_empty() || !kb.per_key_rapid_trigger.is_empty() {
+                    println!(
+                        "  Overrides:  {} per-key actuation · {} per-key RT group(s)",
+                        kb.per_key_actuation.len(),
+                        kb.per_key_rapid_trigger.len()
+                    );
+                }
+                if !kb.advanced_keys.is_empty() {
+                    let items: Vec<String> = kb
+                        .advanced_keys
+                        .iter()
+                        .map(|a| format!("{}: {}", a.kind, a.detail))
+                        .collect();
+                    println!("  AKC:        {}", items.join(" | "));
+                }
+                if let Some(rgb) = &kb.rgb {
+                    let b = rgb
+                        .brightness_pct
+                        .map(|v| format!("{v}%"))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let eff = if rgb.effect_layers.is_empty() {
+                        "Static".to_string()
+                    } else {
+                        rgb.effect_layers.join(" + ")
+                    };
+                    println!("  RGB Core:   Brightness {b} | Layers: {eff}");
+                }
+                if let Some(gs) = &kb.global_settings {
+                    let dim = gs
+                        .rgb_dim_minutes
+                        .map(|m| format!("{m}m"))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let off = gs
+                        .rgb_off_minutes
+                        .map(|m| format!("{m}m"))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let db = match gs.debounce_filter {
+                        Some(true) => "ON",
+                        Some(false) => "OFF",
+                        None => "n/a",
+                    };
+                    println!("  Global:     Debounce {db} | RGB Dim {dim} / Off {off}");
+                }
+                println!();
             }
         }
         return Ok(ExitCode::SUCCESS);
@@ -552,19 +631,17 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
                 }
                 Ok(boards) => {
                     for kb in boards {
-                        let info = kb.info(None);
+                        let name = kb.name().to_string();
                         match kb.switch_profile(slot) {
                             Ok(true) => actions.push(format!(
-                                "{} -> {}",
-                                info.name,
+                                "{name} -> {}",
                                 WootingKeyboardInfo::profile_label(slot)
                             )),
                             Ok(false) => actions.push(format!(
-                                "{} already on {}",
-                                info.name,
+                                "{name} already on {}",
                                 WootingKeyboardInfo::profile_label(slot)
                             )),
-                            Err(e) => warnings.push(format!("{} failed: {e}", info.name)),
+                            Err(e) => warnings.push(format!("{name} failed: {e}")),
                         }
                     }
                 }

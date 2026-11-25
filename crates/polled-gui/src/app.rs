@@ -21,6 +21,7 @@ use polled_core::{
 use crate::elevation::{run_elevated_cli, ElevatedAction};
 use crate::hotkeys::{HotkeyAction, HotkeyManager};
 use crate::input_lab_ui::{InputLabNavAction, InputLabUiState};
+use crate::keyboard_ui::KeyboardUiState;
 use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
 use crate::osd::OsdController;
 use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
@@ -33,6 +34,7 @@ use crate::tray::{find_own_main_hwnd, TrayController, TrayMouseState};
 enum ActiveView {
     HealthCheck,
     Profiles,
+    Keyboard,
     InputLab,
 }
 
@@ -251,6 +253,10 @@ pub(crate) enum WorkerMsg {
         title: String,
         subtitle: String,
     },
+    WootingActionResult {
+        ok: bool,
+        message: String,
+    },
     UpdateCheckFinished(Result<UpdateCheckResult, String>),
 }
 
@@ -282,6 +288,7 @@ pub struct PolledApp {
 
     profiles_ui: ProfilesUiState,
     profile_runtime: ProfileRuntimeHandle,
+    keyboard_ui: KeyboardUiState,
     input_lab_ui: InputLabUiState,
     hotkey_manager: HotkeyManager,
     osd: OsdController,
@@ -367,6 +374,7 @@ impl PolledApp {
             custom_tweak_draft: CustomTweakDraft::default(),
             profiles_ui,
             profile_runtime,
+            keyboard_ui: KeyboardUiState::new(),
             input_lab_ui: InputLabUiState::new(),
             hotkey_manager,
             osd: OsdController::start(),
@@ -807,6 +815,9 @@ impl PolledApp {
                     self.osd
                         .show(title, subtitle, matches!(self.theme, ThemeMode::Dark));
                 }
+                WorkerMsg::WootingActionResult { ok, message } => {
+                    self.keyboard_ui.on_action_result(ok, message);
+                }
                 WorkerMsg::UpdateCheckFinished(res) => {
                     self.update_checking = false;
                     self.update_result = Some(res);
@@ -876,6 +887,7 @@ impl eframe::App for PolledApp {
             && !self.quit_requested.load(Ordering::SeqCst)
         {
             self.input_lab_ui.stop_capture();
+            self.keyboard_ui.stop_analog_stream();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -967,6 +979,7 @@ impl eframe::App for PolledApp {
                         for (view, label) in [
                             (ActiveView::HealthCheck, "Health"),
                             (ActiveView::Profiles, "Profiles"),
+                            (ActiveView::Keyboard, "Keyboard"),
                             (ActiveView::InputLab, "Bench"),
                         ] {
                             let active = self.active_view == view;
@@ -1072,6 +1085,32 @@ impl eframe::App for PolledApp {
                     }
                     ui.add_space(2.0);
 
+                    let kb_badge_owned = if self.keyboard_ui.is_streaming_analog() {
+                        Some(("LIVE".to_string(), p.ok))
+                    } else {
+                        self.profiles_ui
+                            .runtime_snapshot
+                            .as_ref()
+                            .and_then(|s| s.wooting_keyboards.first())
+                            .map(|kb| {
+                                let txt = kb
+                                    .active_profile
+                                    .map(|i| format!("P{}", i + 1))
+                                    .unwrap_or_else(|| "OK".to_string());
+                                (txt, p.info)
+                            })
+                    };
+                    if nav_rail_item(
+                        ui,
+                        p,
+                        "Keyboard",
+                        self.active_view == ActiveView::Keyboard,
+                        kb_badge_owned.as_ref().map(|(t, c)| (t.as_str(), *c)),
+                    ) {
+                        self.active_view = ActiveView::Keyboard;
+                    }
+                    ui.add_space(2.0);
+
                     let bench_badge = if self.input_lab_ui.is_capturing() {
                         Some(("LIVE", p.ok))
                     } else {
@@ -1136,6 +1175,25 @@ impl eframe::App for PolledApp {
                             .truncate(),
                         );
                     }
+                    if let Some(kb) = self
+                        .profiles_ui
+                        .runtime_snapshot
+                        .as_ref()
+                        .and_then(|s| s.wooting_keyboards.first())
+                    {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    kb.name,
+                                    kb.compact_status_summary()
+                                ))
+                                .size(11.0)
+                                .color(p.text_muted),
+                            )
+                            .truncate(),
+                        );
+                    }
 
                     // Bottom utility stack
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -1186,6 +1244,17 @@ impl eframe::App for PolledApp {
                         mode,
                         &self.profile_runtime,
                         self.settings.alerts.clamped_threshold(),
+                    );
+                    return;
+                }
+                if self.active_view == ActiveView::Keyboard {
+                    self.keyboard_ui.render(
+                        ctx,
+                        ui,
+                        p,
+                        mode,
+                        self.profiles_ui.runtime_snapshot.as_ref(),
+                        &self.profile_runtime,
                     );
                     return;
                 }
@@ -2036,6 +2105,9 @@ impl eframe::App for PolledApp {
                         ActiveView::Profiles => {
                             self.profiles_ui.notice = Some((Severity::Ok, msg));
                         }
+                        ActiveView::Keyboard => {
+                            self.keyboard_ui.notice = Some((Severity::Ok, msg));
+                        }
                         ActiveView::InputLab => {
                             self.input_lab_ui.notice = Some((Severity::Ok, msg));
                         }
@@ -2048,6 +2120,9 @@ impl eframe::App for PolledApp {
                 Err(err) => match self.active_view {
                     ActiveView::Profiles => {
                         self.profiles_ui.notice = Some((Severity::Bad, err));
+                    }
+                    ActiveView::Keyboard => {
+                        self.keyboard_ui.notice = Some((Severity::Bad, err));
                     }
                     ActiveView::InputLab => {
                         self.input_lab_ui.notice = Some((Severity::Bad, err));

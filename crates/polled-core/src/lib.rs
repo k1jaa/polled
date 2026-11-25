@@ -32,8 +32,11 @@ pub use devices::{
     Hidpp20ProtocolDriver, IncottDevice, IncottProtocolDriver, KeychronDevice,
     KeychronProtocolDriver, LiftOffDistance, MchoseDevice, MchoseProtocolDriver, MouseDevice,
     MouseSettings, NinjutsoDevice, NinjutsoProtocolDriver, RazerDevice, RazerProtocolDriver,
-    SafeDeviceController, SupportTier, VaxeeDevice, VaxeeProtocolDriver, WootingDevice,
-    WootingKeyboardInfo, WriteMode, WOOTING_MAX_PROFILE_INDEX,
+    SafeDeviceController, SupportTier, VaxeeDevice, VaxeeProtocolDriver, WootingAkcSummary,
+    WootingAnalogBasePatch, WootingAnalogKeyReading, WootingAnalogProfile, WootingAnalogStream,
+    WootingDevice, WootingDiagnostics, WootingGlobalSettings, WootingGlobalSettingsPatch,
+    WootingKeyActuationOverride, WootingKeyboardInfo, WootingProfileSlot, WootingProtocol,
+    WootingRapidTriggerGroupInfo, WootingRgbSummary, WriteMode, WOOTING_MAX_PROFILE_INDEX,
 };
 pub use diagnostics::{
     build_diagnostic_advice, compute_sensitivity, format_advice_summary,

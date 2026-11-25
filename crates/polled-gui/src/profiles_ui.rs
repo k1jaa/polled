@@ -59,6 +59,7 @@ enum GamePickerTab {
 enum ProfileEditorTab {
     #[default]
     Mouse,
+    Keyboard,
     AudioPower,
     General,
 }
@@ -1494,11 +1495,7 @@ impl ProfilesUiState {
                     status_chunks.push(format!("Display: {disp} (temp)"));
                 }
                 for kb in &s.wooting_keyboards {
-                    let slot = kb
-                        .active_profile
-                        .map(|idx| format!("P{}", idx + 1))
-                        .unwrap_or_else(|| "?".to_string());
-                    status_chunks.push(format!("{} ({slot})", kb.name));
+                    status_chunks.push(kb.compact_status_summary());
                 }
                 if s.any_flash_only && s.total_flash_writes_session > 0 {
                     status_chunks.push(format!("Flash writes: {}", s.total_flash_writes_session));
@@ -1807,10 +1804,11 @@ impl ProfilesUiState {
 
             ui.add_space(8.0);
 
-            // Clean segmented sub-tabs inside Profile Editor (`Mouse` | `Display, Audio & Power` | `General`)
-            ui.horizontal(|ui| {
+            // Clean segmented sub-tabs inside Profile Editor (`Mouse` | `Keyboard` | `Display, Audio & Power` | `General`)
+            ui.horizontal_wrapped(|ui| {
                 for (tab, label) in [
                     (ProfileEditorTab::Mouse, "Mouse"),
+                    (ProfileEditorTab::Keyboard, "Keyboard"),
                     (ProfileEditorTab::AudioPower, "Display, Audio & Power"),
                     (ProfileEditorTab::General, "General"),
                 ] {
@@ -2266,6 +2264,147 @@ impl ProfilesUiState {
                             }
                             }
 
+                            if self.editor_tab == ProfileEditorTab::Keyboard {
+                                let primary_kb = snap.and_then(|s| s.wooting_keyboards.first());
+                                ui.label(RichText::new("Wooting Profile").color(p.text_muted));
+                                ui.vertical(|ui| {
+                                    let wooting_lbl = match self.editor.wooting_profile {
+                                        None => "Leave unchanged".to_string(),
+                                        Some(idx) => primary_kb
+                                            .map(|kb| kb.profile_display_name(idx))
+                                            .unwrap_or_else(|| {
+                                                WootingKeyboardInfo::profile_label(idx).to_string()
+                                            }),
+                                    };
+                                    egui::ComboBox::from_id_salt("wooting_profile_combo")
+                                        .selected_text(wooting_lbl)
+                                        .width((field_w - 40.0).clamp(180.0, 320.0))
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    self.editor.wooting_profile.is_none(),
+                                                    "Leave unchanged",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.editor.wooting_profile = None;
+                                            }
+                                            if let Some(kb) = primary_kb {
+                                                for slot in &kb.profiles {
+                                                    let lbl = format!(
+                                                        "P{} · {}",
+                                                        slot.index + 1,
+                                                        slot.name
+                                                    );
+                                                    if ui
+                                                        .selectable_label(
+                                                            self.editor.wooting_profile
+                                                                == Some(slot.index),
+                                                            lbl,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.editor.wooting_profile =
+                                                            Some(slot.index);
+                                                    }
+                                                }
+                                            } else {
+                                                for slot in 0..=3u8 {
+                                                    if ui
+                                                        .selectable_label(
+                                                            self.editor.wooting_profile
+                                                                == Some(slot),
+                                                            WootingKeyboardInfo::profile_label(slot),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.editor.wooting_profile = Some(slot);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(
+                                                "Volatile RAM onboard profile switch (zero flash wear) triggered automatically when this game takes focus.",
+                                            )
+                                            .size(11.0)
+                                            .color(p.text_muted),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                                ui.end_row();
+
+                                ui.label(RichText::new("Detected Board").color(p.text_muted));
+                                ui.vertical(|ui| {
+                                    if let Some(kb) = primary_kb {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(kb.compact_status_summary())
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(p.text),
+                                            )
+                                            .wrap(),
+                                        );
+                                        let mut details = Vec::new();
+                                        if let Some(fw) = &kb.firmware_version {
+                                            details.push(format!("FW v{fw}"));
+                                        }
+                                        if let Some(layout) = &kb.layout {
+                                            details.push(layout.clone());
+                                        }
+                                        if !kb.per_key_actuation.is_empty() {
+                                            details.push(format!(
+                                                "{} per-key actuation overrides",
+                                                kb.per_key_actuation.len()
+                                            ));
+                                        }
+                                        if !kb.advanced_keys.is_empty() {
+                                            details.push(format!(
+                                                "{} AKC/SOCD bindings",
+                                                kb.advanced_keys.len()
+                                            ));
+                                        }
+                                        if !details.is_empty() {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(details.join("  ·  "))
+                                                        .size(11.0)
+                                                        .color(p.text_muted),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                    } else {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(
+                                                    "No Wooting keyboard connected. Supports 60HE / 60HE+ / 80HE / Two HE / UwU / One / Two over open HID.",
+                                                )
+                                                .size(11.5)
+                                                .color(p.text_muted),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(
+                                                "Open the dedicated Keyboard tab in the left sidebar for live analog key-travel testing, actuation & Rapid Trigger tuning, per-key overrides, SOCD/AKC inspection, and Global Settings.",
+                                            )
+                                            .size(11.0)
+                                            .color(p.text_muted),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                                ui.end_row();
+                            }
+
                             if self.editor_tab == ProfileEditorTab::AudioPower {
                             let disp_combo_w = (field_w - 148.0).clamp(130.0, 260.0);
                             let displays = snap.map(|s| s.displays.as_slice()).unwrap_or(&[]);
@@ -2437,62 +2576,6 @@ impl ProfilesUiState {
                                             );
                                         }
                                     });
-                            });
-                            ui.end_row();
-
-                            ui.label(RichText::new("Wooting Keyboard").color(p.text_muted));
-                            ui.vertical(|ui| {
-                                let wooting_lbl = match self.editor.wooting_profile {
-                                    None => "Leave unchanged".to_string(),
-                                    Some(idx) => WootingKeyboardInfo::profile_label(idx).to_string(),
-                                };
-                                egui::ComboBox::from_id_salt("wooting_profile_combo")
-                                    .selected_text(wooting_lbl)
-                                    .width((field_w - 80.0).clamp(160.0, 280.0))
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                self.editor.wooting_profile.is_none(),
-                                                "Leave unchanged",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.editor.wooting_profile = None;
-                                        }
-                                        for slot in 0..=3u8 {
-                                            if ui
-                                                .selectable_label(
-                                                    self.editor.wooting_profile == Some(slot),
-                                                    WootingKeyboardInfo::profile_label(slot),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.editor.wooting_profile = Some(slot);
-                                            }
-                                        }
-                                    });
-                                let kb_hint = snap
-                                    .and_then(|s| s.wooting_keyboards.first())
-                                    .map(|kb| {
-                                        let active = kb
-                                            .active_profile
-                                            .map(|i| format!(" · Active: P{}", i + 1))
-                                            .unwrap_or_default();
-                                        format!(
-                                            "Detected {}{active} (volatile RAM switch, zero flash wear).",
-                                            kb.name
-                                        )
-                                    })
-                                    .unwrap_or_else(|| {
-                                        "Supports Wooting 60HE / 60HE+ / 80HE / Two HE / UwU via open HID protocol (zero flash wear)."
-                                            .to_string()
-                                    });
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(kb_hint).size(11.0).color(p.text_muted),
-                                    )
-                                    .wrap(),
-                                );
                             });
                             ui.end_row();
 
