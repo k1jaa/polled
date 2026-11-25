@@ -6,7 +6,7 @@
 //! -> `match_profile` -> multi-mouse `SafeDeviceController` (+ optional Windows pointer speed),
 //! with automatic USB hot-plug discovery across multiple mice.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -16,11 +16,12 @@ use polled_core::win::{
     AudioFlow, DisplayModeInfo, DisplayResolutionMode, RegHive, SystemEnv, WindowsEnv,
 };
 use polled_core::{
-    detect_hardware_devices, detect_wooting_keyboards, hid_topology_fingerprint, match_profile,
-    normalize_exe_name, AppPaths, ApplyOutcome, BatteryStatus, DeviceCapabilities, DeviceInfo,
-    DryRunDevice, FocusDebouncer, FocusEvent, ForegroundWatcher, GameProfile, MouseSettings,
-    PolledError, ProfileStore, SafeDeviceController, Severity, TrayAlertConfig,
-    WootingAnalogBasePatch, WootingGlobalSettingsPatch, WootingKeyboardInfo,
+    detect_hardware_devices, detect_wooting_keyboards, duck_app_audio_sessions,
+    hid_topology_fingerprint, match_profile, normalize_exe_name, restore_app_audio_sessions,
+    AppPaths, ApplyOutcome, BatteryStatus, DeviceCapabilities, DeviceInfo, DryRunDevice,
+    FocusDebouncer, FocusEvent, ForegroundWatcher, GameProfile, MouseSettings, PolledError,
+    ProfileStore, SafeDeviceController, SavedAppAudioVolume, Severity, SupportTier,
+    TrayAlertConfig, WootingAnalogBasePatch, WootingGlobalSettingsPatch, WootingKeyboardInfo,
 };
 
 use crate::app::WorkerMsg;
@@ -128,6 +129,10 @@ pub enum ProfileRuntimeCmd {
     WriteWootingAnalogBase {
         device_id: Option<String>,
         patch: WootingAnalogBasePatch,
+    },
+    WriteWootingPerKeyActuation {
+        device_id: Option<String>,
+        updates: Vec<(u16, Option<f32>)>,
     },
     WriteWootingGlobalSettings {
         device_id: Option<String>,
@@ -286,6 +291,10 @@ struct RuntimeState {
     pending_wake_retry: Option<(String, Instant, Instant)>,
     /// Captured original `HKCU\...\PushNotifications\ToastEnabled` when a profile enables Quiet Notifications.
     original_toast_enabled: Option<Option<u32>>,
+    /// Captured original Windows Volume Mixer levels for background apps ducked by the active profile.
+    saved_ducked_apps: Vec<SavedAppAudioVolume>,
+    /// Device IDs currently stepped down to 1000 Hz by the opt-in low-battery polling guard.
+    battery_guard_active: HashSet<String>,
     log: Vec<ProfileLogEntry>,
 }
 
@@ -490,10 +499,10 @@ impl RuntimeState {
         );
     }
 
-    fn poll_batteries(&mut self) -> bool {
+    fn poll_batteries(&mut self) -> (bool, Option<(String, String)>) {
         let now = Instant::now();
         if now.saturating_duration_since(self.last_battery_poll) < BATTERY_POLL_INTERVAL {
-            return false;
+            return (false, None);
         }
         self.last_battery_poll = now;
         let alerts = self.alerts.clone();
@@ -503,7 +512,130 @@ impl RuntimeState {
                 any_changed = true;
             }
         }
-        any_changed
+        let (guard_changed, osd) = self.evaluate_battery_polling_guard();
+        (any_changed || guard_changed, osd)
+    }
+
+    fn evaluate_battery_polling_guard(&mut self) -> (bool, Option<(String, String)>) {
+        let enabled = self.alerts.low_battery_polling_guard;
+        let threshold = self.alerts.clamped_threshold();
+        let reset_threshold = self.alerts.reset_threshold();
+        let active_profile = self
+            .store
+            .profiles
+            .iter()
+            .find(|p| p.id == self.active_profile_id)
+            .cloned();
+
+        let mut logs: Vec<(Severity, String)> = Vec::new();
+        let mut osd: Option<(String, String)> = None;
+        let mut changed = false;
+
+        for managed in &mut self.controllers {
+            let info = managed.controller.info();
+            if info.support_tier == SupportTier::Simulator {
+                continue;
+            }
+            let Some(bat) = managed.last_battery else {
+                continue;
+            };
+            let caps = managed.controller.capabilities();
+            let dev_id = info.id;
+            let dev_name = info.name;
+            let already_guarded = self.battery_guard_active.contains(&dev_id);
+
+            if enabled && !bat.charging && bat.percent <= threshold {
+                let current_hz = managed
+                    .last_settings
+                    .as_ref()
+                    .and_then(|s| s.polling_rate_hz)
+                    .unwrap_or(0);
+                if !already_guarded && current_hz > 1000 && caps.polling_rates_hz.contains(&1000) {
+                    let step_down = MouseSettings {
+                        polling_rate_hz: Some(1000),
+                        ..Default::default()
+                    };
+                    match managed.controller.apply_profile_settings(&step_down) {
+                        Ok(ApplyOutcome::Applied { verified, .. }) => {
+                            managed.last_settings = Some(verified);
+                            self.battery_guard_active.insert(dev_id);
+                            changed = true;
+                            logs.push((
+                                Severity::Warn,
+                                format!(
+                                    "[{dev_name}] Battery Polling Guard ({}% <= {threshold}%): stepped down {current_hz} Hz -> 1000 Hz to save battery.",
+                                    bat.percent
+                                ),
+                            ));
+                            if self.alerts.osd_pill_enabled {
+                                osd = Some((
+                                    "Polled · Battery Guard".to_string(),
+                                    format!("{dev_name} ({}%) -> 1000 Hz", bat.percent),
+                                ));
+                            }
+                        }
+                        Ok(ApplyOutcome::SkippedUnchanged { current }) => {
+                            managed.last_settings = Some(current);
+                            self.battery_guard_active.insert(dev_id);
+                        }
+                        Ok(ApplyOutcome::SkippedNoSettings) => {}
+                        Err(err) => {
+                            logs.push((
+                                Severity::Warn,
+                                format!(
+                                    "[{dev_name}] Battery Polling Guard step-down failed: {err}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            } else if already_guarded
+                && (!enabled || bat.charging || bat.percent >= reset_threshold)
+            {
+                self.battery_guard_active.remove(&dev_id);
+                if let Some(prof) = &active_profile {
+                    let (raw, _) = prof.settings_for_device(&dev_id);
+                    if let Some(target_hz) = raw.polling_rate_hz.filter(|&hz| hz > 1000) {
+                        let restore_req = MouseSettings {
+                            polling_rate_hz: Some(target_hz),
+                            ..Default::default()
+                        };
+                        let (adapted, _) = caps.adapt_settings(&restore_req);
+                        if let Ok(ApplyOutcome::Applied { verified, .. }) =
+                            managed.controller.apply_profile_settings(&adapted)
+                        {
+                            managed.last_settings = Some(verified);
+                            changed = true;
+                            let why = if !enabled {
+                                "guard disabled"
+                            } else if bat.charging {
+                                "charging"
+                            } else {
+                                "battery recovered"
+                            };
+                            logs.push((
+                                Severity::Ok,
+                                format!(
+                                    "[{dev_name}] Battery Polling Guard ({why}, {}%): restored {} Hz.",
+                                    bat.percent, target_hz
+                                ),
+                            ));
+                            if self.alerts.osd_pill_enabled {
+                                osd = Some((
+                                    "Polled · Battery Restored".to_string(),
+                                    format!("{dev_name} -> {target_hz} Hz"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (sev, msg) in logs {
+            self.push_log(sev, msg);
+        }
+        (changed, osd)
     }
 
     fn force_refresh_mouse_and_battery(&mut self) {
@@ -1203,6 +1335,39 @@ impl RuntimeState {
             self.restore_quiet_notifications(reason);
         }
 
+        // --- Per-Game Background App Mixer Ducking (Core Audio IAudioSessionManager2, zero admin) ---
+        if !self.saved_ducked_apps.is_empty() {
+            self.restore_ducked_audio_apps(reason);
+        }
+        if !profile.duck_audio_apps.is_empty() {
+            match duck_app_audio_sessions(&profile.duck_audio_apps, profile.duck_audio_volume_pct) {
+                Ok(saved) if !saved.is_empty() => {
+                    let names: Vec<String> = saved.iter().map(|s| s.exe_name.clone()).collect();
+                    let target_lbl = if profile.duck_audio_volume_pct == 0 {
+                        "Muted".to_string()
+                    } else {
+                        format!("{}%", profile.duck_audio_volume_pct)
+                    };
+                    self.push_log(
+                        Severity::Ok,
+                        format!(
+                            "App Mixer Duck ({}): {} -> {target_lbl} (auto-restores on desktop/exit).",
+                            profile.name,
+                            names.join(", ")
+                        ),
+                    );
+                    self.saved_ducked_apps = saved;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    self.push_log(
+                        Severity::Warn,
+                        format!("Could not duck background app audio sessions: {err}"),
+                    );
+                }
+            }
+        }
+
         // --- Wooting Keyboard Volatile Profile Switching (0..=7, zero flash wear) ---
         if let Some(slot) = profile.wooting_profile {
             match detect_wooting_keyboards() {
@@ -1258,7 +1423,31 @@ impl RuntimeState {
             let dev_name = dev_info.name;
             let caps = managed.controller.capabilities();
             let (raw_desired, used_override) = profile.settings_for_device(&dev_info.id);
-            let (effective_desired, adjustments) = caps.adapt_settings(raw_desired);
+            let (mut effective_desired, adjustments) = caps.adapt_settings(raw_desired);
+            if self.alerts.low_battery_polling_guard
+                && dev_info.support_tier != SupportTier::Simulator
+                && caps.polling_rates_hz.contains(&1000)
+            {
+                if let Some(bat) = managed.last_battery {
+                    let threshold = self.alerts.clamped_threshold();
+                    if !bat.charging
+                        && bat.percent <= threshold
+                        && effective_desired
+                            .polling_rate_hz
+                            .is_some_and(|hz| hz > 1000)
+                    {
+                        effective_desired.polling_rate_hz = Some(1000);
+                        self.battery_guard_active.insert(dev_info.id.clone());
+                        logs.push((
+                            Severity::Warn,
+                            format!(
+                                "[{dev_name}] Battery Polling Guard ({}% <= {threshold}%): capped polling rate to 1000 Hz.",
+                                bat.percent
+                            ),
+                        ));
+                    }
+                }
+            }
             let source_tag = if used_override {
                 " [mouse override]"
             } else {
@@ -1447,6 +1636,27 @@ impl RuntimeState {
             ),
         }
     }
+
+    fn restore_ducked_audio_apps(&mut self, reason: &str) {
+        if self.saved_ducked_apps.is_empty() {
+            return;
+        }
+        let saved = std::mem::take(&mut self.saved_ducked_apps);
+        match restore_app_audio_sessions(&saved) {
+            Ok(count) if count > 0 => self.push_log(
+                Severity::Info,
+                format!(
+                    "Restored Windows Volume Mixer level for {count} ducked app{} ({reason}).",
+                    if count == 1 { "" } else { "s" }
+                ),
+            ),
+            Ok(_) => {}
+            Err(err) => self.push_log(
+                Severity::Warn,
+                format!("Could not restore ducked app audio levels ({reason}): {err}"),
+            ),
+        }
+    }
 }
 
 fn upsert_gpu_preference_high_perf(existing: Option<&str>) -> String {
@@ -1509,6 +1719,8 @@ fn run_runtime_loop(
         pending_retry: None,
         pending_wake_retry: None,
         original_toast_enabled: None,
+        saved_ducked_apps: Vec::new(),
+        battery_guard_active: HashSet::new(),
         log: Vec::new(),
     };
 
@@ -1522,8 +1734,12 @@ fn run_runtime_loop(
 
     loop {
         let mut changed = state.check_hotplug();
-        if state.poll_batteries() {
+        let (batt_changed, batt_osd) = state.poll_batteries();
+        if batt_changed {
             changed = true;
+        }
+        if let Some((title, subtitle)) = batt_osd {
+            let _ = ui_tx.send(WorkerMsg::ShowOsdPill { title, subtitle });
         }
         if state.poll_audio_and_mic_lock() {
             changed = true;
@@ -1687,6 +1903,7 @@ fn run_runtime_loop(
                 let _ = state.revert_test_display_if_pending("shutdown");
                 state.restore_original_display("shutdown");
                 state.restore_quiet_notifications("shutdown");
+                state.restore_ducked_audio_apps("shutdown");
                 state.stop_watcher();
                 break;
             }
@@ -1698,6 +1915,10 @@ fn run_runtime_loop(
                 state.alerts = next_alerts;
                 for m in &mut state.controllers {
                     m.low_battery_notified = false;
+                }
+                let (_, osd) = state.evaluate_battery_polling_guard();
+                if let Some((title, subtitle)) = osd {
+                    let _ = ui_tx.send(WorkerMsg::ShowOsdPill { title, subtitle });
                 }
                 state.emit(&ui_tx, &ctx);
             }
@@ -1925,6 +2146,75 @@ fn run_runtime_loop(
                                     }
                                     Err(err) => {
                                         let msg = format!("[{kb_name}] Analog save failed: {err}");
+                                        state.push_log(Severity::Warn, msg.clone());
+                                        messages.push(msg);
+                                        updated.push(kb.read_full_status());
+                                    }
+                                }
+                            } else {
+                                updated.push(kb.read_full_status());
+                            }
+                        }
+                        state.wooting_keyboards = updated;
+                        let _ = ui_tx.send(WorkerMsg::WootingActionResult {
+                            ok: any_ok,
+                            message: if messages.is_empty() {
+                                "Target Wooting keyboard was not found.".to_string()
+                            } else {
+                                messages.join(" ")
+                            },
+                        });
+                    }
+                    Ok(_) => {
+                        state.wooting_keyboards.clear();
+                        let _ = ui_tx.send(WorkerMsg::WootingActionResult {
+                            ok: false,
+                            message: "No Wooting keyboard detected.".to_string(),
+                        });
+                    }
+                    Err(err) => {
+                        let msg = format!("Wooting detection failed: {err}");
+                        state.push_log(Severity::Warn, msg.clone());
+                        let _ = ui_tx.send(WorkerMsg::WootingActionResult {
+                            ok: false,
+                            message: msg,
+                        });
+                    }
+                }
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::WriteWootingPerKeyActuation { device_id, updates }) => {
+                match detect_wooting_keyboards() {
+                    Ok(boards) if !boards.is_empty() => {
+                        let mut updated = Vec::with_capacity(boards.len());
+                        let mut any_ok = false;
+                        let mut messages = Vec::new();
+                        for kb in boards {
+                            let target =
+                                device_id.as_deref().is_none_or(|wanted| kb.id() == wanted);
+                            if target {
+                                let kb_name = kb.name().to_string();
+                                match kb.write_per_key_actuation(&updates) {
+                                    Ok(()) => {
+                                        let full = kb.read_full_status();
+                                        let slot_lbl = full
+                                            .active_profile
+                                            .map(|s| full.profile_display_name(s))
+                                            .unwrap_or_else(|| "active slot".to_string());
+                                        let msg = format!(
+                                            "[{kb_name}] Updated {} per-key actuation override{} on {slot_lbl} (read-back verified).",
+                                            updates.len(),
+                                            if updates.len() == 1 { "" } else { "s" }
+                                        );
+                                        state.push_log(Severity::Ok, msg.clone());
+                                        messages.push(msg);
+                                        any_ok = true;
+                                        updated.push(full);
+                                    }
+                                    Err(err) => {
+                                        let msg = format!(
+                                            "[{kb_name}] Per-key actuation save failed: {err}"
+                                        );
                                         state.push_log(Severity::Warn, msg.clone());
                                         messages.push(msg);
                                         updated.push(kb.read_full_status());

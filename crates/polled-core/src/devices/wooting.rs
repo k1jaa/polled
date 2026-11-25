@@ -81,6 +81,8 @@ pub const CMD_GET_FULL_RAPID_TRIGGER_PROFILE: u8 = 0x3D;
 
 /// Verified Wooting ARM HID output-report command IDs (distinct namespace from feature commands!).
 pub const OUT_CMD_SET_KEYBOARD_BASE: u8 = 0x11;
+/// Output `0x15` writes per-key actuation overrides (distinct from feature `0x15` `KeysOff`).
+pub const OUT_CMD_SET_ACTUATION_PROFILE: u8 = 0x15;
 pub const OUT_CMD_SET_GLOBAL_SETTINGS: u8 = 0x17;
 
 /// Linear actuation & rapid-trigger scaling confirmed on Wooting ARM hardware:
@@ -1311,9 +1313,140 @@ pub fn patch_wooting_global_settings(
     Ok(result)
 }
 
+/// Patches `GetActuationProfile (0x31)` per-key actuation overrides while preserving all other
+/// protobuf fields byte-for-byte.
+///
+/// Supports both verified ARM layouts automatically:
+/// - **Field 4 (`KeyMMPropertyProfile.partialEncoded`, Q12)**: `raw_q12 << 16 | matrix_index`
+/// - **Field 2 (`KeyPropertyProfile.partial`, 8-bit, live-verified on 60HE+ fw v2.13.2)**:
+///   `(raw_u8 << 8) | (matrix_index & 0xFF)`
+///
+/// Each `(matrix_index, Some(mm))` sets or replaces that key's override (`0.10..=4.00 mm`);
+/// `(matrix_index, None)` removes the override so the key follows profile base actuation.
+pub fn patch_wooting_actuation_profile(
+    complete_body: &[u8],
+    updates: &[(u16, Option<f32>)],
+    prefer_q12: bool,
+) -> Result<Vec<u8>> {
+    for &(key, mm_opt) in updates {
+        if let Some(mm) = mm_opt {
+            if !mm.is_finite() || !(0.10..=WOOTING_MAX_TRAVEL_MM as f32).contains(&mm) {
+                return Err(PolledError::Device {
+                    device: "Wooting".to_string(),
+                    message: format!(
+                        "Per-key actuation for matrix 0x{key:04x} ({mm:.2} mm) must be within 0.10..=4.00 mm"
+                    ),
+                });
+            }
+        }
+    }
+
+    let outer = decode_proto_fields(complete_body);
+    let has_f4 = outer.iter().any(|f| f.field == 4 && f.bytes.is_some());
+    let has_f2 = outer.iter().any(|f| f.field == 2 && f.bytes.is_some());
+    let target_field: u32 = if has_f4 {
+        4
+    } else if has_f2 {
+        2
+    } else if prefer_q12 {
+        4
+    } else {
+        2
+    };
+
+    let existing_inner = outer
+        .iter()
+        .find(|f| f.field == target_field && f.wire == 2)
+        .and_then(|f| f.bytes)
+        .unwrap_or(&[]);
+
+    // Extract existing entries as `(matrix_index, packed_raw_entry)` and preserve unknown inner fields.
+    let mut entries: Vec<(u16, u64)> = Vec::new();
+    let mut other_inner = Vec::new();
+    for f in decode_proto_fields(existing_inner) {
+        if f.field != 1 {
+            other_inner.extend_from_slice(f.raw_span);
+            continue;
+        }
+        let mut raw_vals = Vec::new();
+        if let Some(v) = f.varint {
+            raw_vals.push(v);
+        } else if let Some(b) = f.bytes {
+            if let Some(list) = decode_packed_varints(b) {
+                raw_vals.extend(list);
+            }
+        }
+        for v in raw_vals {
+            let key = if target_field == 4 {
+                (v & 0xFFFF) as u16
+            } else {
+                (v & 0xFF) as u16
+            };
+            if target_field == 2 && ((v >> 8) & 0xFF) == 0 {
+                continue;
+            }
+            entries.retain(|&(k, _)| k != key);
+            entries.push((key, v));
+        }
+    }
+
+    for &(key, mm_opt) in updates {
+        entries.retain(|&(k, _)| k != key);
+        if let Some(mm) = mm_opt {
+            let packed = if target_field == 4 {
+                (wooting_mm_to_raw(mm) << 16) | u64::from(key)
+            } else {
+                if key > 0xFF {
+                    return Err(PolledError::Device {
+                        device: "Wooting".to_string(),
+                        message: format!(
+                            "Matrix index 0x{key:04x} exceeds 8-bit partial actuation encoding"
+                        ),
+                    });
+                }
+                (wooting_mm_to_raw_u8(mm) << 8) | u64::from(key & 0xFF)
+            };
+            entries.push((key, packed));
+        }
+    }
+    entries.sort_by_key(|&(k, _)| k);
+
+    let mut out = Vec::with_capacity(complete_body.len() + updates.len() * 8 + 8);
+    for f in outer {
+        if f.field != target_field {
+            out.extend_from_slice(f.raw_span);
+        }
+    }
+
+    if !entries.is_empty() || !other_inner.is_empty() {
+        let mut inner_buf = other_inner;
+        if target_field == 4 {
+            // Unpacked repeated varints (`0x08 <varint>`) match captured Wootility 5.4.2 Q12 packets.
+            for &(_, v) in &entries {
+                inner_buf.push(0x08);
+                encode_varint(v, &mut inner_buf);
+            }
+        } else {
+            // Packed varints (`0x0A <len> <varints...>`) match live 60HE+ fw v2.13.2 replies.
+            let mut packed = Vec::with_capacity(entries.len() * 3);
+            for &(_, v) in &entries {
+                encode_varint(v, &mut packed);
+            }
+            inner_buf.push(0x0A);
+            encode_varint(packed.len() as u64, &mut inner_buf);
+            inner_buf.extend_from_slice(&packed);
+        }
+        encode_varint((u64::from(target_field) << 3) | 2, &mut out);
+        encode_varint(inner_buf.len() as u64, &mut out);
+        out.extend_from_slice(&inner_buf);
+    }
+
+    Ok(out)
+}
+
 /// Frames an ARM variable-length output report (`[report_id, 0xD1, 0xDA, cmd_id, flags, len_lo, len_hi, payload...]`).
 pub fn encode_wooting_arm_output_report(cmd_id: u8, flags: u8, payload: &[u8]) -> Result<Vec<u8>> {
-    const LADDER: &[(u8, usize)] = &[(1, 32), (2, 62), (3, 254), (4, 510)];
+    const LADDER: &[(u8, usize)] = &[(1, 32), (2, 62), (3, 254), (4, 510), (5, 1022), (6, 2046)];
     let &(report_id, body_len) = LADDER
         .iter()
         .find(|&&(_, sz)| payload.len() + 6 <= sz)
@@ -1423,6 +1556,21 @@ pub fn wooting_matrix_label(matrix_index: u16) -> String {
     let row = ((matrix_index >> 5) & 0x07) as u8;
     let name = match (row, col) {
         (0, 0) => "Esc",
+        (0, 2) => "F1",
+        (0, 3) => "F2",
+        (0, 4) => "F3",
+        (0, 5) => "F4",
+        (0, 6) => "F5",
+        (0, 7) => "F6",
+        (0, 8) => "F7",
+        (0, 9) => "F8",
+        (0, 10) => "F9",
+        (0, 11) => "F10",
+        (0, 12) => "F11",
+        (0, 13) => "F12",
+        (0, 14) => "PrtSc",
+        (0, 15) => "Pause",
+        (0, 16) => "Mode",
         (1, 0) => "Esc/`",
         (1, 1) => "1",
         (1, 2) => "2",
@@ -1437,6 +1585,9 @@ pub fn wooting_matrix_label(matrix_index: u16) -> String {
         (1, 11) => "-",
         (1, 12) => "=",
         (1, 13) => "Backspace",
+        (1, 14) => "Ins",
+        (1, 15) => "Home",
+        (1, 16) => "PgUp",
         (2, 0) => "Tab",
         (2, 1) => "Q",
         (2, 2) => "W",
@@ -1451,6 +1602,9 @@ pub fn wooting_matrix_label(matrix_index: u16) -> String {
         (2, 11) => "[",
         (2, 12) => "]",
         (2, 13) => "\\",
+        (2, 14) => "Del",
+        (2, 15) => "End",
+        (2, 16) => "PgDn",
         (3, 0) => "Caps",
         (3, 1) => "A",
         (3, 2) => "S",
@@ -1463,8 +1617,10 @@ pub fn wooting_matrix_label(matrix_index: u16) -> String {
         (3, 9) => "L",
         (3, 10) => ";",
         (3, 11) => "'",
+        (3, 12) => "#",
         (3, 13) => "Enter",
         (4, 0) => "LShift",
+        (4, 1) => "ISO\\",
         (4, 2) => "Z",
         (4, 3) => "X",
         (4, 4) => "C",
@@ -1476,6 +1632,7 @@ pub fn wooting_matrix_label(matrix_index: u16) -> String {
         (4, 10) => ".",
         (4, 11) => "/",
         (4, 13) => "RShift",
+        (4, 15) => "Up",
         (5, 0) => "LCtrl",
         (5, 1) => "LWin",
         (5, 2) => "LAlt",
@@ -1485,6 +1642,9 @@ pub fn wooting_matrix_label(matrix_index: u16) -> String {
         (5, 12) => "Menu",
         (5, 13) => "RCtrl",
         (5, 14) => "Fn",
+        (5, 15) => "Down",
+        (5, 16) => "Right",
+        (5, 17) => "Left",
         _ => return format!("R{row}C{col}"),
     };
     name.to_string()
@@ -1957,6 +2117,91 @@ impl WootingDevice {
         Ok(())
     }
 
+    /// Reads, edits, saves, and verifies per-key actuation overrides (`OUT_CMD_SET_ACTUATION_PROFILE 0x15`)
+    /// on ARM keyboards while preserving all untouched keys and unknown protobuf fields.
+    pub fn write_per_key_actuation(&self, updates: &[(u16, Option<f32>)]) -> Result<()> {
+        if self.protocol != WootingProtocol::Arm {
+            return Err(PolledError::UnsupportedSetting {
+                device: self.name.clone(),
+                detail: "Per-key actuation writes are only verified on ARM Wooting keyboards (60HE+, 80HE, 60HE ARM, Two HE ARM, UwU)".to_string(),
+            });
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let slot = self.read_active_profile().unwrap_or(0);
+        // Inspect base profile scale (`>= 16384` Q12 vs `<= 255` 8-bit) in case `0x31` is currently empty.
+        let prefer_q12 = self
+            .send_profile_cmd(CMD_GET_KEYBOARD_PROFILE, slot)
+            .ok()
+            .and_then(|raw| {
+                let body = reply_blob_body(&raw, CMD_GET_KEYBOARD_PROFILE, WootingProtocol::Arm)?;
+                let base = decode_proto_fields(body)
+                    .into_iter()
+                    .find(|f| f.field == 1 && f.wire == 2)?
+                    .bytes?;
+                decode_proto_fields(base)
+                    .into_iter()
+                    .find(|f| f.field == 1)
+                    .and_then(|f| f.varint)
+            })
+            .is_none_or(|v| v >= 16_384);
+
+        let original_raw = self.send_profile_cmd(CMD_GET_ACTUATION_PROFILE, slot)?;
+        let body = reply_blob_body(
+            &original_raw,
+            CMD_GET_ACTUATION_PROFILE,
+            WootingProtocol::Arm,
+        )
+        .ok_or_else(|| {
+            self.dev_err("Could not read complete per-key actuation block (0x31) before writing")
+        })?;
+
+        let edited = patch_wooting_actuation_profile(body, updates, prefer_q12)?;
+        let flags = 1u8 | ((slot & 0x1F) << 1);
+        let pkt = encode_wooting_arm_output_report(OUT_CMD_SET_ACTUATION_PROFILE, flags, &edited)?;
+        self.hid
+            .write(&pkt)
+            .map_err(|e| self.dev_err(format!("Wooting output report 0x15 failed: {e}")))?;
+        thread::sleep(Duration::from_millis(60));
+
+        let verify_raw = self.send_profile_cmd(CMD_GET_ACTUATION_PROFILE, slot)?;
+        let actual = decode_wooting_per_key_actuation(&verify_raw, WootingProtocol::Arm)
+            .ok_or_else(|| {
+                self.dev_err("Read-back verification failed after writing per-key actuation")
+            })?;
+
+        for &(matrix_key, want_mm) in updates {
+            let found = actual
+                .iter()
+                .find(|o| o.matrix_index == matrix_key)
+                .map(|o| o.actuation_mm);
+            match (want_mm, found) {
+                (Some(want), Some(got)) if (got - want).abs() <= 0.07 => {}
+                (None, None) => {}
+                (Some(want), Some(got)) => {
+                    return Err(self.dev_err(format!(
+                        "Per-key actuation read-back mismatch on {}: wanted {want:.2} mm, board reported {got:.2} mm",
+                        wooting_matrix_label(matrix_key)
+                    )));
+                }
+                (Some(want), None) => {
+                    return Err(self.dev_err(format!(
+                        "Per-key actuation override ({want:.2} mm) for {} was not retained on read-back",
+                        wooting_matrix_label(matrix_key)
+                    )));
+                }
+                (None, Some(got)) => {
+                    return Err(self.dev_err(format!(
+                        "Per-key actuation override for {} was not cleared on read-back (still {got:.2} mm)",
+                        wooting_matrix_label(matrix_key)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Writes device-wide `GlobalSettings` (`OUT_CMD_SET_GLOBAL_SETTINGS 0x17`) on ARM boards,
     /// preserving all unknown fields and verifying with a mandatory read-back of `0x33`.
     pub fn write_global_settings(&self, patch: &WootingGlobalSettingsPatch) -> Result<()> {
@@ -2410,5 +2655,36 @@ mod tests {
         assert!((overrides[5].actuation_mm - 3.00).abs() < 0.01);
         assert_eq!(overrides[6].key_label, "Space");
         assert!((overrides[6].actuation_mm - 1.50).abs() < 0.01);
+
+        // Patching 8-bit 0x31 body updates W to 0.30 mm, removes Space, and preserves all other overrides.
+        let patched_8bit = patch_wooting_actuation_profile(
+            &raw_31_8bit[6..],
+            &[(0x42, Some(0.30)), (0xA6, None)],
+            false,
+        )
+        .unwrap();
+        let mut fake_31 = vec![0xD1, 0xDA, 0x31, 0x88, patched_8bit.len() as u8, 0x00];
+        fake_31.extend_from_slice(&patched_8bit);
+        let after_8bit = decode_wooting_per_key_actuation(&fake_31, WootingProtocol::Arm).unwrap();
+        assert_eq!(after_8bit.len(), 6);
+        let w_after = after_8bit.iter().find(|o| o.matrix_index == 0x42).unwrap();
+        assert!((w_after.actuation_mm - 0.30).abs() < 0.03);
+        assert!(after_8bit.iter().all(|o| o.matrix_index != 0xA6));
+
+        // Patching an empty body in Q12 mode produces exact Field 4 packed encoding and clears back to empty.
+        let q12_body =
+            patch_wooting_actuation_profile(&[], &[(0x20, Some(0.30)), (0xAD, Some(0.30))], true)
+                .unwrap();
+        let mut fake_q12 = vec![0xD1, 0xDA, 0x31, 0x88, q12_body.len() as u8, 0x00];
+        fake_q12.extend_from_slice(&q12_body);
+        let dec_q12 = decode_wooting_per_key_actuation(&fake_q12, WootingProtocol::Arm).unwrap();
+        assert_eq!(dec_q12.len(), 2);
+        assert!((dec_q12[0].actuation_mm - 0.30).abs() < 0.01);
+        assert!((dec_q12[1].actuation_mm - 0.30).abs() < 0.01);
+
+        let cleared =
+            patch_wooting_actuation_profile(&q12_body, &[(0x20, None), (0xAD, None)], true)
+                .unwrap();
+        assert!(cleared.is_empty());
     }
 }

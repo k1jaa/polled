@@ -1287,6 +1287,11 @@ impl eframe::App for PolledApp {
                         .map(|s| s.checks.as_slice())
                         .unwrap_or(&[]);
                     let win_ver = self.summary.as_ref().map(|s| s.windows_version.as_str());
+                    let wooting_kb = self
+                        .profiles_ui
+                        .runtime_snapshot
+                        .as_ref()
+                        .and_then(|s| s.wooting_keyboards.first());
                     if let Some(nav) = self.input_lab_ui.render(
                         ctx,
                         ui,
@@ -1295,6 +1300,7 @@ impl eframe::App for PolledApp {
                         detected_dpi,
                         health_checks,
                         win_ver,
+                        wooting_kb,
                     ) {
                         match nav {
                             InputLabNavAction::OpenHealthCheck => {
@@ -2187,7 +2193,8 @@ impl eframe::App for PolledApp {
                             "Low-battery Windows notification at",
                         );
                         ui.add_enabled(
-                            self.settings.alerts.low_battery_toast,
+                            self.settings.alerts.low_battery_toast
+                                || self.settings.alerts.low_battery_polling_guard,
                             egui::DragValue::new(
                                 &mut self.settings.alerts.low_battery_threshold_pct,
                             )
@@ -2196,6 +2203,10 @@ impl eframe::App for PolledApp {
                             .suffix("%"),
                         );
                     });
+                    ui.checkbox(
+                        &mut self.settings.alerts.low_battery_polling_guard,
+                        "Battery polling guard (step 2K/4K/8K mice -> 1000 Hz at threshold, restore on charge)",
+                    );
                     ui.checkbox(
                         &mut self.settings.alerts.profile_switch_toast,
                         "Show notification when game/desktop profile switches",

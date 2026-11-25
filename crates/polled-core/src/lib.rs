@@ -39,20 +39,21 @@ pub use devices::{
     WootingRapidTriggerGroupInfo, WootingRgbSummary, WriteMode, WOOTING_MAX_PROFILE_INDEX,
 };
 pub use diagnostics::{
-    build_diagnostic_advice, compute_dpc_snapshot, compute_reaction_summary, compute_sensitivity,
-    current_qpc_ns, format_advice_summary, format_audio_benchmark_summary,
+    append_dpc_advice, build_diagnostic_advice, compute_dpc_snapshot, compute_reaction_summary,
+    compute_sensitivity, current_qpc_ns, format_advice_summary, format_audio_benchmark_summary,
     format_diagnostic_report, format_intervals_csv, format_network_benchmark_summary,
     format_watchdog_report, render_ab_comparison_png, render_report_png, render_rig_scorecard_png,
     run_audio_latency_benchmark, run_network_jitter_benchmark, run_timer_jitter_benchmark,
-    ButtonBounceStats, ClickBounceAnalyzer, ClickBounceSnapshot, ClickEventRecord, CoreDpcMetrics,
-    DiagnosticAdvice, DiagnosticsSnapshot, DpcMonitorSession, DpcMonitorSnapshot,
-    DpiCalibrationResult, DpiCalibrator, DpiMeasurementSnapshot, HistogramBin, IntervalSample,
-    KeyboardPollingAnalyzer, KeyboardPollingStats, MatchWatchdogSession, MouseButtonKind,
-    PinnedBenchmark, PollingAnalyzer, PollingStats, PollingTarget, RawCorePerfSample,
-    RawInputCaptureSession, ReactionTestSummary, RigScorecardInput, ScrollEncoderAnalyzer,
-    ScrollEncoderSnapshot, SensitivityConversion, SensitivityGame, SystemLoadStats,
-    TimerJitterBenchmark, TrackingStats, WatchdogEvent, WatchdogSample, WatchdogSnapshot,
-    XyTracePoint, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS,
+    BenchHistoryStore, ButtonBounceStats, ClickBounceAnalyzer, ClickBounceSnapshot,
+    ClickEventRecord, CoreDpcMetrics, DiagnosticAdvice, DiagnosticsSnapshot, DpcMonitorSession,
+    DpcMonitorSnapshot, DpiCalibrationResult, DpiCalibrator, DpiMeasurementSnapshot, HistogramBin,
+    IntervalSample, KeyboardPollingAnalyzer, KeyboardPollingStats, MatchWatchdogSession,
+    MouseButtonKind, PinnedBenchmark, PollingAnalyzer, PollingStats, PollingTarget,
+    RawCorePerfSample, RawInputCaptureSession, ReactionTestSummary, RigScorecardInput,
+    SavedBenchRun, ScrollEncoderAnalyzer, ScrollEncoderSnapshot, SensitivityConversion,
+    SensitivityGame, SystemLoadStats, TimerJitterBenchmark, TrackingStats, WatchdogEvent,
+    WatchdogSample, WatchdogSnapshot, XyTracePoint, BENCH_HISTORY_SCHEMA_VERSION,
+    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, MAX_BENCH_HISTORY_ENTRIES,
     SCROLL_DOUBLE_NOTCH_MS, SCROLL_REVERSE_GLITCH_WINDOW_MS, STANDARD_RATES_HZ,
 };
 pub use error::{PolledError, Result};
@@ -72,7 +73,8 @@ pub use update::{
     GITHUB_RELEASES_WEB_URL,
 };
 pub use win::{
-    AudioEndpointInfo, AudioFlow, AudioLatencyBenchmark, DisplayModeInfo, DisplayResolutionMode,
-    NetworkAdapterInfo, NetworkAdapterKind, NetworkJitterBenchmark, PciMsiCategory, PciMsiDevice,
-    PingHopStats,
+    duck_app_audio_sessions, restore_app_audio_sessions, AudioEndpointInfo, AudioFlow,
+    AudioLatencyBenchmark, DisplayModeInfo, DisplayResolutionMode, NetworkAdapterInfo,
+    NetworkAdapterKind, NetworkJitterBenchmark, PciMsiCategory, PciMsiDevice, PingHopStats,
+    SavedAppAudioVolume,
 };

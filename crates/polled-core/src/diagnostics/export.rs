@@ -9,18 +9,20 @@
 use chrono::Local;
 
 use crate::checks::{CheckReport, Severity};
+use crate::devices::WootingKeyboardInfo;
 use crate::diagnostics::{
-    DiagnosticsSnapshot, PinnedBenchmark, TimerJitterBenchmark, BOUNCE_THRESHOLD_MS,
+    DiagnosticsSnapshot, DpcMonitorSnapshot, PinnedBenchmark, ReactionTestSummary,
+    TimerJitterBenchmark, BOUNCE_THRESHOLD_MS,
 };
 use crate::win::{AudioLatencyBenchmark, NetworkJitterBenchmark, UsbMouseTopology};
 
 const IMG_W: usize = 960;
 const IMG_H: usize = 560;
 const RIG_W: usize = 1040;
-const RIG_H: usize = 620;
+const RIG_H: usize = 760;
 
-/// Combined snapshot of Windows health, mouse polling, USB topology, audio, timer, and network
-/// benchmarks rendered into a single shareable All-in-One Rig Scorecard PNG.
+/// Combined snapshot of Windows health, mouse polling, USB topology, audio, timer, network,
+/// Wooting keyboard, per-core DPC, and raw-input reaction test rendered into a shareable Rig Scorecard PNG.
 pub struct RigScorecardInput<'a> {
     pub windows_version: Option<&'a str>,
     pub health_checks: &'a [CheckReport],
@@ -30,6 +32,9 @@ pub struct RigScorecardInput<'a> {
     pub timer: Option<&'a TimerJitterBenchmark>,
     pub audio: Option<&'a AudioLatencyBenchmark>,
     pub network: Option<&'a NetworkJitterBenchmark>,
+    pub wooting: Option<&'a WootingKeyboardInfo>,
+    pub dpc: Option<&'a DpcMonitorSnapshot>,
+    pub reaction: Option<&'a ReactionTestSummary>,
 }
 
 // 16-entry indexed palette (strict monochrome B&W + 4 semantic status colors only).
@@ -1150,8 +1155,8 @@ pub fn render_rig_scorecard_png(input: &RigScorecardInput<'_>, dark_mode: bool) 
     }
 
     // --- ROW 2: USB TOPOLOGY (left) + AUDIO & TIMER (mid) + DUAL-HOP NETWORK (right) ---
-    let r2_y = r1_y + r1_h + 16;
-    let r2_h = RIG_H - r2_y - 40;
+    let r2_y = r1_y + r1_h + 14;
+    let r2_h = 200;
     let col_gap = 14;
     let col_w = (RIG_W - 52 - col_gap * 2) / 3;
     let c1_x = 26;
@@ -1313,6 +1318,153 @@ pub fn render_rig_scorecard_png(input: &RigScorecardInput<'_>, dark_mode: bool) 
             c3_x + 14,
             r2_y + 52,
             "Run 5s Dual-Hop Ping in Bench.",
+            C_DIM,
+        );
+    }
+
+    // --- ROW 3: WOOTING KEYBOARD (left) + PER-CORE DPC / IRQ (mid) + RAW-INPUT REACTION (right) ---
+    let r3_y = r2_y + r2_h + 14;
+    let r3_h = RIG_H - r3_y - 36;
+
+    // 6. Wooting Keyboard
+    let wooting_sev = input.wooting.map(|_| Severity::Ok);
+    draw_card(
+        &mut c,
+        c1_x,
+        r3_y,
+        col_w,
+        r3_h,
+        "6. WOOTING KEYBOARD",
+        wooting_sev,
+    );
+    if let Some(kb) = input.wooting {
+        let fw = kb
+            .firmware_version
+            .as_deref()
+            .map(|v| format!("v{v}"))
+            .unwrap_or_else(|| kb.protocol.label().to_string());
+        let title_ln = format!("{} ({fw})", kb.name);
+        c.draw_text_clipped(c1_x + 14, r3_y + 44, &title_ln, C_TEXT, col_w - 28);
+        let slot_ln = kb
+            .active_profile
+            .map(|s| format!("Profile: {}", kb.profile_display_name(s)))
+            .unwrap_or_else(|| "Profile: Active".to_string());
+        c.draw_text_clipped(c1_x + 14, r3_y + 64, &slot_ln, C_MUTED, col_w - 28);
+        if let Some(ap) = &kb.analog_profile {
+            let act_ln = format!(
+                "Act {:.2}mm | RT {} ({:.2}mm)",
+                ap.actuation_mm.unwrap_or(0.0),
+                if ap.rapid_trigger_enabled == Some(true) {
+                    "ON"
+                } else {
+                    "OFF"
+                },
+                ap.rapid_trigger_sensitivity_mm.unwrap_or(0.0)
+            );
+            c.draw_text_clipped(c1_x + 14, r3_y + 84, &act_ln, C_TEXT, col_w - 28);
+            let tach_ln = format!(
+                "Tachyon {} | {} overrides | {} AKC",
+                if ap.tachyon_enabled == Some(true) {
+                    "ON"
+                } else {
+                    "OFF"
+                },
+                kb.per_key_actuation.len(),
+                kb.advanced_keys.len()
+            );
+            c.draw_text_clipped(c1_x + 14, r3_y + 104, &tach_ln, C_OK, col_w - 28);
+        }
+    } else {
+        c.draw_text(
+            c1_x + 14,
+            r3_y + 50,
+            "No Wooting keyboard connected.",
+            C_DIM,
+        );
+    }
+
+    // 7. Per-Core Interrupt & DPC Monitor
+    let dpc_valid = input.dpc.filter(|d| d.core_count > 0);
+    draw_card(
+        &mut c,
+        c2_x,
+        r3_y,
+        col_w,
+        r3_h,
+        "7. PER-CORE DPC / IRQ",
+        dpc_valid.map(|d| d.severity),
+    );
+    if let Some(dpc) = dpc_valid {
+        let hot = dpc
+            .hottest_core
+            .map(|idx| format!("C{idx:02} {:.1}%", dpc.hottest_dpc_irq_pct))
+            .unwrap_or_else(|| "--".to_string());
+        let l1 = format!(
+            "{} cores | Peak {:.1}% | Hot {hot}",
+            dpc.core_count, dpc.peak_dpc_irq_pct
+        );
+        let l2 = format!(
+            "Core 0: {:.1}% | Others avg: {:.1}%",
+            dpc.core0_dpc_irq_pct, dpc.other_cores_avg_dpc_irq_pct
+        );
+        let l3 = if dpc.core0_starved {
+            "CORE 0 IRQ STARVATION FLAGGED"
+        } else {
+            "Core 0 balance clean"
+        };
+        c.draw_text_clipped(c2_x + 14, r3_y + 46, &l1, C_TEXT, col_w - 28);
+        c.draw_text_clipped(c2_x + 14, r3_y + 68, &l2, C_MUTED, col_w - 28);
+        c.draw_text_clipped(
+            c2_x + 14,
+            r3_y + 92,
+            l3,
+            severity_color(dpc.severity),
+            col_w - 28,
+        );
+    } else {
+        c.draw_text(
+            c2_x + 14,
+            r3_y + 50,
+            "Run DPC Monitor in System & USB.",
+            C_DIM,
+        );
+    }
+
+    // 8. Raw-Input Click Reaction Test
+    let react_valid = input.reaction.filter(|r| r.trial_count > 0);
+    draw_card(
+        &mut c,
+        c3_x,
+        r3_y,
+        col_w,
+        r3_h,
+        "8. RAW-INPUT REACTION",
+        react_valid.map(|r| r.severity),
+    );
+    if let Some(rx) = react_valid {
+        let big = format!("{:.0} MS", rx.median_ms);
+        c.draw_text_scaled(c3_x + 14, r3_y + 44, &big, C_TEXT, 2);
+        let l1 = format!(
+            "Best {:.1}ms | P95 {:.1}ms | SD {:.1}ms",
+            rx.best_ms, rx.p95_ms, rx.stddev_ms
+        );
+        let l2 = format!(
+            "{} trials | {} false starts | {}",
+            rx.trial_count, rx.false_starts, rx.rating
+        );
+        c.draw_text_clipped(c3_x + 14, r3_y + 76, &l1, C_MUTED, col_w - 28);
+        c.draw_text_clipped(
+            c3_x + 14,
+            r3_y + 98,
+            &l2,
+            severity_color(rx.severity),
+            col_w - 28,
+        );
+    } else {
+        c.draw_text(
+            c3_x + 14,
+            r3_y + 50,
+            "Run Reaction Test in Aim & Switches.",
             C_DIM,
         );
     }
@@ -1824,7 +1976,7 @@ mod tests {
     }
 
     #[test]
-    fn rig_scorecard_png_renders_valid_1040x620_png() {
+    fn rig_scorecard_png_renders_valid_1040x760_png() {
         let snap = sample_snapshot();
         let input = RigScorecardInput {
             windows_version: Some("11 24H2 (26100)"),
@@ -1835,6 +1987,9 @@ mod tests {
             timer: None,
             audio: None,
             network: None,
+            wooting: None,
+            dpc: None,
+            reaction: None,
         };
         let bytes = render_rig_scorecard_png(&input, true);
         assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);

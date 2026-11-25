@@ -21,15 +21,18 @@ use windows::Win32::Foundation::{
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
     eCapture, eCommunications, eConsole, eMultimedia, eRender, IAudioClient, IAudioClient3,
-    IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+    IAudioRenderClient, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
+    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use crate::checks::Severity;
 use crate::error::{PolledError, Result};
@@ -730,9 +733,202 @@ pub fn measure_audio_latency_benchmark(duration_ms: u64) -> Result<AudioLatencyB
     })
 }
 
+/// Captured Windows per-application audio mixer state so Polled can restore exact sliders on desktop/exit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedAppAudioVolume {
+    pub exe_name: String,
+    pub pid: u32,
+    pub original_volume: f32,
+    pub original_muted: bool,
+}
+
+fn normalize_audio_app_name(raw: &str) -> String {
+    let base = raw
+        .trim()
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if base.is_empty() {
+        return String::new();
+    }
+    if base.ends_with(".exe") {
+        base
+    } else {
+        format!("{base}.exe")
+    }
+}
+
+fn process_exe_basename(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: Standard read-only `PROCESS_QUERY_LIMITED_INFORMATION` handle query (anti-cheat safe).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let _guard = OwnedHandle(handle);
+    let mut buf = vec![0u16; 512];
+    let mut len = buf.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()?;
+    let full = String::from_utf16_lossy(&buf[..len as usize]);
+    let base = full
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    (!base.is_empty()).then_some(base)
+}
+
+/// Lowers or mutes (`target_volume_pct == 0`) active Windows Volume Mixer sessions for matching
+/// background app executables (e.g. `spotify.exe`, `chrome.exe`) on the default playback device,
+/// returning their exact original mixer states so Polled can restore them cleanly on tab-out/exit.
+pub fn duck_app_audio_sessions(
+    target_exes: &[String],
+    target_volume_pct: u8,
+) -> Result<Vec<SavedAppAudioVolume>> {
+    let targets: Vec<String> = target_exes
+        .iter()
+        .map(|s| normalize_audio_app_name(s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let _com = ComGuard::acquire()?;
+    let enumerator = create_enumerator()?;
+    let device = resolve_device(&enumerator, AudioFlow::Render, None)?;
+    let mgr: IAudioSessionManager2 =
+        unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|e| PolledError::Win32 {
+            context: "Activate(IAudioSessionManager2)".to_string(),
+            message: e.to_string(),
+        })?;
+    let session_enum = unsafe { mgr.GetSessionEnumerator() }.map_err(|e| PolledError::Win32 {
+        context: "IAudioSessionManager2::GetSessionEnumerator".to_string(),
+        message: e.to_string(),
+    })?;
+    let count = unsafe { session_enum.GetCount() }.unwrap_or(0);
+    let target_scalar = f32::from(target_volume_pct.min(100)) / 100.0;
+
+    let mut saved = Vec::new();
+    for idx in 0..count {
+        let Ok(ctrl) = (unsafe { session_enum.GetSession(idx) }) else {
+            continue;
+        };
+        let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
+            continue;
+        };
+        let Ok(pid) = (unsafe { ctrl2.GetProcessId() }) else {
+            continue;
+        };
+        let Some(exe) = process_exe_basename(pid) else {
+            continue;
+        };
+        if !targets.iter().any(|t| t == &exe) {
+            continue;
+        }
+        let Ok(vol) = ctrl.cast::<ISimpleAudioVolume>() else {
+            continue;
+        };
+        let Ok(orig_vol) = (unsafe { vol.GetMasterVolume() }) else {
+            continue;
+        };
+        let Ok(orig_muted_bool) = (unsafe { vol.GetMute() }) else {
+            continue;
+        };
+        let orig_muted = orig_muted_bool.as_bool();
+
+        let applied = if target_volume_pct == 0 {
+            unsafe { vol.SetMute(true, ptr::null()) }.is_ok()
+        } else {
+            unsafe { vol.SetMasterVolume(target_scalar, ptr::null()) }.is_ok()
+        };
+        if applied {
+            saved.push(SavedAppAudioVolume {
+                exe_name: exe,
+                pid,
+                original_volume: orig_vol.clamp(0.0, 1.0),
+                original_muted: orig_muted,
+            });
+        }
+    }
+    Ok(saved)
+}
+
+/// Restores previously ducked/muted application audio sessions back to their exact captured
+/// Windows Volume Mixer level and mute state.
+pub fn restore_app_audio_sessions(saved: &[SavedAppAudioVolume]) -> Result<usize> {
+    if saved.is_empty() {
+        return Ok(0);
+    }
+    let _com = ComGuard::acquire()?;
+    let enumerator = create_enumerator()?;
+    let device = resolve_device(&enumerator, AudioFlow::Render, None)?;
+    let mgr: IAudioSessionManager2 =
+        unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|e| PolledError::Win32 {
+            context: "Activate(IAudioSessionManager2)".to_string(),
+            message: e.to_string(),
+        })?;
+    let session_enum = unsafe { mgr.GetSessionEnumerator() }.map_err(|e| PolledError::Win32 {
+        context: "IAudioSessionManager2::GetSessionEnumerator".to_string(),
+        message: e.to_string(),
+    })?;
+    let count = unsafe { session_enum.GetCount() }.unwrap_or(0);
+    let mut restored = 0usize;
+
+    for idx in 0..count {
+        let Ok(ctrl) = (unsafe { session_enum.GetSession(idx) }) else {
+            continue;
+        };
+        let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
+            continue;
+        };
+        let Ok(pid) = (unsafe { ctrl2.GetProcessId() }) else {
+            continue;
+        };
+        let entry = saved.iter().find(|s| s.pid == pid).or_else(|| {
+            let exe = process_exe_basename(pid)?;
+            saved.iter().find(|s| s.exe_name == exe)
+        });
+        let Some(entry) = entry else {
+            continue;
+        };
+        if let Ok(vol) = ctrl.cast::<ISimpleAudioVolume>() {
+            let ok_v =
+                unsafe { vol.SetMasterVolume(entry.original_volume.clamp(0.0, 1.0), ptr::null()) }
+                    .is_ok();
+            let ok_m = unsafe { vol.SetMute(entry.original_muted, ptr::null()) }.is_ok();
+            if ok_v || ok_m {
+                restored += 1;
+            }
+        }
+    }
+    Ok(restored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_background_audio_app_names() {
+        assert_eq!(normalize_audio_app_name("spotify"), "spotify.exe");
+        assert_eq!(normalize_audio_app_name("  Chrome.EXE "), "chrome.exe");
+        assert_eq!(
+            normalize_audio_app_name(r"C:\Program Files\Discord\Discord.exe"),
+            "discord.exe"
+        );
+        assert_eq!(normalize_audio_app_name("   "), "");
+    }
 
     #[test]
     fn extracts_endpoint_guid_and_detects_bluetooth_hfp() {

@@ -168,6 +168,10 @@ pub struct TrayAlertConfig {
     /// Show a brief click-through monochrome Win32 on-screen pill (zero game hooks) on profile/DPI switches.
     #[serde(default)]
     pub osd_pill_enabled: bool,
+    /// Opt-in battery guard: automatically step down wireless 2K/4K/8K mice to 1000 Hz at or below
+    /// `low_battery_threshold_pct`, restoring profile polling rate once charging or above recovery.
+    #[serde(default)]
+    pub low_battery_polling_guard: bool,
 }
 
 fn default_true() -> bool {
@@ -186,6 +190,7 @@ impl Default for TrayAlertConfig {
             low_battery_threshold_pct: default_low_battery_threshold(),
             profile_switch_toast: false,
             osd_pill_enabled: false,
+            low_battery_polling_guard: false,
         }
     }
 }
@@ -325,6 +330,7 @@ mod tests {
                 low_battery_threshold_pct: 20,
                 profile_switch_toast: true,
                 osd_pill_enabled: true,
+                low_battery_polling_guard: true,
             },
         };
         custom.save_atomic(&path).unwrap();

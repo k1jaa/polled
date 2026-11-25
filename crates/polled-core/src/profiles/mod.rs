@@ -145,10 +145,21 @@ pub struct GameProfile {
     /// profile is active and restores your original setting automatically on desktop/exit.
     #[serde(default)]
     pub quiet_notifications: bool,
+    /// Optional background app executables (e.g. `["spotify.exe", "chrome.exe"]`) to duck/mute
+    /// in the Windows Volume Mixer while this profile is active (auto-restored on desktop/exit).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duck_audio_apps: Vec<String>,
+    /// Target Volume Mixer level (`0..=100%`; `0` = mute) applied to `duck_audio_apps`.
+    #[serde(default = "default_duck_audio_volume_pct")]
+    pub duck_audio_volume_pct: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+fn default_duck_audio_volume_pct() -> u8 {
+    15
 }
 
 impl GameProfile {
@@ -182,6 +193,8 @@ impl GameProfile {
             wooting_profile: None,
             force_high_perf_gpu: false,
             quiet_notifications: false,
+            duck_audio_apps: Vec::new(),
+            duck_audio_volume_pct: default_duck_audio_volume_pct(),
             author: None,
             notes: Some("Fallback profile used whenever no game profile matches.".to_string()),
         }
@@ -272,6 +285,21 @@ impl GameProfile {
         self.wooting_profile = self
             .wooting_profile
             .map(|idx| idx.min(crate::devices::WOOTING_MAX_PROFILE_INDEX));
+        self.duck_audio_apps = self
+            .duck_audio_apps
+            .into_iter()
+            .filter_map(|e| {
+                let norm = normalize_exe_name(&e);
+                if norm.is_empty() {
+                    None
+                } else if norm.ends_with(".exe") {
+                    Some(norm)
+                } else {
+                    Some(format!("{norm}.exe"))
+                }
+            })
+            .collect();
+        self.duck_audio_volume_pct = self.duck_audio_volume_pct.min(100);
         self
     }
 }
@@ -430,6 +458,8 @@ mod tests {
             wooting_profile: Some(1),
             force_high_perf_gpu: true,
             quiet_notifications: true,
+            duck_audio_apps: vec!["spotify.exe".to_string()],
+            duck_audio_volume_pct: 10,
             author: Some("k1jaa".to_string()),
             notes: Some("Tournament config".to_string()),
         });
@@ -494,6 +524,8 @@ mod tests {
             wooting_profile: None,
             force_high_perf_gpu: false,
             quiet_notifications: false,
+            duck_audio_apps: Vec::new(),
+            duck_audio_volume_pct: 15,
             author: Some("k1jaa".to_string()),
             notes: Some("Low LOD + 4K".to_string()),
         };

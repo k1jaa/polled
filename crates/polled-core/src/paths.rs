@@ -70,6 +70,11 @@ impl AppPaths {
     pub fn exports_dir(&self) -> PathBuf {
         self.root.join("exports")
     }
+
+    /// Stores persistent Bench benchmark run history for cross-session Before/After A/B comparisons.
+    pub fn bench_history_path(&self) -> PathBuf {
+        self.root.join("bench_history.json")
+    }
 }
 
 #[cfg(test)]

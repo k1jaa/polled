@@ -127,6 +127,8 @@ pub struct ProfileDraft {
     pub wooting_profile: Option<u8>,
     pub force_high_perf_gpu: bool,
     pub quiet_notifications: bool,
+    pub duck_audio_apps_csv: String,
+    pub duck_audio_volume_pct: u8,
     pub set_win_speed: bool,
     pub win_speed: u32,
     pub set_power_plan: bool,
@@ -185,6 +187,8 @@ impl ProfileDraft {
             wooting_profile: p.wooting_profile,
             force_high_perf_gpu: p.force_high_perf_gpu,
             quiet_notifications: p.quiet_notifications,
+            duck_audio_apps_csv: p.duck_audio_apps.join(", "),
+            duck_audio_volume_pct: p.duck_audio_volume_pct,
             set_win_speed: p.windows_pointer_speed.is_some(),
             win_speed: p.windows_pointer_speed.unwrap_or(10),
             set_power_plan: p.windows_power_plan.is_some(),
@@ -348,6 +352,14 @@ impl ProfileDraft {
             wooting_profile: copy.wooting_profile,
             force_high_perf_gpu: !copy.is_desktop_default && copy.force_high_perf_gpu,
             quiet_notifications: copy.quiet_notifications,
+            duck_audio_apps: copy
+                .duck_audio_apps_csv
+                .split([',', ';', '\n'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            duck_audio_volume_pct: copy.duck_audio_volume_pct.min(100),
             author: (!copy.author.trim().is_empty()).then(|| copy.author.trim().to_string()),
             notes: (!copy.notes.trim().is_empty()).then(|| copy.notes.trim().to_string()),
         }
@@ -1628,6 +1640,8 @@ impl ProfilesUiState {
                             wooting_profile: None,
                             force_high_perf_gpu: false,
                             quiet_notifications: false,
+                            duck_audio_apps: Vec::new(),
+                            duck_audio_volume_pct: 15,
                             author: None,
                             notes: None,
                         };
@@ -2749,6 +2763,67 @@ impl ProfilesUiState {
                             .on_hover_text(
                                 "Temporarily disables Windows toast popups while this profile is active and restores your original setting automatically on desktop or exit.",
                             );
+                            ui.end_row();
+
+                            ui.label(RichText::new("App Mixer Duck").color(p.text_muted));
+                            ui.vertical(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.editor.duck_audio_apps_csv,
+                                        )
+                                        .desired_width((field_w - 110.0).clamp(110.0, 260.0))
+                                        .hint_text("spotify.exe, chrome.exe"),
+                                    );
+                                    ui.label(RichText::new("to").size(11.5).color(p.text_muted));
+                                    let duck_suffix = if self.editor.duck_audio_volume_pct == 0 {
+                                        "% (Mute)"
+                                    } else {
+                                        "%"
+                                    };
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.editor.duck_audio_volume_pct)
+                                            .range(0..=100)
+                                            .speed(1)
+                                            .suffix(duck_suffix),
+                                    );
+                                });
+                                ui.add_space(3.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    for (label, exe) in [
+                                        ("+ Spotify", "spotify.exe"),
+                                        ("+ Chrome", "chrome.exe"),
+                                        ("+ Edge", "msedge.exe"),
+                                        ("+ Firefox", "firefox.exe"),
+                                        ("+ Discord", "discord.exe"),
+                                    ] {
+                                        if ui.add(secondary_btn(label, p)).clicked() {
+                                            let already = self
+                                                .editor
+                                                .duck_audio_apps_csv
+                                                .split([',', ';'])
+                                                .any(|s| s.trim().eq_ignore_ascii_case(exe));
+                                            if !already {
+                                                if !self.editor.duck_audio_apps_csv.trim().is_empty()
+                                                {
+                                                    self.editor.duck_audio_apps_csv.push_str(", ");
+                                                }
+                                                self.editor.duck_audio_apps_csv.push_str(exe);
+                                            }
+                                        }
+                                    }
+                                });
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(
+                                            "Lowers or mutes (0%) matching apps in Windows Volume Mixer while active; restores exact original sliders on desktop/exit.",
+                                        )
+                                        .size(11.0)
+                                        .color(p.text_muted),
+                                    )
+                                    .wrap(),
+                                );
+                            });
                             ui.end_row();
                             }
                         });

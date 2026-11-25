@@ -18,17 +18,18 @@ use eframe::egui::{
 };
 use polled_core::win::{SystemEnv, UsbMouseTopology, WindowsEnv};
 use polled_core::{
-    build_diagnostic_advice, compute_reaction_summary, compute_sensitivity, current_qpc_ns,
-    format_advice_summary, format_audio_benchmark_summary, format_diagnostic_report,
-    format_intervals_csv, format_network_benchmark_summary, format_watchdog_report,
-    render_ab_comparison_png, render_report_png, render_rig_scorecard_png,
+    append_dpc_advice, build_diagnostic_advice, compute_reaction_summary, compute_sensitivity,
+    current_qpc_ns, format_advice_summary, format_audio_benchmark_summary,
+    format_diagnostic_report, format_intervals_csv, format_network_benchmark_summary,
+    format_watchdog_report, render_ab_comparison_png, render_report_png, render_rig_scorecard_png,
     run_audio_latency_benchmark, run_network_jitter_benchmark, run_timer_jitter_benchmark,
-    AppPaths, AudioLatencyBenchmark, CheckReport, CoreDpcMetrics, DiagnosticAdvice,
-    DiagnosticsSnapshot, DpcMonitorSession, DpcMonitorSnapshot, MatchWatchdogSession,
-    NetworkJitterBenchmark, PinnedBenchmark, PollingStats, PollingTarget, RawInputCaptureSession,
-    ReactionTestSummary, RigScorecardInput, SensitivityGame, Severity, TimerJitterBenchmark,
-    TrackingStats, WatchdogSnapshot, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS,
-    KEY_CHATTER_THRESHOLD_MS, SCROLL_DOUBLE_NOTCH_MS, STANDARD_RATES_HZ,
+    AppPaths, AudioLatencyBenchmark, BenchHistoryStore, CheckReport, CoreDpcMetrics,
+    DiagnosticAdvice, DiagnosticsSnapshot, DpcMonitorSession, DpcMonitorSnapshot,
+    MatchWatchdogSession, NetworkJitterBenchmark, PinnedBenchmark, PollingStats, PollingTarget,
+    RawInputCaptureSession, ReactionTestSummary, RigScorecardInput, SavedBenchRun, SensitivityGame,
+    Severity, TimerJitterBenchmark, TrackingStats, WatchdogSnapshot, WootingKeyboardInfo,
+    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, SCROLL_DOUBLE_NOTCH_MS,
+    STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
@@ -188,6 +189,8 @@ pub struct InputLabUiState {
     pinned_baseline: Option<PinnedBenchmark>,
     baseline_label: String,
     current_label: String,
+    bench_history: BenchHistoryStore,
+    history_label_draft: String,
     usb_topology: Option<Vec<UsbMouseTopology>>,
     pub notice: Option<(Severity, String)>,
 }
@@ -200,6 +203,8 @@ impl Default for InputLabUiState {
 
 impl InputLabUiState {
     pub fn new() -> Self {
+        let bench_history =
+            BenchHistoryStore::load_or_default(&AppPaths::default_user_dir().bench_history_path());
         Self {
             active_tab: BenchSubTab::Polling,
             session: None,
@@ -244,6 +249,8 @@ impl InputLabUiState {
             pinned_baseline: None,
             baseline_label: "Baseline (A)".to_string(),
             current_label: "Current (B)".to_string(),
+            bench_history,
+            history_label_draft: String::new(),
             usb_topology: None,
             notice: None,
         }
@@ -711,6 +718,7 @@ impl InputLabUiState {
         detected_dpi: Option<u16>,
         health_checks: &[CheckReport],
         windows_version: Option<&str>,
+        wooting_kb: Option<&WootingKeyboardInfo>,
     ) -> Option<InputLabNavAction> {
         self.poll_background();
         self.tick_timers(ctx);
@@ -754,7 +762,7 @@ impl InputLabUiState {
             self.toggle_dpi_measurement(ctx);
         }
 
-        let advice = build_diagnostic_advice(
+        let mut advice = build_diagnostic_advice(
             &self.last_snapshot,
             self.configured_dpi,
             self.timer_benchmark.as_ref(),
@@ -763,6 +771,7 @@ impl InputLabUiState {
             self.usb_topology.as_deref().unwrap_or(&[]),
             health_checks,
         );
+        append_dpc_advice(&mut advice, &self.last_dpc);
         let mut nav_action: Option<InputLabNavAction> = None;
 
         let content_w = ui.available_width().max(320.0);
@@ -778,6 +787,7 @@ impl InputLabUiState {
             &advice,
             health_checks,
             windows_version,
+            wooting_kb,
         );
 
         ui.add_space(10.0);
@@ -849,6 +859,9 @@ impl InputLabUiState {
                                 nav_action = Some(act);
                             }
                         }
+
+                        ui.add_space(12.0);
+                        self.render_bench_history_card(ui, p, scroll_w);
                     }
                     BenchSubTab::AimSwitches => {
                         self.render_reaction_test_card(ctx, ui, p, mode, scroll_w);
@@ -962,7 +975,7 @@ impl InputLabUiState {
                                     );
                                     ui.label(
                                         RichText::new(
-                                            "Export a single 1040×620 monochrome PNG combining Health Check, 4K/8K Polling + OS Stalls, USB Topology, WASAPI Audio, and Dual-Hop Ping.",
+                                            "Export a single 1040×760 monochrome PNG combining Health Check, 4K/8K Polling + OS Stalls, USB Topology, WASAPI Audio, Dual-Hop Ping, Wooting Keyboard, Per-Core DPC/IRQ, and Raw-Input Reaction.",
                                         )
                                         .size(11.5)
                                         .color(p.text_muted),
@@ -979,6 +992,7 @@ impl InputLabUiState {
                                                 mode,
                                                 health_checks,
                                                 windows_version,
+                                                wooting_kb,
                                             );
                                         }
                                     },
@@ -994,13 +1008,197 @@ impl InputLabUiState {
         nav_action
     }
 
+    fn save_current_run_to_history(&mut self) {
+        let reaction_summary = (!self.reaction_trials.is_empty())
+            .then(|| compute_reaction_summary(&self.reaction_trials, self.reaction_false_starts));
+        let dpc_opt = (self.last_dpc.core_count > 0).then_some(&self.last_dpc);
+        let run = SavedBenchRun::from_live(
+            self.history_label_draft.clone(),
+            self.configured_dpi,
+            &self.last_snapshot,
+            self.timer_benchmark.as_ref(),
+            reaction_summary.as_ref(),
+            dpc_opt,
+        );
+        let label = run.label.clone();
+        self.bench_history.push_run(run);
+        let path = AppPaths::default_user_dir().bench_history_path();
+        match self.bench_history.save_atomic(&path) {
+            Ok(()) => {
+                self.history_label_draft.clear();
+                self.notice = Some((
+                    Severity::Ok,
+                    format!(
+                        "Saved '{label}' to persistent Bench History ({} saved).",
+                        self.bench_history.runs.len()
+                    ),
+                ));
+            }
+            Err(err) => {
+                self.notice = Some((
+                    Severity::Bad,
+                    format!("Failed to save Bench History: {err}"),
+                ));
+            }
+        }
+    }
+
+    fn render_bench_history_card(&mut self, ui: &mut egui::Ui, p: Palette, card_w: f32) {
+        let has_data = self.last_snapshot.polling.total_motion_packets > 0
+            || self.timer_benchmark.is_some()
+            || !self.reaction_trials.is_empty();
+        let mut do_save = false;
+        let mut load_id: Option<String> = None;
+        let mut delete_id: Option<String> = None;
+
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Saved Bench History ({})",
+                        self.bench_history.runs.len()
+                    ))
+                    .size(14.0)
+                    .strong()
+                    .color(p.text),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Persisted to bench_history.json · load any past run straight into Baseline (A) for Before/After comparison",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                );
+            });
+            ui.add_space(8.0);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.history_label_draft)
+                        .desired_width((card_w - 220.0).clamp(150.0, 320.0))
+                        .hint_text("Label (e.g. Rear USB3 · 4K · After MSI Fix)"),
+                );
+                if ui
+                    .add_enabled(has_data, primary_btn("Save Current Run", p))
+                    .clicked()
+                {
+                    do_save = true;
+                }
+            });
+
+            if self.bench_history.runs.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "No saved runs yet. Capture a run and click Save Current Run to keep cross-session A/B baselines.",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                );
+            } else {
+                ui.add_space(8.0);
+                for (idx, run) in self.bench_history.runs.iter().take(12).enumerate() {
+                    if idx > 0 {
+                        ui.add_space(4.0);
+                    }
+                    let ps = &run.snapshot.polling;
+                    let ts_str = run
+                        .saved_at
+                        .with_timezone(&Local)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string();
+                    let metrics = if ps.total_motion_packets > 0 {
+                        format!(
+                            "{:.0} Hz (med {:.3}ms · p99 {:.3}ms · {} drops)",
+                            ps.effective_hz,
+                            ps.median_us / 1000.0,
+                            ps.p99_us / 1000.0,
+                            ps.true_dropout_count
+                        )
+                    } else if let Some(rx) = &run.reaction {
+                        format!(
+                            "Reaction med {:.1}ms (SD {:.1}ms)",
+                            rx.median_ms, rx.stddev_ms
+                        )
+                    } else {
+                        "Timer / Snapshot".to_string()
+                    };
+                    egui::Frame::NONE
+                        .fill(p.bg)
+                        .stroke(Stroke::new(1.0_f32, p.border))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(&run.label).size(12.0).strong().color(p.text),
+                                );
+                                ui.label(
+                                    RichText::new(format!("{ts_str} · {metrics}"))
+                                        .size(11.0)
+                                        .monospace()
+                                        .color(p.text_muted),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.add(secondary_btn("Delete", p)).clicked() {
+                                            delete_id = Some(run.id.clone());
+                                        }
+                                        if ui
+                                            .add(secondary_btn("Load as Baseline (A)", p))
+                                            .clicked()
+                                        {
+                                            load_id = Some(run.id.clone());
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                }
+            }
+        });
+
+        if do_save {
+            self.save_current_run_to_history();
+        }
+        if let Some(id) = load_id {
+            if let Some(run) = self.bench_history.runs.iter().find(|r| r.id == id).cloned() {
+                self.baseline_label = run.label.clone();
+                self.pinned_baseline = Some(run.to_pinned_baseline());
+                self.notice = Some((
+                    Severity::Ok,
+                    format!(
+                        "Loaded '{}' as Baseline (A) for Before/After comparison.",
+                        run.label
+                    ),
+                ));
+            }
+        }
+        if let Some(id) = delete_id {
+            if self.bench_history.delete_run(&id) {
+                let path = AppPaths::default_user_dir().bench_history_path();
+                let _ = self.bench_history.save_atomic(&path);
+                self.notice = Some((
+                    Severity::Info,
+                    "Removed run from Bench History.".to_string(),
+                ));
+            }
+        }
+    }
+
     fn save_rig_scorecard_png(
         &mut self,
         mode: ThemeMode,
         health_checks: &[CheckReport],
         windows_version: Option<&str>,
+        wooting_kb: Option<&WootingKeyboardInfo>,
     ) {
         let dir = AppPaths::default_user_dir().exports_dir();
+        let reaction_summary = (!self.reaction_trials.is_empty())
+            .then(|| compute_reaction_summary(&self.reaction_trials, self.reaction_false_starts));
+        let dpc_opt = (self.last_dpc.core_count > 0).then_some(&self.last_dpc);
         let input = RigScorecardInput {
             windows_version,
             health_checks,
@@ -1010,6 +1208,9 @@ impl InputLabUiState {
             timer: self.timer_benchmark.as_ref(),
             audio: self.audio_benchmark.as_ref(),
             network: self.network_benchmark.as_ref(),
+            wooting: wooting_kb,
+            dpc: dpc_opt,
+            reaction: reaction_summary.as_ref(),
         };
         let png = render_rig_scorecard_png(&input, matches!(mode, ThemeMode::Dark));
         let filename = format!(
@@ -1044,6 +1245,7 @@ impl InputLabUiState {
         advice: &[DiagnosticAdvice],
         health_checks: &[CheckReport],
         windows_version: Option<&str>,
+        wooting_kb: Option<&WootingKeyboardInfo>,
     ) {
         let capturing = self.is_live_capturing();
         let counting_down = self.is_counting_down();
@@ -1073,6 +1275,7 @@ impl InputLabUiState {
         let mut do_save_csv = false;
         let mut do_open_exports = false;
         let mut do_pin_a = false;
+        let mut do_save_history = false;
         let mut do_clear_a = false;
         let mut do_save_ab_png = false;
         let mut next_mode = self.capture_mode;
@@ -1118,7 +1321,7 @@ impl InputLabUiState {
                             ui.close_menu();
                         }
                         if ui
-                            .button("Save Rig Scorecard PNG (1040×620)")
+                            .button("Save Rig Scorecard PNG (1040×760)")
                             .clicked()
                         {
                             do_save_scorecard = true;
@@ -1132,6 +1335,13 @@ impl InputLabUiState {
                             ui.close_menu();
                         }
                         ui.separator();
+                        if ui
+                            .add_enabled(has_data, egui::Button::new("Save Run to History"))
+                            .clicked()
+                        {
+                            do_save_history = true;
+                            ui.close_menu();
+                        }
                         if ui
                             .add_enabled(has_data, egui::Button::new("Pin Baseline (A)"))
                             .clicked()
@@ -1290,7 +1500,7 @@ impl InputLabUiState {
             }
         }
         if do_save_scorecard {
-            self.save_rig_scorecard_png(mode, health_checks, windows_version);
+            self.save_rig_scorecard_png(mode, health_checks, windows_version, wooting_kb);
         }
         if do_save_csv {
             let dir = AppPaths::default_user_dir().exports_dir();
@@ -1312,6 +1522,9 @@ impl InputLabUiState {
                     self.notice = Some((Severity::Bad, format!("Failed to save CSV: {err}")));
                 }
             }
+        }
+        if do_save_history {
+            self.save_current_run_to_history();
         }
         if do_pin_a {
             self.pinned_baseline = Some(PinnedBenchmark {

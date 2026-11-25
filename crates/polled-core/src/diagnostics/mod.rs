@@ -10,14 +10,15 @@
 pub mod analyzer;
 pub mod dpc_monitor;
 pub mod export;
+pub mod history;
 pub mod raw_capture;
 pub mod reaction;
 pub mod sensitivity;
 pub mod watchdog;
 
 pub use analyzer::{
-    build_diagnostic_advice, format_advice_summary, format_diagnostic_report, snap_nominal_hz,
-    ButtonBounceStats, ClickBounceAnalyzer, ClickBounceSnapshot, ClickEventRecord,
+    append_dpc_advice, build_diagnostic_advice, format_advice_summary, format_diagnostic_report,
+    snap_nominal_hz, ButtonBounceStats, ClickBounceAnalyzer, ClickBounceSnapshot, ClickEventRecord,
     DiagnosticAdvice, DiagnosticsSnapshot, DpiCalibrationResult, DpiCalibrator,
     DpiMeasurementSnapshot, HistogramBin, IntervalSample, KeyboardPollingAnalyzer,
     KeyboardPollingStats, MouseButtonKind, PinnedBenchmark, PollingAnalyzer, PollingStats,
@@ -32,6 +33,9 @@ pub use dpc_monitor::{
 pub use export::{
     format_intervals_csv, render_ab_comparison_png, render_report_png, render_rig_scorecard_png,
     RigScorecardInput,
+};
+pub use history::{
+    BenchHistoryStore, SavedBenchRun, BENCH_HISTORY_SCHEMA_VERSION, MAX_BENCH_HISTORY_ENTRIES,
 };
 pub use raw_capture::{current_qpc_ns, RawInputCaptureSession};
 pub use reaction::{compute_reaction_summary, ReactionTestSummary};

@@ -74,6 +74,8 @@ mod tests {
             wooting_profile: None,
             force_high_perf_gpu: false,
             quiet_notifications: false,
+            duck_audio_apps: Vec::new(),
+            duck_audio_volume_pct: 15,
             author: None,
             notes: None,
         });
@@ -103,6 +105,8 @@ mod tests {
             wooting_profile: None,
             force_high_perf_gpu: false,
             quiet_notifications: false,
+            duck_audio_apps: Vec::new(),
+            duck_audio_volume_pct: 15,
             author: None,
             notes: None,
         });

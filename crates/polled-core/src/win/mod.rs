@@ -32,6 +32,31 @@ use serde::{Deserialize, Serialize};
 use crate::checks::Severity;
 use crate::error::Result;
 
+#[cfg(windows)]
+pub use audio::{duck_app_audio_sessions, restore_app_audio_sessions, SavedAppAudioVolume};
+
+#[cfg(not(windows))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedAppAudioVolume {
+    pub exe_name: String,
+    pub pid: u32,
+    pub original_volume: f32,
+    pub original_muted: bool,
+}
+
+#[cfg(not(windows))]
+pub fn duck_app_audio_sessions(
+    _target_exes: &[String],
+    _target_volume_pct: u8,
+) -> Result<Vec<SavedAppAudioVolume>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(windows))]
+pub fn restore_app_audio_sessions(_saved: &[SavedAppAudioVolume]) -> Result<usize> {
+    Ok(0)
+}
+
 /// Supported Windows Registry root hives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RegHive {

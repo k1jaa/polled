@@ -10,7 +10,7 @@
 //! - Opt-in live analog key-travel visualizer (`0xFF53` / `0xFF54` stream, 0% CPU when stopped)
 //! - Confirm-gated ARM Base Analog & Global Settings tuning with mandatory read-back verification
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
@@ -25,6 +25,12 @@ use polled_core::{
 
 use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::theme::{Palette, ThemeMode};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PerKeyConfirmAction {
+    SetMm(f32),
+    ResetToBase,
+}
 
 const ANALOG_SMOOTH_RATE: f32 = 18.0;
 const ANALOG_RELEASE_HOLD: Duration = Duration::from_millis(1000);
@@ -170,6 +176,10 @@ pub struct KeyboardUiState {
     draft_rt_enabled: bool,
     draft_rt_sens_mm: f32,
     confirm_analog_flash: bool,
+    // Interactive visual keymap per-key actuation selection & confirm-gated flash write.
+    selected_keys: BTreeSet<u16>,
+    draft_per_key_mm: f32,
+    confirm_per_key_action: Option<PerKeyConfirmAction>,
     // Draft values for ARM global settings.
     draft_debounce_filter: bool,
     draft_invert_num_lock: bool,
@@ -201,6 +211,9 @@ impl KeyboardUiState {
             draft_rt_enabled: true,
             draft_rt_sens_mm: 0.15,
             confirm_analog_flash: false,
+            selected_keys: BTreeSet::new(),
+            draft_per_key_mm: 0.40,
+            confirm_per_key_action: None,
             draft_debounce_filter: false,
             draft_invert_num_lock: false,
             draft_rgb_dim_min: 5,
@@ -320,6 +333,7 @@ impl KeyboardUiState {
 
     pub fn on_action_result(&mut self, ok: bool, message: String) {
         self.confirm_analog_flash = false;
+        self.confirm_per_key_action = None;
         self.synced_key = None; // Force re-sync from refreshed hardware read-back.
         self.notice = Some((if ok { Severity::Ok } else { Severity::Warn }, message));
     }
@@ -331,6 +345,7 @@ impl KeyboardUiState {
         }
         self.synced_key = Some(key);
         self.confirm_analog_flash = false;
+        self.confirm_per_key_action = None;
         if let Some(ap) = &kb.analog_profile {
             if let Some(mm) = ap.actuation_mm {
                 self.draft_actuation_mm = (mm * 100.0).round() / 100.0;
@@ -501,8 +516,8 @@ impl KeyboardUiState {
                 self.render_profile_switcher_card(ui, p, scroll_w, &kb, runtime);
                 ui.add_space(12.0);
 
-                // --- INTERACTIVE 60% VISUAL KEYMAP & LIVE ANALOG HEATMAP ---
-                self.render_visual_keymap_card(ui, p, scroll_w, &kb);
+                // --- INTERACTIVE MULTI-LAYOUT VISUAL KEYMAP & LIVE ANALOG HEATMAP ---
+                self.render_visual_keymap_card(ui, p, mode, scroll_w, &kb, runtime);
                 ui.add_space(12.0);
 
                 // --- LIVE ANALOG KEY-TRAVEL VISUALIZER & A/D COUNTER-STRAFE TIMING ---
@@ -1179,458 +1194,240 @@ impl KeyboardUiState {
     }
 
     fn render_visual_keymap_card(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         p: Palette,
+        mode: ThemeMode,
         card_w: f32,
         kb: &WootingKeyboardInfo,
+        runtime: &ProfileRuntimeHandle,
     ) {
+        #[derive(Clone, Copy)]
         struct KeySpec {
+            label: &'static str,
+            width_u: f32,
+            /// Wooting matrix index `(row << 5) | col`, or `0xFFFF` for an empty layout spacer.
+            matrix: u16,
+            alt_matrix: Option<u16>,
+            hid_usage: u16,
+        }
+        const fn key(
             label: &'static str,
             width_u: f32,
             matrix: u16,
             alt_matrix: Option<u16>,
             hid_usage: u16,
+        ) -> KeySpec {
+            KeySpec {
+                label,
+                width_u,
+                matrix,
+                alt_matrix,
+                hid_usage,
+            }
         }
-        const ROWS: &[&[KeySpec]] = &[
-            &[
-                KeySpec {
-                    label: "Esc",
-                    width_u: 1.0,
-                    matrix: 0x20,
-                    alt_matrix: None,
-                    hid_usage: 0x29,
-                },
-                KeySpec {
-                    label: "1",
-                    width_u: 1.0,
-                    matrix: 0x21,
-                    alt_matrix: None,
-                    hid_usage: 0x1E,
-                },
-                KeySpec {
-                    label: "2",
-                    width_u: 1.0,
-                    matrix: 0x22,
-                    alt_matrix: None,
-                    hid_usage: 0x1F,
-                },
-                KeySpec {
-                    label: "3",
-                    width_u: 1.0,
-                    matrix: 0x23,
-                    alt_matrix: None,
-                    hid_usage: 0x20,
-                },
-                KeySpec {
-                    label: "4",
-                    width_u: 1.0,
-                    matrix: 0x24,
-                    alt_matrix: None,
-                    hid_usage: 0x21,
-                },
-                KeySpec {
-                    label: "5",
-                    width_u: 1.0,
-                    matrix: 0x25,
-                    alt_matrix: None,
-                    hid_usage: 0x22,
-                },
-                KeySpec {
-                    label: "6",
-                    width_u: 1.0,
-                    matrix: 0x26,
-                    alt_matrix: None,
-                    hid_usage: 0x23,
-                },
-                KeySpec {
-                    label: "7",
-                    width_u: 1.0,
-                    matrix: 0x27,
-                    alt_matrix: None,
-                    hid_usage: 0x24,
-                },
-                KeySpec {
-                    label: "8",
-                    width_u: 1.0,
-                    matrix: 0x28,
-                    alt_matrix: None,
-                    hid_usage: 0x25,
-                },
-                KeySpec {
-                    label: "9",
-                    width_u: 1.0,
-                    matrix: 0x29,
-                    alt_matrix: None,
-                    hid_usage: 0x26,
-                },
-                KeySpec {
-                    label: "0",
-                    width_u: 1.0,
-                    matrix: 0x2A,
-                    alt_matrix: None,
-                    hid_usage: 0x27,
-                },
-                KeySpec {
-                    label: "-",
-                    width_u: 1.0,
-                    matrix: 0x2B,
-                    alt_matrix: None,
-                    hid_usage: 0x2D,
-                },
-                KeySpec {
-                    label: "=",
-                    width_u: 1.0,
-                    matrix: 0x2C,
-                    alt_matrix: None,
-                    hid_usage: 0x2E,
-                },
-                KeySpec {
-                    label: "Bksp",
-                    width_u: 2.0,
-                    matrix: 0x2D,
-                    alt_matrix: None,
-                    hid_usage: 0x2A,
-                },
-            ],
-            &[
-                KeySpec {
-                    label: "Tab",
-                    width_u: 1.5,
-                    matrix: 0x40,
-                    alt_matrix: None,
-                    hid_usage: 0x2B,
-                },
-                KeySpec {
-                    label: "Q",
-                    width_u: 1.0,
-                    matrix: 0x41,
-                    alt_matrix: None,
-                    hid_usage: 0x14,
-                },
-                KeySpec {
-                    label: "W",
-                    width_u: 1.0,
-                    matrix: 0x42,
-                    alt_matrix: None,
-                    hid_usage: 0x1A,
-                },
-                KeySpec {
-                    label: "E",
-                    width_u: 1.0,
-                    matrix: 0x43,
-                    alt_matrix: None,
-                    hid_usage: 0x08,
-                },
-                KeySpec {
-                    label: "R",
-                    width_u: 1.0,
-                    matrix: 0x44,
-                    alt_matrix: None,
-                    hid_usage: 0x15,
-                },
-                KeySpec {
-                    label: "T",
-                    width_u: 1.0,
-                    matrix: 0x45,
-                    alt_matrix: None,
-                    hid_usage: 0x17,
-                },
-                KeySpec {
-                    label: "Y",
-                    width_u: 1.0,
-                    matrix: 0x46,
-                    alt_matrix: None,
-                    hid_usage: 0x1C,
-                },
-                KeySpec {
-                    label: "U",
-                    width_u: 1.0,
-                    matrix: 0x47,
-                    alt_matrix: None,
-                    hid_usage: 0x18,
-                },
-                KeySpec {
-                    label: "I",
-                    width_u: 1.0,
-                    matrix: 0x48,
-                    alt_matrix: None,
-                    hid_usage: 0x0C,
-                },
-                KeySpec {
-                    label: "O",
-                    width_u: 1.0,
-                    matrix: 0x49,
-                    alt_matrix: None,
-                    hid_usage: 0x12,
-                },
-                KeySpec {
-                    label: "P",
-                    width_u: 1.0,
-                    matrix: 0x4A,
-                    alt_matrix: None,
-                    hid_usage: 0x13,
-                },
-                KeySpec {
-                    label: "[",
-                    width_u: 1.0,
-                    matrix: 0x4B,
-                    alt_matrix: None,
-                    hid_usage: 0x2F,
-                },
-                KeySpec {
-                    label: "]",
-                    width_u: 1.0,
-                    matrix: 0x4C,
-                    alt_matrix: None,
-                    hid_usage: 0x30,
-                },
-                KeySpec {
-                    label: "\\",
-                    width_u: 1.5,
-                    matrix: 0x4D,
-                    alt_matrix: None,
-                    hid_usage: 0x31,
-                },
-            ],
-            &[
-                KeySpec {
-                    label: "Caps",
-                    width_u: 1.75,
-                    matrix: 0x60,
-                    alt_matrix: None,
-                    hid_usage: 0x39,
-                },
-                KeySpec {
-                    label: "A",
-                    width_u: 1.0,
-                    matrix: 0x61,
-                    alt_matrix: None,
-                    hid_usage: 0x04,
-                },
-                KeySpec {
-                    label: "S",
-                    width_u: 1.0,
-                    matrix: 0x62,
-                    alt_matrix: None,
-                    hid_usage: 0x16,
-                },
-                KeySpec {
-                    label: "D",
-                    width_u: 1.0,
-                    matrix: 0x63,
-                    alt_matrix: None,
-                    hid_usage: 0x07,
-                },
-                KeySpec {
-                    label: "F",
-                    width_u: 1.0,
-                    matrix: 0x64,
-                    alt_matrix: None,
-                    hid_usage: 0x09,
-                },
-                KeySpec {
-                    label: "G",
-                    width_u: 1.0,
-                    matrix: 0x65,
-                    alt_matrix: None,
-                    hid_usage: 0x0A,
-                },
-                KeySpec {
-                    label: "H",
-                    width_u: 1.0,
-                    matrix: 0x66,
-                    alt_matrix: None,
-                    hid_usage: 0x0B,
-                },
-                KeySpec {
-                    label: "J",
-                    width_u: 1.0,
-                    matrix: 0x67,
-                    alt_matrix: None,
-                    hid_usage: 0x0D,
-                },
-                KeySpec {
-                    label: "K",
-                    width_u: 1.0,
-                    matrix: 0x68,
-                    alt_matrix: None,
-                    hid_usage: 0x0E,
-                },
-                KeySpec {
-                    label: "L",
-                    width_u: 1.0,
-                    matrix: 0x69,
-                    alt_matrix: None,
-                    hid_usage: 0x0F,
-                },
-                KeySpec {
-                    label: ";",
-                    width_u: 1.0,
-                    matrix: 0x6A,
-                    alt_matrix: None,
-                    hid_usage: 0x33,
-                },
-                KeySpec {
-                    label: "'",
-                    width_u: 1.0,
-                    matrix: 0x6B,
-                    alt_matrix: None,
-                    hid_usage: 0x34,
-                },
-                KeySpec {
-                    label: "Enter",
-                    width_u: 2.25,
-                    matrix: 0x6D,
-                    alt_matrix: None,
-                    hid_usage: 0x28,
-                },
-            ],
-            &[
-                KeySpec {
-                    label: "LShift",
-                    width_u: 2.25,
-                    matrix: 0x80,
-                    alt_matrix: None,
-                    hid_usage: 0xE1,
-                },
-                KeySpec {
-                    label: "Z",
-                    width_u: 1.0,
-                    matrix: 0x82,
-                    alt_matrix: None,
-                    hid_usage: 0x1D,
-                },
-                KeySpec {
-                    label: "X",
-                    width_u: 1.0,
-                    matrix: 0x83,
-                    alt_matrix: None,
-                    hid_usage: 0x1B,
-                },
-                KeySpec {
-                    label: "C",
-                    width_u: 1.0,
-                    matrix: 0x84,
-                    alt_matrix: None,
-                    hid_usage: 0x06,
-                },
-                KeySpec {
-                    label: "V",
-                    width_u: 1.0,
-                    matrix: 0x85,
-                    alt_matrix: None,
-                    hid_usage: 0x19,
-                },
-                KeySpec {
-                    label: "B",
-                    width_u: 1.0,
-                    matrix: 0x86,
-                    alt_matrix: None,
-                    hid_usage: 0x05,
-                },
-                KeySpec {
-                    label: "N",
-                    width_u: 1.0,
-                    matrix: 0x87,
-                    alt_matrix: None,
-                    hid_usage: 0x11,
-                },
-                KeySpec {
-                    label: "M",
-                    width_u: 1.0,
-                    matrix: 0x88,
-                    alt_matrix: None,
-                    hid_usage: 0x10,
-                },
-                KeySpec {
-                    label: ",",
-                    width_u: 1.0,
-                    matrix: 0x89,
-                    alt_matrix: None,
-                    hid_usage: 0x36,
-                },
-                KeySpec {
-                    label: ".",
-                    width_u: 1.0,
-                    matrix: 0x8A,
-                    alt_matrix: None,
-                    hid_usage: 0x37,
-                },
-                KeySpec {
-                    label: "/",
-                    width_u: 1.0,
-                    matrix: 0x8B,
-                    alt_matrix: None,
-                    hid_usage: 0x38,
-                },
-                KeySpec {
-                    label: "RShift",
-                    width_u: 2.75,
-                    matrix: 0x8D,
-                    alt_matrix: None,
-                    hid_usage: 0xE5,
-                },
-            ],
-            &[
-                KeySpec {
-                    label: "LCtrl",
-                    width_u: 1.25,
-                    matrix: 0xA0,
-                    alt_matrix: None,
-                    hid_usage: 0xE0,
-                },
-                KeySpec {
-                    label: "Win",
-                    width_u: 1.25,
-                    matrix: 0xA1,
-                    alt_matrix: None,
-                    hid_usage: 0xE3,
-                },
-                KeySpec {
-                    label: "LAlt",
-                    width_u: 1.25,
-                    matrix: 0xA2,
-                    alt_matrix: None,
-                    hid_usage: 0xE2,
-                },
-                KeySpec {
-                    label: "Space",
-                    width_u: 6.25,
-                    matrix: 0xA6,
-                    alt_matrix: None,
-                    hid_usage: 0x2C,
-                },
-                KeySpec {
-                    label: "RAlt",
-                    width_u: 1.25,
-                    matrix: 0xAA,
-                    alt_matrix: None,
-                    hid_usage: 0xE6,
-                },
-                KeySpec {
-                    label: "Menu",
-                    width_u: 1.25,
-                    matrix: 0xAC,
-                    alt_matrix: None,
-                    hid_usage: 0x65,
-                },
-                KeySpec {
-                    label: "RCtrl",
-                    width_u: 1.25,
-                    matrix: 0xAB,
-                    alt_matrix: Some(0xAD),
-                    hid_usage: 0xE4,
-                },
-                KeySpec {
-                    label: "Fn",
-                    width_u: 1.25,
-                    matrix: 0xAE,
-                    alt_matrix: None,
-                    hid_usage: 0x00,
-                },
-            ],
+        const fn gap_u(width_u: f32) -> KeySpec {
+            KeySpec {
+                label: "",
+                width_u,
+                matrix: 0xFFFF,
+                alt_matrix: None,
+                hid_usage: 0,
+            }
+        }
+
+        let is_iso = kb
+            .layout
+            .as_deref()
+            .is_some_and(|l| l.to_ascii_uppercase().contains("ISO"));
+        let is_tkl = kb.name.contains("80HE") || kb.name.contains("Two") || kb.name.contains("One");
+
+        let layout_badge = match (is_tkl, is_iso) {
+            (false, false) => "60% ANSI",
+            (false, true) => "60% ISO",
+            (true, false) => "80HE / TKL ANSI",
+            (true, true) => "80HE / TKL ISO",
+        };
+
+        // Build rows dynamically for 60% ANSI/ISO or 80HE/TKL ANSI/ISO.
+        let mut rows: Vec<Vec<KeySpec>> = Vec::with_capacity(6);
+        if is_tkl {
+            rows.push(vec![
+                key("Esc", 1.0, 0x00, None, 0x29),
+                gap_u(0.75),
+                key("F1", 1.0, 0x02, None, 0x3A),
+                key("F2", 1.0, 0x03, None, 0x3B),
+                key("F3", 1.0, 0x04, None, 0x3C),
+                key("F4", 1.0, 0x05, None, 0x3D),
+                gap_u(0.5),
+                key("F5", 1.0, 0x06, None, 0x3E),
+                key("F6", 1.0, 0x07, None, 0x3F),
+                key("F7", 1.0, 0x08, None, 0x40),
+                key("F8", 1.0, 0x09, None, 0x41),
+                gap_u(0.5),
+                key("F9", 1.0, 0x0A, None, 0x42),
+                key("F10", 1.0, 0x0B, None, 0x43),
+                key("F11", 1.0, 0x0C, None, 0x44),
+                key("F12", 1.0, 0x0D, None, 0x45),
+                gap_u(0.5),
+                key("Prt", 1.0, 0x0E, None, 0x46),
+                key("Pau", 1.0, 0x0F, None, 0x48),
+                key("Mod", 1.0, 0x10, None, 0x00),
+            ]);
+        }
+
+        // Row 1: Numbers
+        let mut r1 = vec![
+            key(
+                if is_tkl { "`" } else { "Esc" },
+                1.0,
+                0x20,
+                None,
+                if is_tkl { 0x35 } else { 0x29 },
+            ),
+            key("1", 1.0, 0x21, None, 0x1E),
+            key("2", 1.0, 0x22, None, 0x1F),
+            key("3", 1.0, 0x23, None, 0x20),
+            key("4", 1.0, 0x24, None, 0x21),
+            key("5", 1.0, 0x25, None, 0x22),
+            key("6", 1.0, 0x26, None, 0x23),
+            key("7", 1.0, 0x27, None, 0x24),
+            key("8", 1.0, 0x28, None, 0x25),
+            key("9", 1.0, 0x29, None, 0x26),
+            key("0", 1.0, 0x2A, None, 0x27),
+            key("-", 1.0, 0x2B, None, 0x2D),
+            key("=", 1.0, 0x2C, None, 0x2E),
+            key("Bksp", 2.0, 0x2D, None, 0x2A),
         ];
+        if is_tkl {
+            r1.extend([
+                gap_u(0.5),
+                key("Ins", 1.0, 0x2E, None, 0x49),
+                key("Hm", 1.0, 0x2F, None, 0x4A),
+                key("PU", 1.0, 0x30, None, 0x4B),
+            ]);
+        }
+        rows.push(r1);
+
+        // Row 2: QWERTY
+        let mut r2 = vec![
+            key("Tab", 1.5, 0x40, None, 0x2B),
+            key("Q", 1.0, 0x41, None, 0x14),
+            key("W", 1.0, 0x42, None, 0x1A),
+            key("E", 1.0, 0x43, None, 0x08),
+            key("R", 1.0, 0x44, None, 0x15),
+            key("T", 1.0, 0x45, None, 0x17),
+            key("Y", 1.0, 0x46, None, 0x1C),
+            key("U", 1.0, 0x47, None, 0x18),
+            key("I", 1.0, 0x48, None, 0x0C),
+            key("O", 1.0, 0x49, None, 0x12),
+            key("P", 1.0, 0x4A, None, 0x13),
+            key("[", 1.0, 0x4B, None, 0x2F),
+            key("]", 1.0, 0x4C, None, 0x30),
+            if is_iso {
+                key("Enter", 1.5, 0x6D, None, 0x28)
+            } else {
+                key("\\", 1.5, 0x4D, None, 0x31)
+            },
+        ];
+        if is_tkl {
+            r2.extend([
+                gap_u(0.5),
+                key("Del", 1.0, 0x4E, None, 0x4C),
+                key("End", 1.0, 0x4F, None, 0x4D),
+                key("PD", 1.0, 0x50, None, 0x4E),
+            ]);
+        }
+        rows.push(r2);
+
+        // Row 3: ASDF
+        let mut r3 = vec![
+            key("Caps", 1.75, 0x60, None, 0x39),
+            key("A", 1.0, 0x61, None, 0x04),
+            key("S", 1.0, 0x62, None, 0x16),
+            key("D", 1.0, 0x63, None, 0x07),
+            key("F", 1.0, 0x64, None, 0x09),
+            key("G", 1.0, 0x65, None, 0x0A),
+            key("H", 1.0, 0x66, None, 0x0B),
+            key("J", 1.0, 0x67, None, 0x0D),
+            key("K", 1.0, 0x68, None, 0x0E),
+            key("L", 1.0, 0x69, None, 0x0F),
+            key(";", 1.0, 0x6A, None, 0x33),
+            key("'", 1.0, 0x6B, None, 0x34),
+        ];
+        if is_iso {
+            r3.push(key("#", 1.0, 0x6C, None, 0x32));
+            r3.push(key("Ret", 1.25, 0x6D, None, 0x28));
+        } else {
+            r3.push(key("Enter", 2.25, 0x6D, None, 0x28));
+        }
+        if is_tkl {
+            r3.push(gap_u(3.5));
+        }
+        rows.push(r3);
+
+        // Row 4: ZXCV
+        let mut r4 = Vec::with_capacity(16);
+        if is_iso {
+            r4.push(key("LShf", 1.25, 0x80, None, 0xE1));
+            r4.push(key("ISO\\", 1.0, 0x81, None, 0x64));
+        } else {
+            r4.push(key("LShift", 2.25, 0x80, None, 0xE1));
+        }
+        r4.extend([
+            key("Z", 1.0, 0x82, None, 0x1D),
+            key("X", 1.0, 0x83, None, 0x1B),
+            key("C", 1.0, 0x84, None, 0x06),
+            key("V", 1.0, 0x85, None, 0x19),
+            key("B", 1.0, 0x86, None, 0x05),
+            key("N", 1.0, 0x87, None, 0x11),
+            key("M", 1.0, 0x88, None, 0x10),
+            key(",", 1.0, 0x89, None, 0x36),
+            key(".", 1.0, 0x8A, None, 0x37),
+            key("/", 1.0, 0x8B, None, 0x38),
+            key("RShift", 2.75, 0x8D, None, 0xE5),
+        ]);
+        if is_tkl {
+            r4.extend([gap_u(1.5), key("Up", 1.0, 0x8F, None, 0x52), gap_u(1.0)]);
+        }
+        rows.push(r4);
+
+        // Row 5: Bottom modifiers + Space
+        let mut r5 = vec![
+            key("LCtrl", 1.25, 0xA0, None, 0xE0),
+            key("Win", 1.25, 0xA1, None, 0xE3),
+            key("LAlt", 1.25, 0xA2, None, 0xE2),
+            key("Space", 6.25, 0xA6, None, 0x2C),
+            key("RAlt", 1.25, 0xAA, None, 0xE6),
+            key("Menu", 1.25, 0xAC, None, 0x65),
+            key("RCtrl", 1.25, 0xAB, Some(0xAD), 0xE4),
+            key("Fn", 1.25, 0xAE, None, 0x00),
+        ];
+        if is_tkl {
+            r5.extend([
+                gap_u(0.5),
+                key("Lt", 1.0, 0xB1, Some(0xAE), 0x50),
+                key("Dn", 1.0, 0xAF, None, 0x51),
+                key("Rt", 1.0, 0xB0, None, 0x4F),
+            ]);
+        }
+        rows.push(r5);
+
+        // Extract linked SOCD / Rappy Snappy pairs (e.g. `("A", "D")`, `("W", "S")`) for hover pairing.
+        let socd_pairs: Vec<(String, String, String)> = kb
+            .advanced_keys
+            .iter()
+            .filter(|a| a.kind == "SOCD" || a.kind == "Rappy Snappy")
+            .filter_map(|a| {
+                let (left, right_rest) = a.detail.split_once(" + ")?;
+                let right = right_rest.split(" (").next().unwrap_or(right_rest).trim();
+                Some((
+                    left.trim().to_string(),
+                    right.to_string(),
+                    format!("{}: {}", a.kind, a.detail),
+                ))
+            })
+            .collect();
 
         let inner_w = (card_w - 24.0).max(200.0);
         let base_act = kb
@@ -1642,49 +1439,97 @@ impl KeyboardUiState {
         card_frame(ui, p, card_w, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new("Interactive 60% Keymap & Live Analog Heatmap")
+                    RichText::new("Interactive Visual Keymap & Live Analog Heatmap")
                         .size(14.0)
                         .strong()
                         .color(p.text),
                 );
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "Hover any key for per-key actuation & SOCD/AKC details · start Analog Test below for live depth fill",
-                    )
+                mono_chip(ui, p, layout_badge);
+                if kb.supports_arm_writes {
+                    if ui
+                        .add(secondary_btn("Select WASD", p))
+                        .on_hover_text("Select W, A, S, D to edit their per-key actuation together")
+                        .clicked()
+                    {
+                        self.selected_keys.clear();
+                        for m in [0x42u16, 0x61, 0x62, 0x63] {
+                            self.selected_keys.insert(m);
+                        }
+                        self.draft_per_key_mm = kb
+                            .per_key_actuation
+                            .iter()
+                            .find(|o| o.matrix_index == 0x42)
+                            .map(|o| o.actuation_mm)
+                            .unwrap_or(base_act);
+                        self.confirm_per_key_action = None;
+                    }
+                    if !self.selected_keys.is_empty()
+                        && ui.add(secondary_btn("Clear Selection", p)).clicked()
+                    {
+                        self.selected_keys.clear();
+                        self.confirm_per_key_action = None;
+                    }
+                }
+            });
+            ui.add_space(3.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(if kb.supports_arm_writes {
+                        "Click any keys to select and edit per-key actuation (0x31 / OUT 0x15) · hover SOCD keys to highlight pairs · start Analog Test below for live travel"
+                    } else {
+                        "Hover any key for per-key actuation & SOCD/AKC details · start Analog Test below for live depth fill"
+                    })
                     .size(11.5)
                     .color(p.text_muted),
-                );
-            });
+                )
+                .wrap(),
+            );
             ui.add_space(8.0);
 
+            let total_units = if is_tkl { 18.5_f32 } else { 15.0_f32 };
             let gap = 4.0_f32;
-            let max_board_w = inner_w.min(760.0);
-            let unit_w = ((max_board_w - 13.0 * gap) / 15.0).max(16.0);
-            let key_h = (unit_w * 0.88).clamp(24.0, 42.0);
-            let board_w = 15.0 * unit_w + 13.0 * gap;
-            let board_h = 5.0 * key_h + 4.0 * gap;
+            let max_board_w = inner_w.min(if is_tkl { 900.0 } else { 760.0 });
+            let cols_approx = if is_tkl { 17.0_f32 } else { 13.0_f32 };
+            let unit_w = ((max_board_w - cols_approx * gap) / total_units).max(14.0);
+            let key_h = (unit_w * 0.88).clamp(22.0, 42.0);
+            let board_w = total_units * unit_w + cols_approx * gap;
+            let board_h =
+                (rows.len() as f32) * key_h + ((rows.len().saturating_sub(1)) as f32) * gap;
             let left_pad = ((inner_w - board_w) * 0.5).max(0.0);
 
-            let (alloc_rect, _) =
-                ui.allocate_exact_size(Vec2::new(inner_w, board_h), egui::Sense::hover());
+            let (alloc_rect, board_resp) =
+                ui.allocate_exact_size(Vec2::new(inner_w, board_h), egui::Sense::click());
 
-            let mut hovered_tooltip: Option<String> = None;
             let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+            let clicked_pos = if board_resp.clicked() {
+                board_resp.interact_pointer_pos()
+            } else {
+                None
+            };
 
-            let painter = ui.painter_at(alloc_rect);
-            for (r_idx, row) in ROWS.iter().enumerate() {
+            struct PlacedKey {
+                spec: KeySpec,
+                rect: Rect,
+                ov_mm: Option<f32>,
+                is_hovered: bool,
+            }
+
+            let mut placed: Vec<PlacedKey> = Vec::with_capacity(90);
+            for (r_idx, row) in rows.iter().enumerate() {
                 let y = alloc_rect.top() + (r_idx as f32) * (key_h + gap);
                 let mut x = alloc_rect.left() + left_pad;
-                let row_gaps = (row.len().saturating_sub(1)) as f32;
-                let extra_space = (13.0 - row_gaps) * gap;
+                let non_gap_gaps = (row.len().saturating_sub(1)) as f32;
+                let extra_space = ((cols_approx - non_gap_gaps) * gap).max(0.0);
                 let row_units: f32 = row.iter().map(|k| k.width_u).sum();
 
-                for spec in *row {
-                    let kw = spec.width_u * unit_w + (spec.width_u / row_units) * extra_space;
+                for &spec in row {
+                    let kw =
+                        spec.width_u * unit_w + (spec.width_u / row_units.max(1.0)) * extra_space;
                     let key_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(kw, key_h));
                     x += kw + gap;
-
+                    if spec.matrix == 0xFFFF {
+                        continue;
+                    }
                     let ov_mm = kb
                         .per_key_actuation
                         .iter()
@@ -1692,139 +1537,202 @@ impl KeyboardUiState {
                             o.matrix_index == spec.matrix || spec.alt_matrix == Some(o.matrix_index)
                         })
                         .map(|o| o.actuation_mm);
-                    let akc_match = kb.advanced_keys.iter().find(|a| {
-                        a.primary_key.eq_ignore_ascii_case(spec.label)
-                            || (spec.label == "Esc" && a.primary_key.starts_with("Esc"))
-                            || (spec.label == "Win" && a.primary_key == "LWin")
-                            || (a.kind == "SOCD"
-                                && a.detail.split_whitespace().any(|tok| tok == spec.label))
-                    });
-
-                    // Match live analog sample (V2 matrix_index preferred, V1 HID usage fallback).
-                    let live = self.smoothed_keys.values().find(|s| {
-                        s.matrix_index == Some(spec.matrix)
-                            || (spec.alt_matrix.is_some() && s.matrix_index == spec.alt_matrix)
-                            || (s.matrix_index.is_none()
-                                && spec.hid_usage != 0
-                                && s.label.eq_ignore_ascii_case(spec.label))
-                    });
-
-                    let depth_frac = live.map_or(0.0, |s| (s.display_mm / 4.0).clamp(0.0, 1.0));
-                    let is_act = live.is_some_and(|s| {
-                        s.actuated
-                            .unwrap_or(s.display_mm >= ov_mm.unwrap_or(base_act) && s.is_pressed)
-                    });
                     let is_hovered = pointer_pos.is_some_and(|pos| key_rect.contains(pos));
-
-                    painter.rect_filled(key_rect, CornerRadius::same(5), p.surface_alt);
-
-                    // Live bottom-to-top analog fill
-                    if depth_frac > 0.004 {
-                        let fill_h = key_rect.height() * depth_frac;
-                        let fill_rect = Rect::from_min_max(
-                            Pos2::new(key_rect.left() + 1.0, key_rect.bottom() - fill_h),
-                            Pos2::new(key_rect.right() - 1.0, key_rect.bottom() - 1.0),
-                        );
-                        let fill_col = if is_act {
-                            Color32::from_rgba_unmultiplied(p.ok.r(), p.ok.g(), p.ok.b(), 72)
-                        } else {
-                            Color32::from_rgba_unmultiplied(p.text.r(), p.text.g(), p.text.b(), 44)
-                        };
-                        painter.rect_filled(fill_rect, CornerRadius::same(4), fill_col);
-                    }
-
-                    let border_col = if is_act {
-                        p.ok
-                    } else if is_hovered {
-                        p.text
-                    } else if ov_mm.is_some() {
-                        p.text_muted
-                    } else {
-                        p.border
-                    };
-                    painter.rect_stroke(
-                        key_rect,
-                        CornerRadius::same(5),
-                        Stroke::new(
-                            if is_act || is_hovered {
-                                1.5_f32
-                            } else {
-                                1.0_f32
-                            },
-                            border_col,
-                        ),
-                        egui::StrokeKind::Inside,
-                    );
-
-                    // Top-right dot for SOCD / AKC bindings
-                    if let Some(akc) = akc_match {
-                        let dot_col = if akc.kind == "SOCD" || akc.kind == "Rappy Snappy" {
-                            p.info
-                        } else {
-                            p.text_muted
-                        };
-                        painter.circle_filled(
-                            Pos2::new(key_rect.right() - 5.0, key_rect.top() + 5.0),
-                            2.5,
-                            dot_col,
-                        );
-                    }
-
-                    // Key label + optional tiny override mm label
-                    let font_sz = if unit_w < 30.0 { 9.0 } else { 10.5 };
-                    let label_y = if ov_mm.is_some() && key_h >= 30.0 {
-                        key_rect.center().y - 5.0
-                    } else {
-                        key_rect.center().y
-                    };
-                    painter.text(
-                        Pos2::new(key_rect.center().x, label_y),
-                        Align2::CENTER_CENTER,
-                        spec.label,
-                        FontId::monospace(font_sz),
-                        if is_act || is_hovered {
-                            p.text
-                        } else {
-                            p.text_muted
-                        },
-                    );
-                    if let Some(mm) = ov_mm {
-                        if key_h >= 30.0 {
-                            painter.text(
-                                Pos2::new(key_rect.center().x, key_rect.bottom() - 6.5),
-                                Align2::CENTER_CENTER,
-                                format!("{mm:.2}"),
-                                FontId::monospace(8.5),
-                                p.text,
-                            );
-                        }
-                    }
-
-                    if is_hovered {
-                        let mut lines = vec![format!(
-                            "{}  ·  Actuation: {:.2} mm{}",
-                            spec.label,
-                            ov_mm.unwrap_or(base_act),
-                            if ov_mm.is_some() {
-                                " (per-key override)"
-                            } else {
-                                " (base)"
+                    if kb.supports_arm_writes
+                        && clicked_pos.is_some_and(|pos| key_rect.contains(pos))
+                    {
+                        if !self.selected_keys.remove(&spec.matrix) {
+                            if self.selected_keys.is_empty() {
+                                self.draft_per_key_mm = ov_mm.unwrap_or(base_act);
                             }
-                        )];
-                        if let Some(akc) = akc_match {
-                            lines.push(format!("AKC: {} — {}", akc.kind, akc.detail));
+                            self.selected_keys.insert(spec.matrix);
                         }
-                        if let Some(lv) = live {
-                            lines.push(format!(
-                                "Live travel: {:.2} mm (peak {:.2} mm){}",
-                                lv.display_mm,
-                                lv.peak_mm,
-                                if is_act { " · ACTUATED" } else { "" }
-                            ));
-                        }
-                        hovered_tooltip = Some(lines.join("\n"));
+                        self.confirm_per_key_action = None;
+                    }
+                    placed.push(PlacedKey {
+                        spec,
+                        rect: key_rect,
+                        ov_mm,
+                        is_hovered,
+                    });
+                }
+            }
+
+            // Detect if the currently hovered key belongs to a linked SOCD / Rappy Snappy pair.
+            let hovered_label = placed.iter().find(|k| k.is_hovered).map(|k| k.spec.label);
+            let active_socd_pair = hovered_label.and_then(|hl| {
+                socd_pairs
+                    .iter()
+                    .find(|(a, b, _)| a.eq_ignore_ascii_case(hl) || b.eq_ignore_ascii_case(hl))
+                    .cloned()
+            });
+
+            let mut hovered_tooltip: Option<String> = None;
+            let mut pair_rects: Vec<Rect> = Vec::new();
+            let painter = ui.painter_at(alloc_rect);
+
+            for pk in &placed {
+                let spec = pk.spec;
+                let key_rect = pk.rect;
+                let ov_mm = pk.ov_mm;
+
+                let akc_match = kb.advanced_keys.iter().find(|a| {
+                    a.primary_key.eq_ignore_ascii_case(spec.label)
+                        || (spec.label == "Esc" && a.primary_key.starts_with("Esc"))
+                        || (spec.label == "Win" && a.primary_key == "LWin")
+                        || ((a.kind == "SOCD" || a.kind == "Rappy Snappy")
+                            && a.detail.split_whitespace().any(|tok| tok == spec.label))
+                });
+
+                let is_socd_highlighted = active_socd_pair.as_ref().is_some_and(|(a, b, _)| {
+                    a.eq_ignore_ascii_case(spec.label) || b.eq_ignore_ascii_case(spec.label)
+                });
+                if is_socd_highlighted {
+                    pair_rects.push(key_rect);
+                }
+
+                let live = self.smoothed_keys.values().find(|s| {
+                    s.matrix_index == Some(spec.matrix)
+                        || (spec.alt_matrix.is_some() && s.matrix_index == spec.alt_matrix)
+                        || (s.matrix_index.is_none()
+                            && spec.hid_usage != 0
+                            && s.label.eq_ignore_ascii_case(spec.label))
+                });
+
+                let depth_frac = live.map_or(0.0, |s| (s.display_mm / 4.0).clamp(0.0, 1.0));
+                let is_act = live.is_some_and(|s| {
+                    s.actuated
+                        .unwrap_or(s.display_mm >= ov_mm.unwrap_or(base_act) && s.is_pressed)
+                });
+                let is_selected = self.selected_keys.contains(&spec.matrix);
+
+                let key_fill = if is_selected {
+                    Color32::from_rgba_unmultiplied(p.text.r(), p.text.g(), p.text.b(), 28)
+                } else if is_socd_highlighted {
+                    Color32::from_rgba_unmultiplied(p.info.r(), p.info.g(), p.info.b(), 36)
+                } else {
+                    p.surface_alt
+                };
+                painter.rect_filled(key_rect, CornerRadius::same(5), key_fill);
+
+                // Live bottom-to-top analog fill
+                if depth_frac > 0.004 {
+                    let fill_h = key_rect.height() * depth_frac;
+                    let fill_rect = Rect::from_min_max(
+                        Pos2::new(key_rect.left() + 1.0, key_rect.bottom() - fill_h),
+                        Pos2::new(key_rect.right() - 1.0, key_rect.bottom() - 1.0),
+                    );
+                    let fill_col = if is_act {
+                        Color32::from_rgba_unmultiplied(p.ok.r(), p.ok.g(), p.ok.b(), 72)
+                    } else {
+                        Color32::from_rgba_unmultiplied(p.text.r(), p.text.g(), p.text.b(), 44)
+                    };
+                    painter.rect_filled(fill_rect, CornerRadius::same(4), fill_col);
+                }
+
+                let border_col = if is_act {
+                    p.ok
+                } else if is_socd_highlighted {
+                    p.info
+                } else if is_selected || pk.is_hovered {
+                    p.text
+                } else if ov_mm.is_some() {
+                    p.text_muted
+                } else {
+                    p.border
+                };
+                let stroke_w = if is_act || is_socd_highlighted || is_selected {
+                    1.8_f32
+                } else if pk.is_hovered {
+                    1.5_f32
+                } else {
+                    1.0_f32
+                };
+                painter.rect_stroke(
+                    key_rect,
+                    CornerRadius::same(5),
+                    Stroke::new(stroke_w, border_col),
+                    egui::StrokeKind::Inside,
+                );
+
+                // Top-right dot for SOCD / AKC bindings
+                if let Some(akc) = akc_match {
+                    let dot_col = if akc.kind == "SOCD" || akc.kind == "Rappy Snappy" {
+                        p.info
+                    } else {
+                        p.text_muted
+                    };
+                    painter.circle_filled(
+                        Pos2::new(key_rect.right() - 5.0, key_rect.top() + 5.0),
+                        2.5,
+                        dot_col,
+                    );
+                }
+
+                // Key label + optional tiny override mm label
+                let font_sz = if unit_w < 28.0 { 8.5 } else { 10.5 };
+                let label_y = if ov_mm.is_some() && key_h >= 29.0 {
+                    key_rect.center().y - 5.0
+                } else {
+                    key_rect.center().y
+                };
+                painter.text(
+                    Pos2::new(key_rect.center().x, label_y),
+                    Align2::CENTER_CENTER,
+                    spec.label,
+                    FontId::monospace(font_sz),
+                    if is_act || pk.is_hovered || is_selected || is_socd_highlighted {
+                        p.text
+                    } else {
+                        p.text_muted
+                    },
+                );
+                if let Some(mm) = ov_mm {
+                    if key_h >= 29.0 {
+                        painter.text(
+                            Pos2::new(key_rect.center().x, key_rect.bottom() - 6.5),
+                            Align2::CENTER_CENTER,
+                            format!("{mm:.2}"),
+                            FontId::monospace(8.5),
+                            p.text,
+                        );
                     }
                 }
+
+                if pk.is_hovered {
+                    let mut lines = vec![format!(
+                        "{} (0x{:02X})  ·  Actuation: {:.2} mm{}",
+                        spec.label,
+                        spec.matrix,
+                        ov_mm.unwrap_or(base_act),
+                        if ov_mm.is_some() {
+                            " (per-key override)"
+                        } else {
+                            " (base)"
+                        }
+                    )];
+                    if let Some(akc) = akc_match {
+                        lines.push(format!("AKC: {} — {}", akc.kind, akc.detail));
+                    }
+                    if let Some(lv) = live {
+                        lines.push(format!(
+                            "Live travel: {:.2} mm (peak {:.2} mm){}",
+                            lv.display_mm,
+                            lv.peak_mm,
+                            if is_act { " · ACTUATED" } else { "" }
+                        ));
+                    }
+                    hovered_tooltip = Some(lines.join("\n"));
+                }
+            }
+
+            // Connect linked SOCD / Rappy Snappy pair keys visually on hover.
+            if pair_rects.len() == 2 {
+                let p0 = Pos2::new(pair_rects[0].center().x, pair_rects[0].top() + 2.0);
+                let p1 = Pos2::new(pair_rects[1].center().x, pair_rects[1].top() + 2.0);
+                painter.line_segment([p0, p1], Stroke::new(2.0_f32, p.info));
+                painter.circle_filled(p0, 3.0, p.info);
+                painter.circle_filled(p1, 3.0, p.info);
             }
 
             if let Some(tip) = hovered_tooltip {
@@ -1832,13 +1740,110 @@ impl KeyboardUiState {
                 ui.label(RichText::new(tip).size(11.5).monospace().color(p.text));
             } else {
                 ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new("Legend: Bright border/number = per-key actuation override  ·  Blue dot = SOCD/Rappy Snappy  ·  Gray dot = Mod Tap/DKS  ·  Green = live ACT")
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Legend: Bright border/number = per-key override  ·  White frame = selected  ·  Blue link = SOCD / Rappy Snappy pair  ·  Green = live ACT")
                             .size(10.5)
                             .color(p.text_muted),
+                    )
+                    .wrap(),
+                );
+            }
+
+            // Inline Confirm-Gated Per-Key Actuation Editor (ARM boards)
+            if kb.supports_arm_writes && !self.selected_keys.is_empty() {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                let sel_labels: Vec<String> = self
+                    .selected_keys
+                    .iter()
+                    .map(|&m| {
+                        placed
+                            .iter()
+                            .find(|k| k.spec.matrix == m)
+                            .map(|k| k.spec.label.to_string())
+                            .unwrap_or_else(|| format!("0x{m:02X}"))
+                    })
+                    .collect();
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Selected ({}): {}",
+                            sel_labels.len(),
+                            sel_labels.join(", ")
+                        ))
+                        .size(12.0)
+                        .strong()
+                        .color(p.text),
                     );
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Actuation:").size(11.5).color(p.text_muted));
+                    ui.add(
+                        egui::DragValue::new(&mut self.draft_per_key_mm)
+                            .range(0.10..=4.00)
+                            .speed(0.05)
+                            .fixed_decimals(2)
+                            .suffix(" mm"),
+                    );
+                    if ui.add(primary_btn("Set Per-Key...", p)).clicked() {
+                        self.confirm_per_key_action =
+                            Some(PerKeyConfirmAction::SetMm(self.draft_per_key_mm));
+                    }
+                    if ui.add(secondary_btn("Reset to Base...", p)).clicked() {
+                        self.confirm_per_key_action = Some(PerKeyConfirmAction::ResetToBase);
+                    }
                 });
+
+                if let Some(action) = self.confirm_per_key_action {
+                    ui.add_space(6.0);
+                    let slot_lbl = kb
+                        .active_profile
+                        .map(|i| kb.profile_display_name(i))
+                        .unwrap_or_else(|| "active slot".to_string());
+                    let desc = match action {
+                        PerKeyConfirmAction::SetMm(mm) => format!(
+                            "Write {:.2} mm per-key actuation for {} ({}) to onboard flash on {}? Polled preserves untouched keys and verifies via 0x31 read-back.",
+                            mm,
+                            sel_labels.join(", "),
+                            sel_labels.len(),
+                            slot_lbl
+                        ),
+                        PerKeyConfirmAction::ResetToBase => format!(
+                            "Remove per-key actuation overrides for {} ({}) on {} so they follow profile base ({:.2} mm)? Verified via 0x31 read-back.",
+                            sel_labels.join(", "),
+                            sel_labels.len(),
+                            slot_lbl,
+                            base_act
+                        ),
+                    };
+                    semantic_banner(ui, p, mode, inner_w, Severity::Warn, &desc);
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(primary_btn("Confirm Flash Save", p)).clicked() {
+                            let target_mm = match action {
+                                PerKeyConfirmAction::SetMm(mm) => Some(mm),
+                                PerKeyConfirmAction::ResetToBase => None,
+                            };
+                            let updates: Vec<(u16, Option<f32>)> = self
+                                .selected_keys
+                                .iter()
+                                .copied()
+                                .map(|m| (m, target_mm))
+                                .collect();
+                            runtime.send(ProfileRuntimeCmd::WriteWootingPerKeyActuation {
+                                device_id: Some(kb.id.clone()),
+                                updates,
+                            });
+                            self.confirm_per_key_action = None;
+                        }
+                        if ui.add(secondary_btn("Cancel", p)).clicked() {
+                            self.confirm_per_key_action = None;
+                        }
+                    });
+                }
             }
         });
     }

@@ -784,6 +784,40 @@ pub fn build_diagnostic_advice(
     advice
 }
 
+/// Appends actionable per-core Interrupt/DPC spike & Core 0 starvation advice into an existing
+/// Bench `DiagnosticAdvice` list and re-sorts highest severity first.
+pub fn append_dpc_advice(
+    advice: &mut Vec<DiagnosticAdvice>,
+    dpc: &crate::diagnostics::DpcMonitorSnapshot,
+) {
+    if dpc.core_count == 0 || (!dpc.core0_starved && dpc.severity < Severity::Warn) {
+        return;
+    }
+    let title = if dpc.core0_starved {
+        format!(
+            "Relieve Core 0 IRQ/DPC starvation ({:.1}% vs {:.1}% other cores)",
+            dpc.core0_dpc_irq_pct, dpc.other_cores_avg_dpc_irq_pct
+        )
+    } else {
+        format!(
+            "Investigate per-core DPC/IRQ spike on Core {} ({:.1}% peak)",
+            dpc.hottest_core.unwrap_or(0),
+            dpc.peak_dpc_irq_pct
+        )
+    };
+    advice.push(DiagnosticAdvice {
+        severity: dpc.severity,
+        category: "Per-Core DPC".to_string(),
+        title,
+        detail: format!(
+            "{} Open Health Check to verify PCI GPU & HD Audio MSI mode and USB power settings.",
+            dpc.diagnosis
+        ),
+        action_target: Some("health_check".to_string()),
+    });
+    advice.sort_by_key(|a| std::cmp::Reverse(a.severity));
+}
+
 /// Formats actionable fix recommendations as a clean plain-text block for clipboard reports.
 pub fn format_advice_summary(advice: &[DiagnosticAdvice]) -> String {
     if advice.is_empty() {
