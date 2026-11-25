@@ -158,6 +158,9 @@ pub struct TrayAlertConfig {
     /// Send an optional Windows toast notification when Polled switches to a game/desktop profile.
     #[serde(default)]
     pub profile_switch_toast: bool,
+    /// Show a brief click-through monochrome Win32 on-screen pill (zero game hooks) on profile/DPI switches.
+    #[serde(default)]
+    pub osd_pill_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -175,6 +178,7 @@ impl Default for TrayAlertConfig {
             low_battery_toast: true,
             low_battery_threshold_pct: default_low_battery_threshold(),
             profile_switch_toast: false,
+            osd_pill_enabled: false,
         }
     }
 }
@@ -312,6 +316,7 @@ mod tests {
                 low_battery_toast: true,
                 low_battery_threshold_pct: 20,
                 profile_switch_toast: true,
+                osd_pill_enabled: true,
             },
         };
         custom.save_atomic(&path).unwrap();

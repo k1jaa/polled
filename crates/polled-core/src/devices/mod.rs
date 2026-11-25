@@ -15,6 +15,7 @@ pub mod mchose;
 pub mod ninjutso;
 pub mod razer;
 pub mod vaxee;
+pub mod wooting;
 
 use std::fmt;
 
@@ -36,6 +37,9 @@ pub use mchose::{MchoseDevice, MchoseProtocolDriver};
 pub use ninjutso::{NinjutsoDevice, NinjutsoProtocolDriver};
 pub use razer::{RazerDevice, RazerProtocolDriver};
 pub use vaxee::{VaxeeDevice, VaxeeProtocolDriver};
+pub use wooting::{
+    detect_wooting_keyboards, WootingDevice, WootingKeyboardInfo, WOOTING_MAX_PROFILE_INDEX,
+};
 
 /// Explicitly communicates how a device backend was verified (surfaced in UI and README).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -79,6 +79,10 @@ pub enum SavedValue {
         tcp_ack_frequency: Option<u32>,
         tcp_no_delay: Option<u32>,
     },
+    /// Original `MSISupported` values for PCI GPU & Audio controllers modified by `pci_gpu_audio_msi`.
+    PciMsiMode {
+        entries: Vec<(String, Option<u32>)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

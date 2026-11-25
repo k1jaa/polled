@@ -24,6 +24,13 @@ pub const BOUNCE_THRESHOLD_MS: f64 = 35.0;
 /// Minimum same-key release-to-press interval (ms) below which keyboard switch chatter is flagged.
 pub const KEY_CHATTER_THRESHOLD_MS: f64 = 25.0;
 
+/// Time window (ms) during continuous scrolling in one direction where a single opposite-direction
+/// notch followed immediately by the original direction indicates a worn/dirty scroll encoder.
+pub const SCROLL_REVERSE_GLITCH_WINDOW_MS: f64 = 160.0;
+
+/// Sub-threshold same-direction notch interval (ms) indicating scroll-encoder contact bounce.
+pub const SCROLL_DOUBLE_NOTCH_MS: f64 = 18.0;
+
 /// Standard mouse polling rates used when snapping auto-detected nominal cadence.
 pub const STANDARD_RATES_HZ: [u32; 7] = [125, 250, 500, 1000, 2000, 4000, 8000];
 
@@ -517,6 +524,7 @@ pub fn build_diagnostic_advice(
             "usb_selective_suspend",
             "usb_power_management",
             "usb_xhci_msi",
+            "pci_gpu_audio_msi",
             "pcie_aspm",
             "power_plan",
             "cpu_processor_state",
@@ -701,6 +709,27 @@ pub fn build_diagnostic_advice(
         });
     }
 
+    // 5b. Scroll wheel encoder bounce / reverse-scroll faults.
+    if snap.scroll.reverse_glitches > 0 || snap.scroll.double_notch_faults > 0 {
+        advice.push(DiagnosticAdvice {
+            severity: if snap.scroll.reverse_glitches >= 2 || snap.scroll.double_notch_faults >= 2 {
+                Severity::Bad
+            } else {
+                Severity::Warn
+            },
+            category: "Scroll Encoder".to_string(),
+            title: format!(
+                "Inspect mouse scroll encoder ({} reverse glitch{}, {} bounce{})",
+                snap.scroll.reverse_glitches,
+                if snap.scroll.reverse_glitches == 1 { "" } else { "es" },
+                snap.scroll.double_notch_faults,
+                if snap.scroll.double_notch_faults == 1 { "" } else { "s" },
+            ),
+            detail: "Worn or dusty mechanical rotary encoders emit single opposite-direction ticks or sub-18 ms phantom double notches during continuous scrolling. Blow compressed air into the wheel gap or inspect/replace the TTC/Alps/Kailh encoder.".to_string(),
+            action_target: None,
+        });
+    }
+
     // 6. OS Timer Jitter benchmark spikes.
     if let Some(t) = timer {
         if t.severity >= Severity::Warn {
@@ -790,6 +819,23 @@ pub struct SystemLoadStats {
     pub diagnosis: String,
 }
 
+/// Live scroll-wheel rotary encoder bounce & reverse-scroll fault metrics.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScrollEncoderSnapshot {
+    pub total_notches: u64,
+    pub up_notches: u64,
+    pub down_notches: u64,
+    /// Single opposite-direction tick sandwiched inside a fast continuous scroll sweep.
+    pub reverse_glitches: u64,
+    /// Same-direction ticks firing faster than `SCROLL_DOUBLE_NOTCH_MS` (mechanical contact bounce).
+    pub double_notch_faults: u64,
+    pub min_notch_interval_ms: Option<f64>,
+    /// Recent scroll tick markers (`+1` = Up, `-1` = Down, `+2` = Up glitch, `-2` = Down glitch).
+    pub recent_notches: Vec<i8>,
+    pub health_severity: Option<Severity>,
+    pub health_summary: String,
+}
+
 /// Immutable snapshot published periodically (~30 Hz) from the capture thread to the GUI.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticsSnapshot {
@@ -799,6 +845,8 @@ pub struct DiagnosticsSnapshot {
     pub tracking: TrackingStats,
     pub dpi_measurement: DpiMeasurementSnapshot,
     pub clicks: ClickBounceSnapshot,
+    #[serde(default)]
+    pub scroll: ScrollEncoderSnapshot,
     #[serde(default)]
     pub keyboard: KeyboardPollingStats,
     #[serde(default)]
@@ -1653,6 +1701,155 @@ impl KeyboardPollingAnalyzer {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ScrollTick {
+    ts_ns: u64,
+    dir: i8, // +1 up, -1 down
+}
+
+/// Detects mechanical scroll-wheel encoder faults (reverse-scroll ticks and sub-18 ms contact bounce)
+/// directly from raw `RI_MOUSE_WHEEL` hardware delta packets.
+#[derive(Debug, Default)]
+pub struct ScrollEncoderAnalyzer {
+    total_notches: u64,
+    up_notches: u64,
+    down_notches: u64,
+    reverse_glitches: u64,
+    double_notch_faults: u64,
+    min_notch_interval_ms: Option<f64>,
+    last_ticks: VecDeque<ScrollTick>,
+    recent_notches: VecDeque<i8>,
+}
+
+impl ScrollEncoderAnalyzer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Records a raw `RI_MOUSE_WHEEL` packet (`delta > 0` = scroll up, `delta < 0` = scroll down).
+    pub fn record_wheel(&mut self, timestamp_ns: u64, delta: i16) {
+        if delta == 0 {
+            return;
+        }
+        let dir: i8 = if delta > 0 { 1 } else { -1 };
+        self.total_notches += 1;
+        if dir > 0 {
+            self.up_notches += 1;
+        } else {
+            self.down_notches += 1;
+        }
+
+        let mut marker = dir;
+        if let Some(prev) = self.last_ticks.back().copied() {
+            if timestamp_ns > prev.ts_ns {
+                let dt_ms = (timestamp_ns - prev.ts_ns) as f64 / 1_000_000.0;
+                if dt_ms < 2_000.0 {
+                    self.min_notch_interval_ms = Some(
+                        self.min_notch_interval_ms
+                            .map_or(dt_ms, |best| best.min(dt_ms)),
+                    );
+                }
+                if prev.dir == dir && dt_ms < SCROLL_DOUBLE_NOTCH_MS {
+                    self.double_notch_faults += 1;
+                    marker = dir * 2;
+                }
+            }
+        }
+
+        // Reverse-scroll glitch pattern: A -> B -> A within `SCROLL_REVERSE_GLITCH_WINDOW_MS`
+        // where a single opposite-direction tick (`B`) interrupted a steady sweep in direction `A`.
+        if self.last_ticks.len() >= 2 {
+            let prev1 = self.last_ticks[self.last_ticks.len() - 1];
+            let prev2 = self.last_ticks[self.last_ticks.len() - 2];
+            if prev2.dir == dir && prev1.dir == -dir && timestamp_ns > prev2.ts_ns {
+                let dt1_ms = prev1.ts_ns.saturating_sub(prev2.ts_ns) as f64 / 1_000_000.0;
+                let dt2_ms = timestamp_ns.saturating_sub(prev1.ts_ns) as f64 / 1_000_000.0;
+                if dt1_ms <= SCROLL_REVERSE_GLITCH_WINDOW_MS
+                    && dt2_ms <= SCROLL_REVERSE_GLITCH_WINDOW_MS
+                {
+                    self.reverse_glitches += 1;
+                    // Retroactively flag the sandwiched reverse tick in `recent_notches`.
+                    if let Some(last_marker) = self.recent_notches.back_mut() {
+                        *last_marker = prev1.dir * 2;
+                    }
+                }
+            }
+        }
+
+        if self.last_ticks.len() >= 4 {
+            self.last_ticks.pop_front();
+        }
+        self.last_ticks.push_back(ScrollTick {
+            ts_ns: timestamp_ns,
+            dir,
+        });
+
+        if self.recent_notches.len() >= 48 {
+            self.recent_notches.pop_front();
+        }
+        self.recent_notches.push_back(marker);
+    }
+
+    pub fn snapshot(&self) -> ScrollEncoderSnapshot {
+        let (health_severity, health_summary) = if self.total_notches == 0 {
+            (
+                None,
+                "Scroll continuously in one direction (up or down) while capturing to detect reverse-scroll encoder glitches or bounce."
+                    .to_string(),
+            )
+        } else if self.reverse_glitches > 0 || self.double_notch_faults > 0 {
+            let sev = if self.reverse_glitches >= 2 || self.double_notch_faults >= 2 {
+                Severity::Bad
+            } else {
+                Severity::Warn
+            };
+            (
+                Some(sev),
+                format!(
+                    "Encoder fault detected: {} reverse-scroll glitch{}, {} double-notch bounce{} across {} ticks.",
+                    self.reverse_glitches,
+                    if self.reverse_glitches == 1 { "" } else { "es" },
+                    self.double_notch_faults,
+                    if self.double_notch_faults == 1 { "" } else { "s" },
+                    self.total_notches
+                ),
+            )
+        } else if self.total_notches < 12 {
+            (
+                Some(Severity::Info),
+                format!(
+                    "{} scroll ticks captured (0 faults so far) — keep scrolling steadily up & down.",
+                    self.total_notches
+                ),
+            )
+        } else {
+            (
+                Some(Severity::Ok),
+                format!(
+                    "Clean rotary encoder — {} ticks ({} up / {} down), 0 reverse glitches, 0 bounce faults.",
+                    self.total_notches, self.up_notches, self.down_notches
+                ),
+            )
+        };
+
+        ScrollEncoderSnapshot {
+            total_notches: self.total_notches,
+            up_notches: self.up_notches,
+            down_notches: self.down_notches,
+            reverse_glitches: self.reverse_glitches,
+            double_notch_faults: self.double_notch_faults,
+            min_notch_interval_ms: self.min_notch_interval_ms,
+            recent_notches: self.recent_notches.iter().copied().collect(),
+            health_severity,
+            health_summary,
+        }
+    }
+}
+
 /// Formats a clean plain-text diagnostic report suitable for clipboard export or issue tickets.
 pub fn format_diagnostic_report(
     snap: &DiagnosticsSnapshot,
@@ -1746,6 +1943,23 @@ pub fn format_diagnostic_report(
         }
     }
 
+    if snap.scroll.total_notches > 0 {
+        let min_s = snap
+            .scroll
+            .min_notch_interval_ms
+            .map(|v| format!("{v:.1} ms"))
+            .unwrap_or_else(|| "n/a".to_string());
+        lines.push(format!(
+            "Scroll Encoder: {} ticks ({} up / {} down) | reverse glitches: {} | double-notch bounces: {} | fastest tick: {}",
+            snap.scroll.total_notches,
+            snap.scroll.up_notches,
+            snap.scroll.down_notches,
+            snap.scroll.reverse_glitches,
+            snap.scroll.double_notch_faults,
+            min_s
+        ));
+    }
+
     if snap.keyboard.total_events > 0 {
         let min_str = snap
             .keyboard
@@ -1818,6 +2032,38 @@ mod tests {
         let peak_bin =
             stats.histogram_bins[9].saturated_count + stats.histogram_bins[10].saturated_count;
         assert!(peak_bin >= 190, "peak_bin={peak_bin}");
+    }
+
+    #[test]
+    fn scroll_encoder_detects_clean_scroll_reverse_glitch_and_double_notch_bounce() {
+        let mut enc = ScrollEncoderAnalyzer::new();
+        let mut t_ns = 1_000_000_000u64;
+        // 14 clean downward ticks spaced 45 ms apart -> Ok, 0 faults.
+        for _ in 0..14 {
+            enc.record_wheel(t_ns, -120);
+            t_ns += 45_000_000;
+        }
+        let clean = enc.snapshot();
+        assert_eq!(clean.total_notches, 14);
+        assert_eq!(clean.down_notches, 14);
+        assert_eq!(clean.reverse_glitches, 0);
+        assert_eq!(clean.double_notch_faults, 0);
+        assert_eq!(clean.health_severity, Some(Severity::Ok));
+
+        // Inject a reverse-scroll glitch: down -> up (30 ms) -> down (30 ms).
+        enc.record_wheel(t_ns, 120);
+        t_ns += 30_000_000;
+        enc.record_wheel(t_ns, -120);
+        // Inject a mechanical double-notch bounce (6 ms after previous down tick).
+        t_ns += 6_000_000;
+        enc.record_wheel(t_ns, -120);
+
+        let faulty = enc.snapshot();
+        assert_eq!(faulty.reverse_glitches, 1);
+        assert_eq!(faulty.double_notch_faults, 1);
+        assert_eq!(faulty.health_severity, Some(Severity::Warn));
+        assert!(faulty.recent_notches.contains(&2));
+        assert!(faulty.recent_notches.contains(&-2));
     }
 
     #[test]

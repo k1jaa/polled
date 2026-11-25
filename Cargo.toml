@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/k1jaa/polled"
@@ -36,6 +36,7 @@ windows = { version = "0.61", features = [
     "Win32_Media_Audio_Endpoints",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinHttp",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_Com",

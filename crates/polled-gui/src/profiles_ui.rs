@@ -18,7 +18,7 @@ use polled_core::{
     discover_installed_games, discover_running_apps, dump_hid_devices, export_profile_json,
     format_unsupported_mouse_issue, import_profile_json, AppPaths, DeviceCapabilities,
     DiscoveredGame, GameProfile, LiftOffDistance, MouseSettings, PowerPlanPreset, ProfileStore,
-    Severity, SupportTier,
+    Severity, SupportTier, WootingKeyboardInfo,
 };
 
 use crate::profile_runtime::{
@@ -123,6 +123,7 @@ pub struct ProfileDraft {
     pub display_width: u32,
     pub display_height: u32,
     pub display_refresh_hz: u32,
+    pub wooting_profile: Option<u8>,
     pub set_win_speed: bool,
     pub win_speed: u32,
     pub set_power_plan: bool,
@@ -178,6 +179,7 @@ impl ProfileDraft {
             display_width: p.display_width.unwrap_or(1920),
             display_height: p.display_height.unwrap_or(1080),
             display_refresh_hz: p.display_refresh_hz.unwrap_or(240),
+            wooting_profile: p.wooting_profile,
             set_win_speed: p.windows_pointer_speed.is_some(),
             win_speed: p.windows_pointer_speed.unwrap_or(10),
             set_power_plan: p.windows_power_plan.is_some(),
@@ -338,6 +340,7 @@ impl ProfileDraft {
             display_width: copy.set_display_mode.then_some(copy.display_width),
             display_height: copy.set_display_mode.then_some(copy.display_height),
             display_refresh_hz: copy.set_display_mode.then_some(copy.display_refresh_hz),
+            wooting_profile: copy.wooting_profile,
             author: (!copy.author.trim().is_empty()).then(|| copy.author.trim().to_string()),
             notes: (!copy.notes.trim().is_empty()).then(|| copy.notes.trim().to_string()),
         }
@@ -1490,6 +1493,13 @@ impl ProfilesUiState {
                 if let Some(disp) = &s.active_display_override {
                     status_chunks.push(format!("Display: {disp} (temp)"));
                 }
+                for kb in &s.wooting_keyboards {
+                    let slot = kb
+                        .active_profile
+                        .map(|idx| format!("P{}", idx + 1))
+                        .unwrap_or_else(|| "?".to_string());
+                    status_chunks.push(format!("{} ({slot})", kb.name));
+                }
                 if s.any_flash_only && s.total_flash_writes_session > 0 {
                     status_chunks.push(format!("Flash writes: {}", s.total_flash_writes_session));
                 }
@@ -1612,6 +1622,7 @@ impl ProfilesUiState {
                             display_width: None,
                             display_height: None,
                             display_refresh_hz: None,
+                            wooting_profile: None,
                             author: None,
                             notes: None,
                         };
@@ -2426,6 +2437,62 @@ impl ProfilesUiState {
                                             );
                                         }
                                     });
+                            });
+                            ui.end_row();
+
+                            ui.label(RichText::new("Wooting Keyboard").color(p.text_muted));
+                            ui.vertical(|ui| {
+                                let wooting_lbl = match self.editor.wooting_profile {
+                                    None => "Leave unchanged".to_string(),
+                                    Some(idx) => WootingKeyboardInfo::profile_label(idx).to_string(),
+                                };
+                                egui::ComboBox::from_id_salt("wooting_profile_combo")
+                                    .selected_text(wooting_lbl)
+                                    .width((field_w - 80.0).clamp(160.0, 280.0))
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                self.editor.wooting_profile.is_none(),
+                                                "Leave unchanged",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.editor.wooting_profile = None;
+                                        }
+                                        for slot in 0..=3u8 {
+                                            if ui
+                                                .selectable_label(
+                                                    self.editor.wooting_profile == Some(slot),
+                                                    WootingKeyboardInfo::profile_label(slot),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.editor.wooting_profile = Some(slot);
+                                            }
+                                        }
+                                    });
+                                let kb_hint = snap
+                                    .and_then(|s| s.wooting_keyboards.first())
+                                    .map(|kb| {
+                                        let active = kb
+                                            .active_profile
+                                            .map(|i| format!(" · Active: P{}", i + 1))
+                                            .unwrap_or_default();
+                                        format!(
+                                            "Detected {}{active} (volatile RAM switch, zero flash wear).",
+                                            kb.name
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        "Supports Wooting 60HE / 60HE+ / 80HE / Two HE / UwU via open HID protocol (zero flash wear)."
+                                            .to_string()
+                                    });
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(kb_hint).size(11.0).color(p.text_muted),
+                                    )
+                                    .wrap(),
+                                );
                             });
                             ui.end_row();
 

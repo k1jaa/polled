@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use crate::diagnostics::analyzer::{
     ClickBounceAnalyzer, DiagnosticsSnapshot, DpiCalibrator, KeyboardPollingAnalyzer,
-    MouseButtonKind, PollingAnalyzer, PollingTarget, SystemLoadStats,
+    MouseButtonKind, PollingAnalyzer, PollingTarget, ScrollEncoderAnalyzer, SystemLoadStats,
 };
 
 const TARGET_AUTO_SENTINEL: u32 = 0;
@@ -42,6 +42,10 @@ enum RawEvent {
         ts_ns: u64,
         button: MouseButtonKind,
         pressed: bool,
+    },
+    MouseWheel {
+        ts_ns: u64,
+        delta: i16,
     },
     Key {
         ts_ns: u64,
@@ -449,6 +453,7 @@ fn run_analyzer_loop(
     let mut polling = PollingAnalyzer::new(decode_target(initial_target_raw));
     let mut dpi_cal = DpiCalibrator::default();
     let mut clicks = ClickBounceAnalyzer::new();
+    let mut scroll = ScrollEncoderAnalyzer::new();
     let mut keyboard = KeyboardPollingAnalyzer::new();
     let mut sys_stall = SystemStallTracker::default();
     sys_stall.reset();
@@ -469,6 +474,7 @@ fn run_analyzer_loop(
         if reset_requested.swap(false, Ordering::SeqCst) {
             polling.reset();
             clicks.reset();
+            scroll.reset();
             dpi_cal.reset();
             keyboard.reset();
             sys_stall.reset();
@@ -502,6 +508,9 @@ fn run_analyzer_loop(
                 } => {
                     clicks.record_button(button, pressed, ts_ns);
                 }
+                RawEvent::MouseWheel { ts_ns, delta } => {
+                    scroll.record_wheel(ts_ns, delta);
+                }
                 RawEvent::Key {
                     ts_ns,
                     slot,
@@ -529,6 +538,7 @@ fn run_analyzer_loop(
             tracking: polling.tracking_snapshot(now_ns),
             dpi_measurement: dpi_cal.snapshot(),
             clicks: clicks.snapshot(),
+            scroll: scroll.snapshot(),
             keyboard: keyboard.snapshot(),
             system_load: sys_stall.snapshot(),
             error: prev_err,
@@ -593,8 +603,8 @@ fn run_win32_capture_loop(
         RI_KEY_BREAK, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN,
         RI_MOUSE_BUTTON_5_UP, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
         RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN,
-        RI_MOUSE_RIGHT_BUTTON_UP, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_INPUT,
-        WNDCLASSW,
+        RI_MOUSE_RIGHT_BUTTON_UP, RI_MOUSE_WHEEL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+        WM_DESTROY, WM_INPUT, WNDCLASSW,
     };
 
     struct CaptureThreadState {
@@ -740,6 +750,14 @@ fn run_win32_capture_loop(
                                     button: MouseButtonKind::SideForward,
                                     pressed: false,
                                 });
+                            }
+                            if (flags & RI_MOUSE_WHEEL) != 0 {
+                                // SAFETY: `RI_MOUSE_WHEEL` guarantees `usButtonData` holds a signed wheel delta.
+                                let delta =
+                                    unsafe { mouse.Anonymous.Anonymous.usButtonData } as i16;
+                                if delta != 0 {
+                                    q.push(RawEvent::MouseWheel { ts_ns, delta });
+                                }
                             }
                         }
                     };

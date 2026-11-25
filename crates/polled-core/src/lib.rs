@@ -11,6 +11,7 @@ pub mod hid;
 pub mod paths;
 pub mod profiles;
 pub mod settings;
+pub mod update;
 pub mod win;
 
 pub use backup::{
@@ -24,27 +25,31 @@ pub use checks::{
     UndoSummary,
 };
 pub use devices::{
-    detect_hardware_devices, hid_topology_fingerprint, ApplyOutcome, BatteryStatus, Compx64Device,
-    Compx64ProtocolDriver, CompxDevice, CompxProtocolDriver, DeviceCapabilities, DeviceDriver,
-    DeviceInfo, DryRunDevice, EndgameGearOp1Device, EndgameGearOp1ProtocolDriver, FinalmouseDevice,
-    FinalmouseProtocolDriver, Hidpp20Device, Hidpp20ProtocolDriver, IncottDevice,
-    IncottProtocolDriver, KeychronDevice, KeychronProtocolDriver, LiftOffDistance, MchoseDevice,
-    MchoseProtocolDriver, MouseDevice, MouseSettings, NinjutsoDevice, NinjutsoProtocolDriver,
-    RazerDevice, RazerProtocolDriver, SafeDeviceController, SupportTier, VaxeeDevice,
-    VaxeeProtocolDriver, WriteMode,
+    detect_hardware_devices, detect_wooting_keyboards, hid_topology_fingerprint, ApplyOutcome,
+    BatteryStatus, Compx64Device, Compx64ProtocolDriver, CompxDevice, CompxProtocolDriver,
+    DeviceCapabilities, DeviceDriver, DeviceInfo, DryRunDevice, EndgameGearOp1Device,
+    EndgameGearOp1ProtocolDriver, FinalmouseDevice, FinalmouseProtocolDriver, Hidpp20Device,
+    Hidpp20ProtocolDriver, IncottDevice, IncottProtocolDriver, KeychronDevice,
+    KeychronProtocolDriver, LiftOffDistance, MchoseDevice, MchoseProtocolDriver, MouseDevice,
+    MouseSettings, NinjutsoDevice, NinjutsoProtocolDriver, RazerDevice, RazerProtocolDriver,
+    SafeDeviceController, SupportTier, VaxeeDevice, VaxeeProtocolDriver, WootingDevice,
+    WootingKeyboardInfo, WriteMode, WOOTING_MAX_PROFILE_INDEX,
 };
 pub use diagnostics::{
     build_diagnostic_advice, compute_sensitivity, format_advice_summary,
     format_audio_benchmark_summary, format_diagnostic_report, format_intervals_csv,
-    format_network_benchmark_summary, render_ab_comparison_png, render_report_png,
-    render_rig_scorecard_png, run_audio_latency_benchmark, run_network_jitter_benchmark,
-    run_timer_jitter_benchmark, ButtonBounceStats, ClickBounceAnalyzer, ClickBounceSnapshot,
-    ClickEventRecord, DiagnosticAdvice, DiagnosticsSnapshot, DpiCalibrationResult, DpiCalibrator,
-    DpiMeasurementSnapshot, HistogramBin, IntervalSample, KeyboardPollingAnalyzer,
-    KeyboardPollingStats, MouseButtonKind, PinnedBenchmark, PollingAnalyzer, PollingStats,
-    PollingTarget, RawInputCaptureSession, RigScorecardInput, SensitivityConversion,
-    SensitivityGame, SystemLoadStats, TimerJitterBenchmark, TrackingStats, XyTracePoint,
-    BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, STANDARD_RATES_HZ,
+    format_network_benchmark_summary, format_watchdog_report, render_ab_comparison_png,
+    render_report_png, render_rig_scorecard_png, run_audio_latency_benchmark,
+    run_network_jitter_benchmark, run_timer_jitter_benchmark, ButtonBounceStats,
+    ClickBounceAnalyzer, ClickBounceSnapshot, ClickEventRecord, DiagnosticAdvice,
+    DiagnosticsSnapshot, DpiCalibrationResult, DpiCalibrator, DpiMeasurementSnapshot, HistogramBin,
+    IntervalSample, KeyboardPollingAnalyzer, KeyboardPollingStats, MatchWatchdogSession,
+    MouseButtonKind, PinnedBenchmark, PollingAnalyzer, PollingStats, PollingTarget,
+    RawInputCaptureSession, RigScorecardInput, ScrollEncoderAnalyzer, ScrollEncoderSnapshot,
+    SensitivityConversion, SensitivityGame, SystemLoadStats, TimerJitterBenchmark, TrackingStats,
+    WatchdogEvent, WatchdogSample, WatchdogSnapshot, XyTracePoint, BOUNCE_THRESHOLD_MS,
+    HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, SCROLL_DOUBLE_NOTCH_MS,
+    SCROLL_REVERSE_GLITCH_WINDOW_MS, STANDARD_RATES_HZ,
 };
 pub use error::{PolledError, Result};
 pub use hid::{dump_hid_devices, format_unsupported_mouse_issue, HidDeviceDump, HidDumpReport};
@@ -57,6 +62,10 @@ pub use profiles::{
 pub use settings::{
     format_autostart_command, is_autostart_enabled, set_autostart_enabled, AppSettings,
     HotkeyBinding, HotkeyConfig, ThemePreference, TrayAlertConfig,
+};
+pub use update::{
+    check_latest_github_release, is_newer_version, parse_github_release_json, UpdateCheckResult,
+    GITHUB_RELEASES_WEB_URL,
 };
 pub use win::{
     AudioEndpointInfo, AudioFlow, AudioLatencyBenchmark, DisplayModeInfo, DisplayResolutionMode,

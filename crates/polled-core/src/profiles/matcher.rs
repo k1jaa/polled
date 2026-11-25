@@ -71,6 +71,7 @@ mod tests {
             display_width: None,
             display_height: None,
             display_refresh_hz: None,
+            wooting_profile: None,
             author: None,
             notes: None,
         });
@@ -97,6 +98,7 @@ mod tests {
             display_width: None,
             display_height: None,
             display_refresh_hz: None,
+            wooting_profile: None,
             author: None,
             notes: None,
         });

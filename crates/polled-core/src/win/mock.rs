@@ -133,11 +133,13 @@ impl Default for MockState {
                     name: "Mock GPU RTX".to_string(),
                     category: PciMsiCategory::Gpu,
                     msi_supported: Some(true),
+                    msi_reg_path: r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_10DE&DEV_MOCK\0000\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties".to_string(),
                 },
                 PciMsiDevice {
                     name: "High Definition Audio Controller".to_string(),
                     category: PciMsiCategory::Audio,
                     msi_supported: Some(true),
+                    msi_reg_path: r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_1022&DEV_MOCK\0000\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties".to_string(),
                 },
             ],
             usb_topology: Vec::new(),
@@ -554,7 +556,24 @@ impl SystemEnv for MockEnv {
     }
 
     fn list_pci_msi_devices(&self) -> Result<Vec<PciMsiDevice>> {
-        Ok(self.state.lock().unwrap().pci_msi_devices.clone())
+        let s = self.state.lock().unwrap();
+        let out = s
+            .pci_msi_devices
+            .iter()
+            .cloned()
+            .map(|mut d| {
+                if !d.msi_reg_path.is_empty() {
+                    if let Some(MockRegValue::Dword(v)) =
+                        s.registry
+                            .get(&Self::key(RegHive::Hklm, &d.msi_reg_path, "MSISupported"))
+                    {
+                        d.msi_supported = Some(*v != 0);
+                    }
+                }
+                d
+            })
+            .collect();
+        Ok(out)
     }
 
     fn list_usb_topology(&self) -> Result<Vec<UsbMouseTopology>> {

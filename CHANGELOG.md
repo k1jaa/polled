@@ -10,9 +10,34 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Unsigned Windows binaries:** Release executables (`polled.exe`, `polled-gui.exe`) are not yet signed with a commercial code-signing certificate, so Windows Defender SmartScreen may prompt on first run. Every release ships `SHA256SUMS.txt` and builds publicly via GitHub Actions.
 - **Unverified mouse models (`Implemented from docs`):** Only **Pulsar X2 CrazyLight Mini Wireless** (`3710:5406`) and **LAMZU 4K Receiver** (`3554:f510`) have been verified on physical hardware in Polled. Razer, CompX 64B (WLMouse / LAMZU Maya X & Inca / Attack Shark / Vancer / RAWM), Endgame Gear, Finalmouse, VAXEE, Ninjutso, MCHOSE, Incott, Keychron, Logitech HID++ 2.0, and Wave 2 CompX 17B models (VGN, Scyrox V8, ATK/VXE R1, G-Wolves XVI:0, Hitscan Hyperlight) are implemented from open-source protocol documentation and prompt for confirmation before the first write in a session (see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
 - **Onboard flash writes:** Most wireless gaming mice persist settings to onboard memory rather than RAM; Polled mitigates flash wear via register diffing, focus debouncing, and a 4-writes / 60-second sliding-window cap.
-- **No built-in auto-updater:** Portable zip releases are updated manually.
-- **Minimum window size:** The GUI enforces a minimum viewport of `680×540` px to avoid crowding Bench plots and Profile editors.
+- **No automatic background updater:** Polled includes a strictly on-demand **Check for Updates** button (Settings / `--check-update`) over Win32 WinHTTP that opens the GitHub Releases page when you choose; portable ZIPs are never downloaded or overwritten silently in the background.
+- **Minimum window size:** The GUI enforces a minimum viewport of `740×540` px to avoid crowding Bench plots and Profile editors.
 - **Version metadata in `v0.2.0`:** The `v0.2.0` tagged binaries reported `0.1.0` from `polled --version` because workspace `Cargo.toml` was not bumped prior to tagging `v0.2.0` (fixed in `v0.2.1`+).
+
+---
+
+## [0.12.0] - 2026-11-25
+
+### Added
+- **Reversible PCI GPU & HD Audio MSI Mode Fixer (`checks/pci_gpu_audio_msi.rs`, `checks/snapshot.rs`, `win/usb_msi.rs`):**
+  - Upgraded `pci_gpu_audio_msi` from report-only to an opt-in reversible tweak (`is_optional_tweak = true`, `requires_elevation = true`, `requires_reboot = true`, Curated Opt-In Tweaks: 12 → 13).
+  - Strictly targets PCI GPUs & High Definition Audio controllers explicitly reporting `MSISupported == 0` (never touches devices already on MSI or missing the capability), capturing every exact device registry path & original DWORD into `baseline_snapshot.json` (`SavedValue::PciMsiMode`) for 1-click Undo.
+- **Scroll Wheel Encoder Bounce & Reverse-Scroll Tester (`diagnostics/raw_capture.rs`, `diagnostics/analyzer.rs`, `input_lab_ui.rs`):**
+  - Captures raw hardware `RI_MOUSE_WHEEL` delta ticks on the decoupled `WM_INPUT` thread to detect single opposite-direction reverse-scroll glitches during steady sweeps (`<= 160 ms`) and mechanical sub-18 ms double-notch contact bounce.
+  - Added a live **Scroll Wheel Encoder Tester** card with directional tick-strip visualization in **Bench → Aim & Switches**, integrated into **Recommended Fixes** and diagnostic text exports.
+- **Passive Match Watchdog (`diagnostics/watchdog.rs`, `input_lab_ui.rs`):**
+  - Strictly user-started, zero-game-hook background logger sampling Windows total + kernel/DPC CPU %, scheduler wake overshoot, local gateway ICMP RTT, and target internet IP RTT every 2 seconds for up to 60 minutes (1,800 rolling samples).
+  - Automatically classifies and timestamps stutter events (**OS Scheduler Stall**, **Kernel/DPC Spike**, **CPU Saturation**, **Local LAN Spike / Router Loss**, **ISP Ping Spike / Packet Loss**) with a dual-series CPU/Ping sparkline and **Copy Log** export in **Bench → System & USB**.
+- **Wooting Analog/HE Keyboard Per-Game Profile Switching (`devices/wooting.rs`, `profiles/mod.rs`, `profile_runtime.rs`, `profiles_ui.rs`):**
+  - Implemented open-source verified Wooting HID profile switching (`VID 0x31E3` & legacy `0x03EB`, usage pages `0x1337` / `0xFF55`, 8-byte feature reports `[0x00, 0xD0, 0xDA, cmd, ...]`, `0x0B` query / `0x17` `ActivateProfile` / `0x26` `ReloadProfile`, read-back verified, volatile RAM only — zero flash wear).
+  - Added optional `wooting_profile` (`Profile 1–4`) per game profile with auto-detection in the Profiles status bar and automatic switching on game focus / manual apply / hotkey cycle.
+- **Pure-Win32 Monochrome On-Screen Switch Pill / OSD (`osd.rs`, `settings.rs`, `profile_runtime.rs`, `app.rs`):**
+  - Added an opt-in (`osd_pill_enabled`, off by default) click-through, non-focus-stealing Win32 topmost layered pill (`WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED`, zero DirectX/Vulkan hooking, 0% CPU when hidden) that briefly displays profile, DPI, Hz, display, and Wooting switches with smooth fade-out and a **Test Pill** preview button in Settings.
+- **Full CLI Parity (`polled-cli`):**
+  - Added `--wooting`, `--list-profiles`, `--apply-profile <ID_OR_NAME>`, `--backup [PATH]`, `--restore <PATH>`, `--report-mouse [PATH]`, and `--check-update` (with `--json` support).
+- **On-Demand Update Checker & WinGet / Release Packaging (`update.rs`, `app.rs`, `packaging/winget/*`, `scripts/release-checklist.ps1`):**
+  - Added a strictly user-triggered GitHub Releases check over native Win32 `WinHTTP` (zero new crates, zero startup/background network calls) in **Settings → Updates** and CLI `--check-update`.
+  - Added ready-to-submit WinGet portable manifests (`packaging/winget/k1jaa.Polled*.yaml`, schema `1.9.0`) and a PowerShell release verification & SHA-256 staging script (`scripts/release-checklist.ps1`).
 
 ---
 

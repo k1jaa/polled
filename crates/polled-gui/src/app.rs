@@ -11,16 +11,18 @@ use chrono::Local;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 use polled_core::win::{RegHive, WindowsEnv};
 use polled_core::{
-    curated_custom_tweak_presets, export_setup_bundle_json, is_autostart_enabled,
-    parse_setup_bundle_json, restore_setup_bundle, set_autostart_enabled, AppPaths, AppSettings,
-    CheckReport, CustomTweakDef, CustomTweakStore, CustomValueKind, HealthEngine, HotkeyBinding,
-    MouseSettings, PolledError, ScanSummary, Severity, SupportTier, ThemePreference,
+    check_latest_github_release, curated_custom_tweak_presets, export_setup_bundle_json,
+    is_autostart_enabled, parse_setup_bundle_json, restore_setup_bundle, set_autostart_enabled,
+    AppPaths, AppSettings, CheckReport, CustomTweakDef, CustomTweakStore, CustomValueKind,
+    HealthEngine, HotkeyBinding, MouseSettings, PolledError, ScanSummary, Severity, SupportTier,
+    ThemePreference, UpdateCheckResult, GITHUB_RELEASES_WEB_URL,
 };
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
 use crate::hotkeys::{HotkeyAction, HotkeyManager};
 use crate::input_lab_ui::{InputLabNavAction, InputLabUiState};
 use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
+use crate::osd::OsdController;
 use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::profiles_ui::ProfilesUiState;
 use crate::single_instance::SingleInstanceGuard;
@@ -245,6 +247,11 @@ pub(crate) enum WorkerMsg {
         error: Option<String>,
     },
     DisplayTestReverted(String),
+    ShowOsdPill {
+        title: String,
+        subtitle: String,
+    },
+    UpdateCheckFinished(Result<UpdateCheckResult, String>),
 }
 
 pub struct PolledApp {
@@ -269,12 +276,15 @@ pub struct PolledApp {
     setup_backup_import_open: bool,
     setup_backup_import_text: String,
     setup_backup_error: Option<String>,
+    update_checking: bool,
+    update_result: Option<Result<UpdateCheckResult, String>>,
     custom_tweak_draft: CustomTweakDraft,
 
     profiles_ui: ProfilesUiState,
     profile_runtime: ProfileRuntimeHandle,
     input_lab_ui: InputLabUiState,
     hotkey_manager: HotkeyManager,
+    osd: OsdController,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -352,11 +362,14 @@ impl PolledApp {
             setup_backup_import_open: false,
             setup_backup_import_text: String::new(),
             setup_backup_error: None,
+            update_checking: false,
+            update_result: None,
             custom_tweak_draft: CustomTweakDraft::default(),
             profiles_ui,
             profile_runtime,
             input_lab_ui: InputLabUiState::new(),
             hotkey_manager,
+            osd: OsdController::start(),
             tx,
             rx,
             main_hwnd,
@@ -789,6 +802,14 @@ impl PolledApp {
                 }
                 WorkerMsg::DisplayTestReverted(msg) => {
                     self.profiles_ui.on_display_test_reverted(msg);
+                }
+                WorkerMsg::ShowOsdPill { title, subtitle } => {
+                    self.osd
+                        .show(title, subtitle, matches!(self.theme, ThemeMode::Dark));
+                }
+                WorkerMsg::UpdateCheckFinished(res) => {
+                    self.update_checking = false;
+                    self.update_result = Some(res);
                 }
             }
         }
@@ -2089,6 +2110,19 @@ impl eframe::App for PolledApp {
                         &mut self.settings.alerts.profile_switch_toast,
                         "Show notification when game/desktop profile switches",
                     );
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.settings.alerts.osd_pill_enabled,
+                            "Show monochrome on-screen switch pill (OSD, zero game hooks)",
+                        );
+                        if ui.add(secondary_button("Test Pill", p)).clicked() {
+                            self.osd.show(
+                                "Polled · Profile Switched",
+                                "Counter-Strike 2 · 1600 DPI · 4000 Hz · Wooting P2",
+                                matches!(self.theme, ThemeMode::Dark),
+                            );
+                        }
+                    });
 
                     ui.add_space(10.0);
                     ui.separator();
@@ -2191,6 +2225,110 @@ impl eframe::App for PolledApp {
                             open_import_backup_clicked = true;
                         }
                     });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.label(
+                        RichText::new("UPDATES (STRICTLY ON-DEMAND)")
+                            .size(10.5)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "Current version: v{}. Polled never phones home — update checks only query GitHub Releases when you click Check Now.",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .size(11.5)
+                            .color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let check_lbl = if self.update_checking {
+                            "Checking GitHub..."
+                        } else {
+                            "Check for Updates"
+                        };
+                        if ui
+                            .add_enabled(!self.update_checking, secondary_button(check_lbl, p))
+                            .clicked()
+                        {
+                            self.update_checking = true;
+                            self.update_result = None;
+                            let tx = self.tx.clone();
+                            let ctx_bg = ctx.clone();
+                            std::thread::spawn(move || {
+                                let res =
+                                    check_latest_github_release().map_err(|e| e.to_string());
+                                let _ = tx.send(WorkerMsg::UpdateCheckFinished(res));
+                                ctx_bg.request_repaint();
+                            });
+                        }
+                        let open_url = match &self.update_result {
+                            Some(Ok(info)) => info.release_url.clone(),
+                            _ => GITHUB_RELEASES_WEB_URL.to_string(),
+                        };
+                        if ui.add(secondary_button("Open Releases Page", p)).clicked() {
+                            let _ = std::process::Command::new("cmd")
+                                .args(["/C", "start", "", &open_url])
+                                .spawn();
+                        }
+                    });
+                    if let Some(res) = &self.update_result {
+                        ui.add_space(6.0);
+                        match res {
+                            Ok(info) if info.update_available => {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "New release available: v{} (current v{}).",
+                                            info.latest_version, info.current_version
+                                        ))
+                                        .size(12.0)
+                                        .strong()
+                                        .color(p.info),
+                                    )
+                                    .wrap(),
+                                );
+                                if !info.notes_preview.is_empty() {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&info.notes_preview)
+                                                .size(11.0)
+                                                .color(p.text_muted),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            }
+                            Ok(info) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Up to date — v{} is the latest GitHub release (latest: v{}).",
+                                        info.current_version, info.latest_version
+                                    ))
+                                    .size(12.0)
+                                    .color(p.ok),
+                                );
+                            }
+                            Err(err) => {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("Update check failed: {err}"))
+                                            .size(11.5)
+                                            .color(p.warn),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        }
+                    }
 
                     ui.add_space(12.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

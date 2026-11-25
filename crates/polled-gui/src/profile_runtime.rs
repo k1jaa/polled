@@ -13,10 +13,10 @@ use chrono::Local;
 use eframe::egui;
 use polled_core::win::{AudioFlow, DisplayModeInfo, DisplayResolutionMode, SystemEnv, WindowsEnv};
 use polled_core::{
-    detect_hardware_devices, hid_topology_fingerprint, match_profile, AppPaths, ApplyOutcome,
-    BatteryStatus, DeviceCapabilities, DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent,
-    ForegroundWatcher, GameProfile, MouseSettings, PolledError, ProfileStore, SafeDeviceController,
-    Severity, TrayAlertConfig,
+    detect_hardware_devices, detect_wooting_keyboards, hid_topology_fingerprint, match_profile,
+    AppPaths, ApplyOutcome, BatteryStatus, DeviceCapabilities, DeviceInfo, DryRunDevice,
+    FocusDebouncer, FocusEvent, ForegroundWatcher, GameProfile, MouseSettings, PolledError,
+    ProfileStore, SafeDeviceController, Severity, TrayAlertConfig, WootingKeyboardInfo,
 };
 
 use crate::app::WorkerMsg;
@@ -68,6 +68,8 @@ pub struct ProfileRuntimeSnapshot {
     pub selection: BackendSelection,
     pub detected_hardware: Vec<DeviceInfo>,
     pub active_devices: Vec<ConnectedDeviceStatus>,
+    /// Connected Wooting keyboards and their last known active onboard profile (`0..=3`).
+    pub wooting_keyboards: Vec<WootingKeyboardInfo>,
     pub any_flash_only: bool,
     pub flash_warning: Option<String>,
     pub foreground_exe: Option<String>,
@@ -230,6 +232,7 @@ struct RuntimeState {
     selection: BackendSelection,
     detected_hardware_info: Vec<DeviceInfo>,
     controllers: Vec<ManagedController>,
+    wooting_keyboards: Vec<WootingKeyboardInfo>,
     last_topology: Vec<(u16, u16, u16, u16)>,
     last_topology_check: Instant,
     pending_hotplug_at: Option<Instant>,
@@ -313,6 +316,7 @@ impl RuntimeState {
             selection: self.selection.clone(),
             detected_hardware: self.detected_hardware_info.clone(),
             active_devices,
+            wooting_keyboards: self.wooting_keyboards.clone(),
             any_flash_only,
             flash_warning,
             foreground_exe: self.foreground_exe.clone(),
@@ -366,9 +370,21 @@ impl RuntimeState {
         self.focus_rx = None;
     }
 
+    fn refresh_wooting_keyboards(&mut self) {
+        self.wooting_keyboards = detect_wooting_keyboards()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|kb| {
+                let active = kb.read_active_profile().ok();
+                kb.info(active)
+            })
+            .collect();
+    }
+
     fn rebuild_controllers(&mut self, selection: BackendSelection, reason: &str) {
         let mut hardware = detect_hardware_devices().unwrap_or_default();
         self.detected_hardware_info = hardware.iter().map(|d| d.info()).collect();
+        self.refresh_wooting_keyboards();
         self.last_topology = hid_topology_fingerprint();
         self.last_topology_check = Instant::now();
 
@@ -837,7 +853,7 @@ impl RuntimeState {
         }
     }
 
-    fn apply_profile(&mut self, profile: &GameProfile, reason: &str) {
+    fn apply_profile(&mut self, profile: &GameProfile, reason: &str) -> Option<(String, String)> {
         self.pending_retry = None;
 
         if let Some(speed) = profile.windows_pointer_speed {
@@ -1076,6 +1092,51 @@ impl RuntimeState {
             self.restore_original_display(reason);
         }
 
+        // --- Wooting Keyboard Volatile Profile Switching (0..=3, zero flash wear) ---
+        if let Some(slot) = profile.wooting_profile {
+            match detect_wooting_keyboards() {
+                Ok(boards) if !boards.is_empty() => {
+                    let mut updated_infos = Vec::with_capacity(boards.len());
+                    for kb in boards {
+                        let base_info = kb.info(None);
+                        match kb.switch_profile(slot) {
+                            Ok(true) => {
+                                self.push_log(
+                                    Severity::Ok,
+                                    format!(
+                                        "[{}] Switched to {} ({reason}, volatile RAM).",
+                                        base_info.name,
+                                        WootingKeyboardInfo::profile_label(slot)
+                                    ),
+                                );
+                                updated_infos.push(kb.info(Some(slot)));
+                            }
+                            Ok(false) => {
+                                updated_infos.push(kb.info(Some(slot)));
+                            }
+                            Err(err) => {
+                                self.push_log(
+                                    Severity::Warn,
+                                    format!("[{}] Wooting switch failed: {err}", base_info.name),
+                                );
+                                updated_infos.push(kb.info(kb.read_active_profile().ok()));
+                            }
+                        }
+                    }
+                    self.wooting_keyboards = updated_infos;
+                }
+                Ok(_) => {
+                    self.wooting_keyboards.clear();
+                }
+                Err(err) => {
+                    self.push_log(
+                        Severity::Warn,
+                        format!("Wooting keyboard detection failed: {err}"),
+                    );
+                }
+            }
+        }
+
         let mut logs: Vec<(Severity, String)> = Vec::new();
         let mut max_rate_limit_wait: Option<u64> = None;
         let mut any_succeeded = false;
@@ -1174,6 +1235,7 @@ impl RuntimeState {
         self.last_battery_poll = Instant::now();
 
         let switched_profile = self.active_profile_id != profile.id;
+        let mut osd_msg: Option<(String, String)> = None;
         if let Some(wait_secs) = max_rate_limit_wait {
             if self.auto_switch_enabled {
                 self.pending_retry = Some((
@@ -1184,9 +1246,9 @@ impl RuntimeState {
         } else if any_succeeded || self.controllers.is_empty() {
             self.active_profile_id = profile.id.clone();
             self.active_profile_name = profile.name.clone();
-            if self.alerts.profile_switch_toast
-                && (switched_profile || reason == "hotkey cycle" || reason == "manual test")
-            {
+            let should_notify =
+                switched_profile || reason == "hotkey cycle" || reason == "manual test";
+            if should_notify && (self.alerts.profile_switch_toast || self.alerts.osd_pill_enabled) {
                 let mut parts = Vec::new();
                 if let Some(dpi) = profile.mouse.dpi {
                     parts.push(format!("{dpi} DPI"));
@@ -1194,19 +1256,36 @@ impl RuntimeState {
                 if let Some(hz) = profile.mouse.polling_rate_hz {
                     parts.push(format!("{hz} Hz"));
                 }
+                if let Some((_, w, h, hz)) = profile.display_mode_override() {
+                    parts.push(format!("{w}×{h}@{hz}Hz"));
+                }
+                if let Some(slot) = profile.wooting_profile {
+                    parts.push(format!("Wooting P{}", slot + 1));
+                }
                 if let Some(plan) = profile.windows_power_plan {
                     parts.push(plan.label().to_string());
                 }
                 if let Some(out) = profile.audio_output_device_name.as_deref() {
                     parts.push(out.to_string());
                 }
-                notify_profile_switched(&profile.name, &parts.join(" · "));
+                let subtitle = if parts.is_empty() {
+                    reason.to_string()
+                } else {
+                    parts.join(" · ")
+                };
+                if self.alerts.profile_switch_toast {
+                    notify_profile_switched(&profile.name, &subtitle);
+                }
+                if self.alerts.osd_pill_enabled {
+                    osd_msg = Some((format!("Polled · {}", profile.name), subtitle));
+                }
             }
         }
 
         for (sev, msg) in logs {
             self.push_log(sev, msg);
         }
+        osd_msg
     }
 }
 
@@ -1234,6 +1313,7 @@ fn run_runtime_loop(
         selection: BackendSelection::AutoConnected,
         detected_hardware_info: Vec::new(),
         controllers: Vec::new(),
+        wooting_keyboards: Vec::new(),
         last_topology: Vec::new(),
         last_topology_check: Instant::now(),
         pending_hotplug_at: None,
@@ -1321,7 +1401,9 @@ fn run_runtime_loop(
                             .as_deref()
                             .map(|e| format!("focus: {e}"))
                             .unwrap_or_else(|| "focus: desktop".to_string());
-                        state.apply_profile(&profile, &reason);
+                        if let Some((title, subtitle)) = state.apply_profile(&profile, &reason) {
+                            let _ = ui_tx.send(WorkerMsg::ShowOsdPill { title, subtitle });
+                        }
                         changed = true;
                     }
                 }
@@ -1339,7 +1421,11 @@ fn run_runtime_loop(
                             .find(|p| p.id == retry_profile_id)
                             .cloned()
                         {
-                            state.apply_profile(&profile, "cooldown retry");
+                            if let Some((title, subtitle)) =
+                                state.apply_profile(&profile, "cooldown retry")
+                            {
+                                let _ = ui_tx.send(WorkerMsg::ShowOsdPill { title, subtitle });
+                            }
                             changed = true;
                         }
                     }
@@ -1393,6 +1479,12 @@ fn run_runtime_loop(
                     ..Default::default()
                 };
                 state.quick_apply_mouse_setting(&desired, &format!("{hz} Hz"));
+                if state.alerts.osd_pill_enabled {
+                    let _ = ui_tx.send(WorkerMsg::ShowOsdPill {
+                        title: "Polled · Mouse Quick-Set".to_string(),
+                        subtitle: format!("Polling Rate -> {hz} Hz"),
+                    });
+                }
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::QuickSetMouseDpi(dpi)) => {
@@ -1401,6 +1493,12 @@ fn run_runtime_loop(
                     ..Default::default()
                 };
                 state.quick_apply_mouse_setting(&desired, &format!("{dpi} DPI"));
+                if state.alerts.osd_pill_enabled {
+                    let _ = ui_tx.send(WorkerMsg::ShowOsdPill {
+                        title: "Polled · Mouse Quick-Set".to_string(),
+                        subtitle: format!("DPI -> {dpi}"),
+                    });
+                }
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::RefreshMouseAndBattery) => {
@@ -1457,7 +1555,11 @@ fn run_runtime_loop(
                         .unwrap_or(0);
                     let next_idx = (cur_idx + 1) % state.store.profiles.len();
                     let next_profile = state.store.profiles[next_idx].clone();
-                    state.apply_profile(&next_profile, "hotkey cycle");
+                    if let Some((title, subtitle)) =
+                        state.apply_profile(&next_profile, "hotkey cycle")
+                    {
+                        let _ = ui_tx.send(WorkerMsg::ShowOsdPill { title, subtitle });
+                    }
                     state.emit(&ui_tx, &ctx);
                 }
             }
@@ -1554,7 +1656,9 @@ fn run_runtime_loop(
                     .find(|p| p.id == profile_id)
                     .cloned()
                 {
-                    state.apply_profile(&profile, "manual test");
+                    if let Some((title, subtitle)) = state.apply_profile(&profile, "manual test") {
+                        let _ = ui_tx.send(WorkerMsg::ShowOsdPill { title, subtitle });
+                    }
                     state.emit(&ui_tx, &ctx);
                 }
             }

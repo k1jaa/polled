@@ -200,6 +200,9 @@ pub struct PciMsiDevice {
     pub category: PciMsiCategory,
     /// `Some(true)` = MSI enabled (`MSISupported=1`), `Some(false)` = legacy IRQ, `None` = unset.
     pub msi_supported: Option<bool>,
+    /// HKLM relative subkey path to `MessageSignaledInterruptProperties` for safe reversible toggling.
+    #[serde(default)]
+    pub msi_reg_path: String,
 }
 
 /// High-bandwidth USB device class that can contend with 4K/8K mouse polling on a shared hub.

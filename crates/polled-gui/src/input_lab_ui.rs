@@ -20,13 +20,14 @@ use polled_core::win::{SystemEnv, UsbMouseTopology, WindowsEnv};
 use polled_core::{
     build_diagnostic_advice, compute_sensitivity, format_advice_summary,
     format_audio_benchmark_summary, format_diagnostic_report, format_intervals_csv,
-    format_network_benchmark_summary, render_ab_comparison_png, render_report_png,
-    render_rig_scorecard_png, run_audio_latency_benchmark, run_network_jitter_benchmark,
-    run_timer_jitter_benchmark, AppPaths, AudioLatencyBenchmark, CheckReport, DiagnosticAdvice,
-    DiagnosticsSnapshot, NetworkJitterBenchmark, PinnedBenchmark, PollingStats, PollingTarget,
-    RawInputCaptureSession, RigScorecardInput, SensitivityGame, Severity, TimerJitterBenchmark,
-    TrackingStats, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS,
-    STANDARD_RATES_HZ,
+    format_network_benchmark_summary, format_watchdog_report, render_ab_comparison_png,
+    render_report_png, render_rig_scorecard_png, run_audio_latency_benchmark,
+    run_network_jitter_benchmark, run_timer_jitter_benchmark, AppPaths, AudioLatencyBenchmark,
+    CheckReport, DiagnosticAdvice, DiagnosticsSnapshot, MatchWatchdogSession,
+    NetworkJitterBenchmark, PinnedBenchmark, PollingStats, PollingTarget, RawInputCaptureSession,
+    RigScorecardInput, SensitivityGame, Severity, TimerJitterBenchmark, TrackingStats,
+    WatchdogSnapshot, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS,
+    SCROLL_DOUBLE_NOTCH_MS, STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
@@ -154,6 +155,9 @@ pub struct InputLabUiState {
     network_benchmark: Option<NetworkJitterBenchmark>,
     network_running: bool,
     network_rx: Option<Receiver<Result<NetworkJitterBenchmark, String>>>,
+    watchdog_session: Option<MatchWatchdogSession>,
+    watchdog_target_ip: String,
+    last_watchdog: WatchdogSnapshot,
     pinned_baseline: Option<PinnedBenchmark>,
     baseline_label: String,
     current_label: String,
@@ -200,6 +204,9 @@ impl InputLabUiState {
             network_benchmark: None,
             network_running: false,
             network_rx: None,
+            watchdog_session: None,
+            watchdog_target_ip: "1.1.1.1".to_string(),
+            last_watchdog: WatchdogSnapshot::default(),
             pinned_baseline: None,
             baseline_label: "Baseline (A)".to_string(),
             current_label: "Current (B)".to_string(),
@@ -388,6 +395,9 @@ impl InputLabUiState {
                 self.notice = Some((Severity::Bad, err));
                 self.stop_capture();
             }
+        }
+        if let Some(wd) = &self.watchdog_session {
+            self.last_watchdog = wd.snapshot();
         }
         if let Some(rx) = &self.timer_rx {
             if let Ok(result) = rx.try_recv() {
@@ -646,9 +656,13 @@ impl InputLabUiState {
                                 );
                             });
                         }
+                        ui.add_space(12.0);
+                        self.render_scroll_encoder_card(ui, p, mode, scroll_w);
                     }
                     BenchSubTab::SystemUsb => {
                         self.render_system_stall_card(ui, p, mode, scroll_w);
+                        ui.add_space(12.0);
+                        self.render_match_watchdog_card(ctx, ui, p, mode, scroll_w);
                         ui.add_space(12.0);
                         if scroll_w < 720.0 {
                             self.render_usb_topology_card(ui, p, mode, scroll_w);
@@ -815,6 +829,7 @@ impl InputLabUiState {
 
         let has_data = self.last_snapshot.polling.total_motion_packets > 0
             || self.last_snapshot.clicks.total_presses > 0
+            || self.last_snapshot.scroll.total_notches > 0
             || self.last_snapshot.dpi_measurement.packet_count > 0
             || self.timer_benchmark.is_some()
             || self.audio_benchmark.is_some()
@@ -1572,6 +1587,329 @@ impl InputLabUiState {
                     Severity::Info
                 };
                 semantic_banner(ui, p, mode, inner_w, sev, &sys.diagnosis);
+            }
+        });
+    }
+
+    fn render_scroll_encoder_card(
+        &self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(160.0);
+        let sc = &self.last_snapshot.scroll;
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Scroll Wheel Encoder Tester")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Raw RI_MOUSE_WHEEL · flags reverse ticks & < {:.0} ms bounce",
+                            SCROLL_DOUBLE_NOTCH_MS
+                        ))
+                        .size(11.5)
+                        .color(p.text_muted),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+
+            let pills = vec![
+                ("TOTAL TICKS".to_string(), sc.total_notches.to_string()),
+                (
+                    "UP / DOWN".to_string(),
+                    format!("{} / {}", sc.up_notches, sc.down_notches),
+                ),
+                (
+                    "REVERSE GLITCHES".to_string(),
+                    sc.reverse_glitches.to_string(),
+                ),
+                (
+                    "DOUBLE-NOTCH BOUNCE".to_string(),
+                    sc.double_notch_faults.to_string(),
+                ),
+                (
+                    "FASTEST TICK".to_string(),
+                    sc.min_notch_interval_ms
+                        .map(|ms| format!("{ms:.1} ms"))
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+            ];
+            render_status_pill_rows(ui, p, inner_w, &pills);
+
+            if !sc.recent_notches.is_empty() {
+                ui.add_space(8.0);
+                let strip_h = 34.0;
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(inner_w, strip_h), egui::Sense::hover());
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, CornerRadius::same(6), p.surface_alt);
+                painter.rect_stroke(
+                    rect,
+                    CornerRadius::same(6),
+                    Stroke::new(1.0_f32, p.border_subtle),
+                    egui::StrokeKind::Inside,
+                );
+                let mid_y = rect.center().y;
+                painter.hline(
+                    (rect.left() + 6.0)..=(rect.right() - 6.0),
+                    mid_y,
+                    Stroke::new(1.0_f32, p.border),
+                );
+                let count = sc.recent_notches.len().max(1);
+                let slot_w = ((rect.width() - 12.0) / 48.0).max(4.0);
+                let start_x = rect.left() + 6.0;
+                for (i, &marker) in sc.recent_notches.iter().take(count).enumerate() {
+                    let x = start_x + (i as f32) * slot_w;
+                    let is_glitch = marker.abs() >= 2;
+                    let is_up = marker > 0;
+                    let col = if is_glitch {
+                        p.bad
+                    } else if is_up {
+                        p.text
+                    } else {
+                        p.text_muted
+                    };
+                    let bar_rect = if is_up {
+                        Rect::from_min_max(
+                            Pos2::new(x, rect.top() + 5.0),
+                            Pos2::new((x + slot_w - 2.0).max(x + 2.0), mid_y - 1.0),
+                        )
+                    } else {
+                        Rect::from_min_max(
+                            Pos2::new(x, mid_y + 1.0),
+                            Pos2::new((x + slot_w - 2.0).max(x + 2.0), rect.bottom() - 5.0),
+                        )
+                    };
+                    painter.rect_filled(bar_rect, CornerRadius::same(2), col);
+                }
+            }
+
+            if !sc.health_summary.is_empty() {
+                ui.add_space(8.0);
+                let sev = sc.health_severity.unwrap_or(Severity::Info);
+                semantic_banner(ui, p, mode, inner_w, sev, &sc.health_summary);
+            }
+        });
+    }
+
+    fn render_match_watchdog_card(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(160.0);
+        let running = self.watchdog_session.is_some();
+        let snap = self.last_watchdog.clone();
+
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Passive Match Watchdog")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Zero game hooks · 2s CPU/DPC/Router/ISP log (up to 60 min)")
+                        .size(11.5)
+                        .color(p.text_muted),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if running {
+                        if ui.add(primary_btn("Stop Watchdog", p)).clicked() {
+                            if let Some(mut wd) = self.watchdog_session.take() {
+                                wd.stop();
+                                self.last_watchdog = wd.snapshot();
+                            }
+                        }
+                    } else if ui.add(primary_btn("Start Watchdog", p)).clicked() {
+                        let ctx_bg = ctx.clone();
+                        let wd = MatchWatchdogSession::start(
+                            self.watchdog_target_ip.clone(),
+                            move || {
+                                ctx_bg.request_repaint();
+                            },
+                        );
+                        self.last_watchdog = wd.snapshot();
+                        self.watchdog_session = Some(wd);
+                    }
+                    if snap.sample_count > 0 && ui.add(secondary_btn("Copy Log", p)).clicked() {
+                        ctx.copy_text(format_watchdog_report(&snap));
+                        self.notice = Some((
+                            Severity::Ok,
+                            "Copied Passive Match Watchdog report to clipboard.".to_string(),
+                        ));
+                    }
+                    ui.add_enabled(
+                        !running,
+                        egui::TextEdit::singleline(&mut self.watchdog_target_ip)
+                            .desired_width(96.0)
+                            .hint_text("1.1.1.1"),
+                    );
+                    ui.label(RichText::new("Ping IP:").size(11.5).color(p.text_muted));
+                });
+            });
+
+            ui.add_space(10.0);
+
+            let dur_str = if snap.sample_count > 0 || running {
+                format!(
+                    "{:02}:{:02}",
+                    snap.elapsed_secs / 60,
+                    snap.elapsed_secs % 60
+                )
+            } else {
+                "—".to_string()
+            };
+            let gw_str = snap
+                .median_gateway_ms
+                .map(|m| format!("{m:.1} / {:.1} ms", snap.peak_gateway_ms.unwrap_or(m)))
+                .unwrap_or_else(|| "—".to_string());
+            let inet_str = snap
+                .median_internet_ms
+                .map(|m| format!("{m:.1} / {:.1} ms", snap.peak_internet_ms.unwrap_or(m)))
+                .unwrap_or_else(|| "—".to_string());
+
+            let pills = vec![
+                ("DURATION".to_string(), dur_str),
+                (
+                    "CPU AVG / PEAK".to_string(),
+                    if snap.sample_count > 0 {
+                        format!("{:.0}% / {:.0}%", snap.avg_cpu_pct, snap.peak_cpu_pct)
+                    } else {
+                        "—".to_string()
+                    },
+                ),
+                (
+                    "KERNEL PEAK".to_string(),
+                    if snap.sample_count > 0 {
+                        format!("{:.0}%", snap.peak_kernel_pct)
+                    } else {
+                        "—".to_string()
+                    },
+                ),
+                ("ROUTER MED / PK".to_string(), gw_str),
+                ("ISP MED / PK".to_string(), inet_str),
+                ("SPIKE EVENTS".to_string(), snap.events.len().to_string()),
+            ];
+            render_status_pill_rows(ui, p, inner_w, &pills);
+
+            if snap.samples.len() >= 2 {
+                ui.add_space(8.0);
+                let chart_h = 64.0;
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(inner_w, chart_h), egui::Sense::hover());
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, CornerRadius::same(6), p.surface_alt);
+                painter.rect_stroke(
+                    rect,
+                    CornerRadius::same(6),
+                    Stroke::new(1.0_f32, p.border_subtle),
+                    egui::StrokeKind::Inside,
+                );
+                let slice_start = snap.samples.len().saturating_sub(180);
+                let view = &snap.samples[slice_start..];
+                let n = view.len().max(2);
+                let max_ping = view
+                    .iter()
+                    .filter_map(|s| s.internet_ms)
+                    .fold(60.0_f64, f64::max);
+
+                let pad = 6.0;
+                let plot_w = (rect.width() - pad * 2.0).max(10.0);
+                let plot_h = (rect.height() - pad * 2.0).max(10.0);
+
+                // CPU % polyline (subtle monochrome muted)
+                let cpu_pts: Vec<Pos2> = view
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let x = rect.left() + pad + (i as f32 / (n - 1) as f32) * plot_w;
+                        let frac = (s.cpu_pct / 100.0).clamp(0.0, 1.0) as f32;
+                        let y = rect.bottom() - pad - frac * plot_h;
+                        Pos2::new(x, y)
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(
+                    cpu_pts,
+                    Stroke::new(1.25_f32, p.text_muted),
+                ));
+
+                // Internet Ping polyline (foreground crisp monochrome)
+                let ping_pts: Vec<Pos2> = view
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| {
+                        let ms = s.internet_ms?;
+                        let x = rect.left() + pad + (i as f32 / (n - 1) as f32) * plot_w;
+                        let frac = (ms / max_ping).clamp(0.0, 1.0) as f32;
+                        let y = rect.bottom() - pad - frac * plot_h;
+                        Some(Pos2::new(x, y))
+                    })
+                    .collect();
+                if ping_pts.len() >= 2 {
+                    painter.add(egui::Shape::line(ping_pts, Stroke::new(1.6_f32, p.text)));
+                }
+                painter.text(
+                    Pos2::new(rect.left() + 8.0, rect.top() + 5.0),
+                    Align2::LEFT_TOP,
+                    format!("White: Ping (0–{max_ping:.0} ms) · Gray: CPU (0–100%)"),
+                    FontId::proportional(10.5),
+                    p.text_muted,
+                );
+            }
+
+            if !snap.diagnosis.is_empty() {
+                ui.add_space(8.0);
+                let sev = if snap.events.iter().any(|e| e.severity == Severity::Bad) {
+                    Severity::Bad
+                } else if !snap.events.is_empty() {
+                    Severity::Warn
+                } else if snap.sample_count > 0 {
+                    Severity::Ok
+                } else {
+                    Severity::Info
+                };
+                semantic_banner(ui, p, mode, inner_w, sev, &snap.diagnosis);
+            }
+
+            if !snap.events.is_empty() {
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("watchdog_events_scroll")
+                    .max_height(110.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for ev in snap.events.iter().rev().take(25) {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(format!("[{}]", ev.wall_time))
+                                        .size(11.0)
+                                        .monospace()
+                                        .color(p.text_muted),
+                                );
+                                ui.label(
+                                    RichText::new(&ev.category)
+                                        .size(11.5)
+                                        .strong()
+                                        .color(p.severity_fg(ev.severity)),
+                                );
+                                ui.label(RichText::new(&ev.detail).size(11.5).color(p.text_muted));
+                            });
+                        }
+                    });
             }
         });
     }

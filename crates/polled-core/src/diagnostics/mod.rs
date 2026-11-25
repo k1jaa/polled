@@ -11,6 +11,7 @@ pub mod analyzer;
 pub mod export;
 pub mod raw_capture;
 pub mod sensitivity;
+pub mod watchdog;
 
 pub use analyzer::{
     build_diagnostic_advice, format_advice_summary, format_diagnostic_report, snap_nominal_hz,
@@ -18,9 +19,10 @@ pub use analyzer::{
     DiagnosticAdvice, DiagnosticsSnapshot, DpiCalibrationResult, DpiCalibrator,
     DpiMeasurementSnapshot, HistogramBin, IntervalSample, KeyboardPollingAnalyzer,
     KeyboardPollingStats, MouseButtonKind, PinnedBenchmark, PollingAnalyzer, PollingStats,
-    PollingTarget, SystemLoadStats, TimerJitterBenchmark, TrackingStats, XyTracePoint,
-    BOUNCE_THRESHOLD_MS, GRAVITY_MPS2, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS,
-    PAUSE_THRESHOLD_US, STANDARD_RATES_HZ,
+    PollingTarget, ScrollEncoderAnalyzer, ScrollEncoderSnapshot, SystemLoadStats,
+    TimerJitterBenchmark, TrackingStats, XyTracePoint, BOUNCE_THRESHOLD_MS, GRAVITY_MPS2,
+    HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, PAUSE_THRESHOLD_US, SCROLL_DOUBLE_NOTCH_MS,
+    SCROLL_REVERSE_GLITCH_WINDOW_MS, STANDARD_RATES_HZ,
 };
 pub use export::{
     format_intervals_csv, render_ab_comparison_png, render_report_png, render_rig_scorecard_png,
@@ -28,6 +30,9 @@ pub use export::{
 };
 pub use raw_capture::RawInputCaptureSession;
 pub use sensitivity::{compute_sensitivity, SensitivityConversion, SensitivityGame};
+pub use watchdog::{
+    format_watchdog_report, MatchWatchdogSession, WatchdogEvent, WatchdogSample, WatchdogSnapshot,
+};
 
 use crate::error::Result;
 use crate::win::{AudioLatencyBenchmark, NetworkJitterBenchmark};

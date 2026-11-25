@@ -26,7 +26,7 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 | `usb_selective_suspend` | Fixable | `powrprof.dll` active scheme → Subgroup `2a737441-1930-4402-8d77-b2bebba308a3` → Setting `48e6b7a6-50f5-4782-a5d4-53bb8f07e226` | AC index = `0` (Disabled); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
 | `usb_power_management` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_...` & `ROOT_HUB20/30` (`EnhancedPowerManagementEnabled`, `SelectiveSuspendEnabled`, `AllowIdleIrpInD3`, `WDF\IdleInWorkingState`) | *None (never modifies)* | No admin | N/A |
 | `usb_xhci_msi` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\...\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties\MSISupported` where `Service == USBXHCI` | *None (never modifies)* | No admin | N/A |
-| `pci_gpu_audio_msi` | **Report-Only** | Reads `MSISupported` under `HKLM\SYSTEM\CurrentControlSet\Enum\PCI` for PCI Display adapters (NVIDIA/AMD/Intel GPUs) and PCI High Definition Audio controllers (`HDAudBus`, `HdAudio`, `MEDIA`) | *None (never modifies)* | No admin | N/A |
+| `pci_gpu_audio_msi` | **Optional Tweak** | `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\...\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties\MSISupported` (`REG_DWORD`) for PCI GPUs & HD Audio controllers explicitly set to `0` | `1` (only on devices currently reporting `MSISupported == 0`; devices already on MSI or without the key are untouched) | **UAC (Admin)** / **Reboot** | Restores exact captured `MSISupported` DWORD (or deletes if absent) per device path (`pci_msi_mode` snapshot) |
 | `usb_topology` | **Report-Only** | Walks live Windows PnP USB device tree via `cfgmgr32.dll` (`CM_Get_Device_ID_ListW`, `CM_Get_Parent`, `CM_Get_Child`, `CM_Get_Sibling`) + `hidapi` to map connected mice/dongles to their exact USB port, hub, PCI xHCI controller, and sibling cameras/USB audio DACs/storage | *None (never modifies)* | No admin | N/A |
 | `pcie_aspm` | Fixable | `powrprof.dll` active scheme → Subgroup `501a4d13-42af-4429-9fd1-a8218c268e20` → Setting `ee12f906-d277-404b-b6da-e5fa1a576df5` | AC index = `0` (Off); DC/battery left untouched | **UAC (Admin)** / Immediate | Restores captured AC & DC power indices on saved scheme GUID |
 | `power_plan` | Fixable | `powrprof.dll` `PowerSetActiveScheme` | Switches active scheme to High Performance (`8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c`) / Ultimate Performance / Balanced (if on Power Saver) | No admin / Immediate | Calls `PowerSetActiveScheme` with original scheme GUID |
@@ -59,9 +59,9 @@ Every mutable fix, optional tweak, and user-defined custom tweak records its **e
 | `game_bar_capture` | Fixable | `HKCU\Software\Microsoft\Windows\CurrentVersion\GameDVR\AppCaptureEnabled` & `HKCU\System\GameConfigStore\GameDVR_Enabled` (`REG_DWORD`) | `0` for both (does **not** touch Fullscreen Optimizations) | No admin / Immediate | Restores both captured `REG_DWORD` values (or deletes if absent) |
 | `vbs_memory_integrity` | **Report-Only** | Reads `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\EnableVirtualizationBasedSecurity` & `...\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled` | *None (Polled never weakens OS security)* | No admin | N/A |
 
-### 1.6 Optional Reversible Low-Latency Tweaks (Opt-In Only, 12 Total)
+### 1.6 Optional Reversible Low-Latency Tweaks (Opt-In Only, 13 Total)
 
-Optional tweaks are **never** applied by **Fix Safe Issues** and always show an explicit confirmation warning before applying.
+Optional tweaks (plus `pci_gpu_audio_msi` listed in Section 1.2 above) are **never** applied by **Fix Safe Issues** and always show an explicit confirmation warning before applying.
 
 | Check ID | Mode | Exact Windows Target | Value Written on Apply | Admin / Restart | Rollback Behavior |
 | --- | --- | --- | --- | --- | --- |
@@ -142,7 +142,9 @@ When **Auto-Switch** is enabled or you click **Apply Now**, Polled can modify:
 4. **Optional Temporary Display Resolution & Refresh Rate Override** (only if enabled on a profile):
    - Pre-validates modes with Win32 `ChangeDisplaySettingsExW(..., CDS_TEST)` and applies strictly as a temporary session-only switch (`dwflags = 0`; **`CDS_UPDATEREGISTRY` is never passed**, so crashes or reboots always recover native desktop resolution cleanly).
    - Automatically restores your captured native resolution & refresh rate when tabbing back to desktop, switching to a profile without a display override, or exiting Polled. GUI **Test (10s)** enforces both a 10-second confirmation countdown and an independent 11-second background failsafe auto-revert.
-5. **Mouse Hardware Settings over USB HID** (only on matching protocol-family devices):
+5. **Optional Wooting Keyboard Onboard Profile Switching** (only if configured on the profile):
+   - Uses Wooting's open-source HID command interface (`VID 0x31E3` / legacy `0x03EB`, usage pages `0x1337` / `0xFF55`, 8-byte feature reports `[0x00, 0xD0, 0xDA, cmd, ...]`) to query the active slot (`0x0B`) and switch volatile active profile (`0x17` `ActivateProfile` + `0x26` `ReloadProfile`) with read-back verification. Never flashes firmware or modifies stored profile configs (zero flash wear).
+6. **Mouse Hardware Settings over USB HID** (only on matching protocol-family devices):
    - **CompX / Nordic 17-byte protocol** (`usage_page 0xFF02`, `usage 0x0002`, `Report ID 0x08`, `CMD_MEM_SET = 0x07`, Pulsar / LAMZU / VGN / Scyrox V8 / ATK & VXE R1 / G-Wolves XVI:0 / Hitscan Hyperlight):
      - Writes **only changed registers** among: Polling Rate (`0x0000`), Active DPI Stage Slot (`0x0004`), DPI Stage X/Y (`0x000C + 4*stage`, or all stages when **Lock DPI Button** is enabled), Lift-Off Distance (`0x000A`), Debounce (`0x00A9`), Motion Sync (`0x00AB`), Idle Sleep (`0x00AD`), Angle Snapping (`0x00AF`), and Ripple Control (`0x00B1`). Reads battery via read-only `CMD_BATTERY = 0x04`. Never sends factory reset (`0x09`).
    - **CompX 64-byte Page-Command protocol** (`Report ID 0x00`, WLMouse / LAMZU Maya X & Inca / Attack Shark / Vancer / RAWM / CRDRAKO / LunaFury):
@@ -203,4 +205,4 @@ Get-Content "$env:LOCALAPPDATA\Polled\baseline_snapshot.json"
 - Never flashes or updates mouse firmware, and never issues HID factory-reset commands.
 - Never disables Windows Defender, VBS, HVCI (Memory Integrity), Firewall, or Windows Update.
 - Never takes ownership of or modifies `TrustedInstaller`-protected registry ACLs (such as `MMDevices\...\FxProperties`).
-- Never sends telemetry or contacts external servers automatically (the Bench **Dual-Hop Ping** / CLI `--ping` only sends ICMP echo packets on demand when explicitly triggered by you).
+- Never sends telemetry or contacts external servers automatically (Bench **Dual-Hop Ping** / **Passive Match Watchdog** / CLI `--ping` only send ICMP packets when explicitly started, and **Check for Updates** / CLI `--check-update` only sends one WinHTTP HTTPS GET to `api.github.com/repos/k1jaa/polled/releases/latest` when you explicitly click/invoke it).

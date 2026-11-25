@@ -425,6 +425,26 @@ fn icmp_ping_once(handle: HANDLE, target: Ipv4Addr, timeout_ms: u32) -> Option<f
     Some(rtt_ms.max(0.05))
 }
 
+/// Sends a single user-mode ICMP echo request to an IPv4 address (zero admin).
+/// Returns round-trip time in milliseconds, or `None` on timeout / invalid IP / error.
+pub fn ping_once_ipv4(ip: &str, timeout_ms: u32) -> Option<f64> {
+    let target: Ipv4Addr = ip.trim().parse().ok()?;
+    // SAFETY: Standard Win32 user-mode ICMP handle.
+    let raw_handle = unsafe { IcmpCreateFile() }.ok()?;
+    let handle = IcmpHandleGuard(raw_handle);
+    icmp_ping_once(handle.0, target, timeout_ms.clamp(100, 3_000))
+}
+
+/// Returns the IPv4 default gateway of the primary active physical network adapter, if any.
+pub fn primary_gateway_ipv4() -> Option<String> {
+    let adapters = list_network_adapters().ok()?;
+    adapters
+        .iter()
+        .find(|a| a.is_primary)
+        .or(adapters.first())
+        .and_then(|a| a.gateway_ipv4.clone())
+}
+
 pub(crate) fn compute_hop_stats(
     label: &str,
     target_ip: &str,

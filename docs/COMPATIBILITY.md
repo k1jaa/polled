@@ -9,7 +9,7 @@
 
 | OS | Status | Notes |
 | --- | --- | --- |
-| **Windows 11 (22H2 / 23H2 / 24H2+)** | Supported (Primary) | All 41 health checks (including 12 opt-in reversible tweaks), Bench (up to 8,000 Hz + WASAPI audio & dual-hop ICMP ping benchmarks), and Per-Game Profiles (mouse, temporary display mode, power & audio) supported. |
+| **Windows 11 (22H2 / 23H2 / 24H2+)** | Supported (Primary) | All 41 health checks (including 13 opt-in reversible tweaks), Bench (up to 8,000 Hz, scroll wheel encoder tester, passive match watchdog, WASAPI audio & dual-hop ICMP ping benchmarks), Per-Game Profiles (mouse, Wooting keyboard, temporary display mode, power & audio), and optional click-through Win32 OSD switch pill supported. |
 | **Windows 10 (1903+)** | Supported | `windowed_optimizations` and `global_timer_requests` are Windows 11-specific features and are safe to leave untouched on Windows 10. |
 | **Windows 7 / 8 / 8.1** | Unsupported | Not tested; Win32 / power / Raw Input behavior is unsupported. |
 | **Linux / macOS** | Unsupported | Polled targets Windows APIs directly. |
@@ -41,6 +41,7 @@
 | **MCHOSE V2 / Ultra** (A7 V2 Pro / Pro+ / Ultra / Ultra+, A7 Ultra, L7 Pro / Pro+) | `3837:*`, `5253:1020/1011` | Implemented from docs *(unverified)* | Onboard flash | DPI `50–30000/42000` (50 step), Polling `125–8000 Hz`, LOD `0.7/1.0/2.0 mm`, Debounce `0–20 ms`, Motion Sync / Angle Snap / Ripple, Live Battery % |
 | **Incott** (G23 / G23 V2 / G24 / Ghero / Zero 29 / Zero 39) | `093a:522c`, `622c` | Implemented from docs *(unverified)* | Onboard flash | DPI `50–32000/45000` (50 step), Polling `125–8000 Hz` (wireless) / `1000 Hz` (wired), LOD `0.7/1.0/2.0 mm`, Debounce `0–30 ms`, Motion Sync / Angle Snap / Ripple |
 | **Keychron Launcher 8K** (M1–M8, G3–G10, LM7 wired + Link / Ultra-Link / TurboLink receivers) | `3434:*` (`0xFFC1`) | Implemented from docs *(unverified)* | Onboard flash | DPI up to `26000/30000` (50 step), Polling `125–8000 Hz`, LOD `0.7/1.0/2.0 mm`, Debounce `0–20 ms`, Motion Sync / Angle Snap / Ripple, Live Battery % |
+| **Wooting Keyboards** (60HE, 60HE+, 80HE, Two HE, UwU, Wooting One / Two) | `31e3:*`, `03eb:ff01/ff02` | Implemented from docs *(unverified)* | **Volatile RAM** *(zero flash wear)* | Onboard profile slot (`Profile 1–4`) via `0x0B` / `0x17` / `0x26` with read-back verification |
 
 > **Intentionally skipped:**
 > - `Pulsar X3 LHD CrazyLight Medium` (`3710:5406`, `cid=0x57, mid=0x68`) is explicitly skipped during detection until its register layout is verified.

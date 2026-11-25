@@ -2,15 +2,19 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
-    detect_hardware_devices, dump_hid_devices, format_network_benchmark_summary,
-    run_network_jitter_benchmark, AppPaths, AudioEndpointInfo, AudioFlow, CheckReport,
-    HealthEngine, NetworkAdapterInfo, PolledError, Severity,
+    check_latest_github_release, detect_hardware_devices, detect_wooting_keyboards,
+    dump_hid_devices, export_setup_bundle_json, format_network_benchmark_summary,
+    format_unsupported_mouse_issue, parse_setup_bundle_json, restore_setup_bundle,
+    run_network_jitter_benchmark, AppPaths, ApplyOutcome, AudioEndpointInfo, AudioFlow,
+    CheckReport, HealthEngine, NetworkAdapterInfo, PolledError, ProfileStore, SafeDeviceController,
+    Severity, WootingKeyboardInfo,
 };
 
 #[derive(Debug, Parser)]
@@ -32,6 +36,34 @@ struct Cli {
     #[arg(long)]
     detect: bool,
 
+    /// Detect connected Wooting keyboards and read their active onboard profile (read-only)
+    #[arg(long)]
+    wooting: bool,
+
+    /// List all saved per-game profiles from profiles.json
+    #[arg(long)]
+    list_profiles: bool,
+
+    /// Apply a saved profile by ID or name to connected mice, Wooting keyboards, power plan, and audio
+    #[arg(long, value_name = "ID_OR_NAME")]
+    apply_profile: Option<String>,
+
+    /// Export full portable setup backup (polled.setup.v1) to PATH or stdout
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "-")]
+    backup: Option<String>,
+
+    /// Restore full portable setup backup (polled.setup.v1) from PATH
+    #[arg(long, value_name = "PATH")]
+    restore: Option<PathBuf>,
+
+    /// Generate a serial-redacted unsupported mouse Markdown report to PATH or stdout
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "-")]
+    report_mouse: Option<String>,
+
+    /// Check GitHub Releases once for a newer version of Polled (strictly on-demand, WinHTTP)
+    #[arg(long)]
+    check_update: bool,
+
     /// List active Windows audio playback & capture endpoints, WASAPI formats, and APO status
     #[arg(long)]
     audio: bool,
@@ -52,7 +84,7 @@ struct Cli {
     #[arg(long)]
     include_serials: bool,
 
-    /// Output results as machine-readable JSON (use with --scan, --audio, --network, --ping, --detect, --dump, --fix, or --undo-all)
+    /// Output results as machine-readable JSON
     #[arg(long)]
     json: bool,
 
@@ -106,6 +138,76 @@ fn parse_hex_vid(input: &str) -> polled_core::Result<u16> {
 }
 
 fn run(cli: Cli) -> polled_core::Result<ExitCode> {
+    if cli.check_update {
+        let res = check_latest_github_release()?;
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        } else if res.update_available {
+            println!(
+                "Update available: v{} -> v{}",
+                res.current_version, res.latest_version
+            );
+            println!("Release page: {}", res.release_url);
+            if !res.notes_preview.is_empty() {
+                println!();
+                println!("{}", res.notes_preview);
+            }
+        } else {
+            println!(
+                "Polled v{} is up to date (latest release: v{}).",
+                res.current_version, res.latest_version
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if cli.wooting {
+        let boards = detect_wooting_keyboards()?;
+        let infos: Vec<WootingKeyboardInfo> = boards
+            .iter()
+            .map(|b| b.info(b.read_active_profile().ok()))
+            .collect();
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&infos)?);
+        } else if infos.is_empty() {
+            println!("No supported Wooting keyboards detected.");
+            println!("Close Wootility if open and run `polled --dump --vid 31e3` to inspect HID interfaces.");
+        } else {
+            for kb in &infos {
+                let slot = kb
+                    .active_profile
+                    .map(WootingKeyboardInfo::profile_label)
+                    .unwrap_or("Unknown");
+                println!("{} ({}) — Active: {}", kb.name, kb.vid_pid, slot);
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if let Some(target_path) = cli.report_mouse {
+        let dump = dump_hid_devices(false, None)?;
+        let env = WindowsEnv;
+        let topology = env.list_usb_topology().unwrap_or_default();
+        let win_ver = env.windows_version().ok().map(|v| v.display_string());
+        let detected: Vec<_> = detect_hardware_devices()
+            .unwrap_or_default()
+            .iter()
+            .map(|d| d.info())
+            .collect();
+        let md = format_unsupported_mouse_issue(&dump, &topology, &detected, win_ver.as_deref());
+        if target_path == "-" {
+            println!("{md}");
+        } else {
+            let p = PathBuf::from(&target_path);
+            fs::write(&p, &md).map_err(|source| PolledError::Io {
+                path: p.clone(),
+                source,
+            })?;
+            println!("Wrote serial-redacted mouse report to {}", p.display());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     if let Some(target_ip) = cli.ping {
         let bench = run_network_jitter_benchmark(&target_ip, 20, 250)?;
         if cli.json {
@@ -274,6 +376,260 @@ fn run(cli: Cli) -> polled_core::Result<ExitCode> {
         Some(dir) => AppPaths::from_root(dir),
         None => AppPaths::default_user_dir(),
     };
+
+    if let Some(target_path) = cli.backup {
+        let json = export_setup_bundle_json(&paths)?;
+        if target_path == "-" {
+            println!("{json}");
+        } else {
+            let p = PathBuf::from(&target_path);
+            fs::write(&p, &json).map_err(|source| PolledError::Io {
+                path: p.clone(),
+                source,
+            })?;
+            println!(
+                "Saved full setup backup (polled.setup.v1) to {}",
+                p.display()
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if let Some(src_path) = cli.restore {
+        let raw = fs::read_to_string(&src_path).map_err(|source| PolledError::Io {
+            path: src_path.clone(),
+            source,
+        })?;
+        let bundle = parse_setup_bundle_json(&raw)?;
+        let restored = restore_setup_bundle(&paths, &bundle)?;
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "restored": restored.summary_counts(),
+                    "profiles_count": restored.profiles.profiles.len(),
+                    "custom_tweaks_count": restored.custom_tweaks.tweaks.len(),
+                }))?
+            );
+        } else {
+            println!(
+                "Restored setup backup from {} ({}).",
+                src_path.display(),
+                restored.summary_counts()
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if cli.list_profiles {
+        let store = ProfileStore::load_or_default(&paths.profiles_path())?;
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&store)?);
+        } else {
+            println!("Saved Profiles ({}):", store.profiles.len());
+            for prof in &store.profiles {
+                let tag = if prof.is_desktop_default {
+                    " [default]"
+                } else {
+                    ""
+                };
+                let exes = if prof.executables.is_empty() {
+                    "(fallback)".to_string()
+                } else {
+                    prof.executables.join(", ")
+                };
+                let mut extras = Vec::new();
+                if let Some(slot) = prof.wooting_profile {
+                    extras.push(format!("Wooting P{}", slot + 1));
+                }
+                if let Some((_, w, h, hz)) = prof.display_mode_override() {
+                    extras.push(format!("{w}x{h}@{hz}Hz"));
+                }
+                if let Some(plan) = prof.windows_power_plan {
+                    extras.push(plan.label().to_string());
+                }
+                let extra_str = if extras.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | {}", extras.join(", "))
+                };
+                println!(
+                    "  - {} ({}){} — {} | {}{}",
+                    prof.name,
+                    prof.id,
+                    tag,
+                    prof.mouse.summary_string(),
+                    exes,
+                    extra_str
+                );
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if let Some(query) = cli.apply_profile {
+        let store = ProfileStore::load_or_default(&paths.profiles_path())?;
+        let needle = query.trim();
+        let profile = store
+            .profiles
+            .iter()
+            .find(|p| p.id.eq_ignore_ascii_case(needle) || p.name.eq_ignore_ascii_case(needle))
+            .cloned()
+            .ok_or_else(|| {
+                PolledError::InvalidProfile(format!(
+                    "No saved profile matches '{needle}'. Run `polled --list-profiles` to see available IDs."
+                ))
+            })?;
+
+        let env = WindowsEnv;
+        let mut actions: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+
+        if let Some(speed) = profile.windows_pointer_speed {
+            match env.set_mouse_speed(speed) {
+                Ok(()) => actions.push(format!("Windows pointer speed -> {speed}/20")),
+                Err(e) => warnings.push(format!("Windows pointer speed failed: {e}")),
+            }
+        }
+
+        if let Some(preset) = profile.windows_power_plan {
+            if let Ok(schemes) = env.list_power_schemes() {
+                if let Some(target) = preset.resolve_scheme(&schemes) {
+                    match env.set_active_power_scheme(&target.guid) {
+                        Ok(()) => actions.push(format!("Power plan -> {}", target.name)),
+                        Err(e) => warnings.push(format!("Power plan failed: {e}")),
+                    }
+                }
+            }
+        }
+
+        if let Some(out_id) = profile.audio_output_device_id.as_deref() {
+            match env.set_default_audio_endpoint(out_id) {
+                Ok(()) => actions.push(format!(
+                    "Audio output -> {}",
+                    profile
+                        .audio_output_device_name
+                        .as_deref()
+                        .unwrap_or(out_id)
+                )),
+                Err(e) => warnings.push(format!("Audio output switch failed: {e}")),
+            }
+        }
+        if let Some(vol) = profile.audio_output_volume {
+            match env.set_audio_endpoint_volume(
+                AudioFlow::Render,
+                profile.audio_output_device_id.as_deref(),
+                vol,
+            ) {
+                Ok(()) => actions.push(format!("Output volume -> {vol}%")),
+                Err(e) => warnings.push(format!("Output volume failed: {e}")),
+            }
+        }
+        if let Some(in_id) = profile.audio_input_device_id.as_deref() {
+            match env.set_default_audio_endpoint(in_id) {
+                Ok(()) => actions.push(format!(
+                    "Microphone -> {}",
+                    profile.audio_input_device_name.as_deref().unwrap_or(in_id)
+                )),
+                Err(e) => warnings.push(format!("Microphone switch failed: {e}")),
+            }
+        }
+        if let Some(vol) = profile.audio_input_volume {
+            match env.set_audio_endpoint_volume(
+                AudioFlow::Capture,
+                profile.audio_input_device_id.as_deref(),
+                vol,
+            ) {
+                Ok(()) => actions.push(format!("Microphone volume -> {vol}%")),
+                Err(e) => warnings.push(format!("Microphone volume failed: {e}")),
+            }
+        }
+
+        if let Some(slot) = profile.wooting_profile {
+            match detect_wooting_keyboards() {
+                Ok(boards) if boards.is_empty() => {
+                    warnings.push("No connected Wooting keyboard detected.".to_string());
+                }
+                Ok(boards) => {
+                    for kb in boards {
+                        let info = kb.info(None);
+                        match kb.switch_profile(slot) {
+                            Ok(true) => actions.push(format!(
+                                "{} -> {}",
+                                info.name,
+                                WootingKeyboardInfo::profile_label(slot)
+                            )),
+                            Ok(false) => actions.push(format!(
+                                "{} already on {}",
+                                info.name,
+                                WootingKeyboardInfo::profile_label(slot)
+                            )),
+                            Err(e) => warnings.push(format!("{} failed: {e}", info.name)),
+                        }
+                    }
+                }
+                Err(e) => warnings.push(format!("Wooting detection failed: {e}")),
+            }
+        }
+
+        match detect_hardware_devices() {
+            Ok(devices) if devices.is_empty() => {
+                warnings.push("No supported hardware mouse detected.".to_string());
+            }
+            Ok(devices) => {
+                for dev in devices {
+                    let info = dev.info();
+                    let caps = dev.capabilities();
+                    let (raw_desired, _) = profile.settings_for_device(&info.id);
+                    let (adapted, _) = caps.adapt_settings(raw_desired);
+                    let mut ctrl = SafeDeviceController::new(dev);
+                    match ctrl.apply_profile_settings(&adapted) {
+                        Ok(ApplyOutcome::Applied { mode, verified, .. }) => actions.push(format!(
+                            "{} -> {} ({mode:?})",
+                            info.name,
+                            verified.summary_string()
+                        )),
+                        Ok(ApplyOutcome::SkippedUnchanged { current }) => actions.push(format!(
+                            "{} already matches ({})",
+                            info.name,
+                            current.summary_string()
+                        )),
+                        Ok(ApplyOutcome::SkippedNoSettings) => {}
+                        Err(e) => warnings.push(format!("{} failed: {e}", info.name)),
+                    }
+                }
+            }
+            Err(e) => warnings.push(format!("Mouse detection failed: {e}")),
+        }
+
+        if let Some((_, w, h, hz)) = profile.display_mode_override() {
+            warnings.push(format!(
+                "Temporary display switch ({w}x{h} @ {hz} Hz) is managed by the Polled GUI runtime so it safely auto-reverts on exit."
+            ));
+        }
+
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "profile_id": profile.id,
+                    "profile_name": profile.name,
+                    "actions": actions,
+                    "warnings": warnings,
+                }))?
+            );
+        } else {
+            println!("Applied profile '{}' ({}):", profile.name, profile.id);
+            for a in &actions {
+                println!("  [ OK ] {a}");
+            }
+            for w in &warnings {
+                println!("  [WARN] {w}");
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let env = WindowsEnv;
     let engine = HealthEngine::with_default_and_custom_checks(&paths);
 

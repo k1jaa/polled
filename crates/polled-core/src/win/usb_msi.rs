@@ -180,6 +180,7 @@ pub fn list_pci_msi_devices() -> Result<Vec<PciMsiDevice>> {
                 name,
                 category,
                 msi_supported,
+                msi_reg_path: msi_path,
             });
         }
     }

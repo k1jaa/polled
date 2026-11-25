@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+
+PackageIdentifier: k1jaa.Polled
+PackageVersion: 0.12.0
+PackageLocale: en-US
+Publisher: k1jaa
+PublisherUrl: https://github.com/k1jaa/polled
+PublisherSupportUrl: https://github.com/k1jaa/polled/issues
+Author: k1jaa
+PackageName: Polled
+PackageUrl: https://github.com/k1jaa/polled
+License: AGPL-3.0-or-later
+LicenseUrl: https://github.com/k1jaa/polled/blob/main/LICENSE
+Copyright: Copyright (C) 2026 k1jaa
+ShortDescription: Open-source Windows gaming input health check, 8K mouse/scroll/network bench, and per-game mouse, display, audio & Wooting profile switcher.
+Description: >-
+  Polled is an open-source, anti-cheat-safe Windows utility and CLI built in pure Rust.
+  It audits 41 Windows input, USB, audio, display, PCI MSI, and network settings with automatic
+  one-click revert snapshots, includes a sub-microsecond 8K Raw Input polling, switch bounce,
+  scroll encoder, DPI, WASAPI, dual-hop ping, and passive match watchdog benchmark suite, and
+  switches per-game mouse settings (Logitech, Razer, Lamzu, Pulsar, Endgame Gear, Keychron,
+  VAXEE, Finalmouse, Ninjutso, MCHOSE, Incott), Wooting keyboard profiles, temporary monitor
+  resolutions, Windows power plans, and audio endpoints without bloated vendor software.
+Moniker: polled
+Tags:
+  - gaming
+  - mouse
+  - polling-rate
+  - input-latency
+  - esports
+  - wooting
+  - hid
+  - rust
+ReleaseNotesUrl: https://github.com/k1jaa/polled/releases/tag/v0.12.0
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

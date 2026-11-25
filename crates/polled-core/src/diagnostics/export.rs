@@ -1746,6 +1746,7 @@ mod tests {
             tracking: analyzer.tracking_snapshot(Some(t_ns)),
             dpi_measurement: Default::default(),
             clicks: Default::default(),
+            scroll: Default::default(),
             keyboard: Default::default(),
             system_load: Default::default(),
             error: None,

@@ -134,6 +134,9 @@ pub struct GameProfile {
     /// Optional temporary display refresh rate override in Hz (e.g. `240`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_refresh_hz: Option<u32>,
+    /// Optional Wooting keyboard onboard profile slot (`0..=3`, displayed as Profile 1–4; zero flash wear).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wooting_profile: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +171,7 @@ impl GameProfile {
             display_width: None,
             display_height: None,
             display_refresh_hz: None,
+            wooting_profile: None,
             author: None,
             notes: Some("Fallback profile used whenever no game profile matches.".to_string()),
         }
@@ -255,6 +259,7 @@ impl GameProfile {
             self.display_height = None;
             self.display_refresh_hz = None;
         }
+        self.wooting_profile = self.wooting_profile.map(|idx| idx.min(3));
         self
     }
 }
@@ -410,6 +415,7 @@ mod tests {
             display_width: Some(1280),
             display_height: Some(960),
             display_refresh_hz: Some(240),
+            wooting_profile: Some(1),
             author: Some("k1jaa".to_string()),
             notes: Some("Tournament config".to_string()),
         });
@@ -424,6 +430,7 @@ mod tests {
         );
         assert_eq!(loaded.profiles[1].mouse.dpi_stage, Some(2));
         assert_eq!(loaded.profiles[1].mouse.lock_dpi_stages, Some(true));
+        assert_eq!(loaded.profiles[1].wooting_profile, Some(1));
         assert_eq!(
             loaded.profiles[1].windows_power_plan,
             Some(PowerPlanPreset::HighPerformance)
@@ -470,6 +477,7 @@ mod tests {
             display_width: None,
             display_height: None,
             display_refresh_hz: None,
+            wooting_profile: None,
             author: Some("k1jaa".to_string()),
             notes: Some("Low LOD + 4K".to_string()),
         };

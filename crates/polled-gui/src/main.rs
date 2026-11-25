@@ -12,6 +12,7 @@ mod hotplug;
 mod icon;
 mod input_lab_ui;
 mod notifications;
+mod osd;
 mod profile_runtime;
 mod profiles_ui;
 mod single_instance;

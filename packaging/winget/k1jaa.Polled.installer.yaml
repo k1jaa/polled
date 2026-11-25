@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
+# Before submitting a PR to microsoft/winget-pkgs, replace InstallerSha256 with the
+# exact SHA-256 hash printed by scripts/release-checklist.ps1 for the uploaded GitHub release ZIP.
+
+PackageIdentifier: k1jaa.Polled
+PackageVersion: 0.12.0
+Platform:
+  - Windows.Desktop
+MinimumOSVersion: 10.0.19041.0
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: polled-gui.exe
+    PortableCommandAlias: polled-gui
+  - RelativeFilePath: polled.exe
+    PortableCommandAlias: polled
+UpgradeBehavior: install
+ReleaseDate: 2026-11-25
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/k1jaa/polled/releases/download/v0.12.0/polled-v0.12.0-windows-x86_64.zip
+    InstallerSha256: REPLACE_WITH_SHA256_FROM_RELEASE_ZIP
+ManifestType: installer
+ManifestVersion: 1.9.0
