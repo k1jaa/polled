@@ -14,6 +14,8 @@ use std::time::Instant;
 #[derive(Debug, Clone)]
 pub struct FocusEvent {
     pub exe_name: Option<String>,
+    /// Full Win32 path of the foreground `.exe` when resolvable (used for optional per-game GPU preference).
+    pub exe_path: Option<String>,
     pub observed_at: Instant,
 }
 
@@ -65,8 +67,10 @@ mod platform {
                     // Emit the currently active foreground window immediately on startup.
                     // SAFETY: `GetForegroundWindow` returns a window handle or null.
                     let initial_hwnd = unsafe { GetForegroundWindow() };
+                    let (exe_name, exe_path) = exe_info_from_hwnd(initial_hwnd);
                     let _ = sender.send(FocusEvent {
-                        exe_name: exe_name_from_hwnd(initial_hwnd),
+                        exe_name,
+                        exe_path,
                         observed_at: Instant::now(),
                     });
 
@@ -166,26 +170,27 @@ mod platform {
         }
         // When the foreground window becomes null (e.g., minimizing everything to an empty
         // desktop), emit `exe_name: None` so the matcher falls back to the Desktop profile.
-        let exe_name = if hwnd.is_invalid() {
-            None
+        let (exe_name, exe_path) = if hwnd.is_invalid() {
+            (None, None)
         } else {
-            exe_name_from_hwnd(hwnd)
+            exe_info_from_hwnd(hwnd)
         };
         HOOK_SENDER.with(|slot| {
             if let Some(tx) = slot.borrow().as_ref() {
                 let _ = tx.send(FocusEvent {
                     exe_name,
+                    exe_path,
                     observed_at: Instant::now(),
                 });
             }
         });
     }
 
-    /// Resolves the lowercase `.exe` basename of `hwnd`'s owning process using only
+    /// Resolves `(lowercase_basename, full_win32_path)` of `hwnd`'s owning process using only
     /// `PROCESS_QUERY_LIMITED_INFORMATION` (no admin, no memory reads).
-    fn exe_name_from_hwnd(hwnd: HWND) -> Option<String> {
+    fn exe_info_from_hwnd(hwnd: HWND) -> (Option<String>, Option<String>) {
         if hwnd.is_invalid() {
-            return None;
+            return (None, None);
         }
 
         let mut pid = 0u32;
@@ -194,11 +199,14 @@ mod platform {
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
         }
         if pid == 0 {
-            return None;
+            return (None, None);
         }
 
         // SAFETY: Requests minimal read-only metadata permission only.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+        else {
+            return (None, None);
+        };
 
         let mut buf = vec![0u16; 1024];
         let mut len = buf.len() as u32;
@@ -219,15 +227,15 @@ mod platform {
         }
 
         if !ok || len == 0 {
-            return None;
+            return (None, None);
         }
 
         let full_path = String::from_utf16_lossy(&buf[..len as usize]);
         let normalized = normalize_exe_name(&full_path);
         if normalized.is_empty() {
-            None
+            (None, None)
         } else {
-            Some(normalized)
+            (Some(normalized), Some(full_path))
         }
     }
 }

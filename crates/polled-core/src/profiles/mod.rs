@@ -137,6 +137,14 @@ pub struct GameProfile {
     /// Optional Wooting keyboard onboard profile slot (`0..=7`, displayed as Profile 1–8; zero flash wear).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wooting_profile: Option<u8>,
+    /// Optional: ensures Windows Graphics Settings (`HKCU\...\UserGpuPreferences`) pins this
+    /// game's `.exe` to High Performance GPU (`GpuPreference=2;`) when focused (zero admin).
+    #[serde(default)]
+    pub force_high_perf_gpu: bool,
+    /// Optional: temporarily mutes Windows toast notifications (`ToastEnabled = 0`) while this
+    /// profile is active and restores your original setting automatically on desktop/exit.
+    #[serde(default)]
+    pub quiet_notifications: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +180,8 @@ impl GameProfile {
             display_height: None,
             display_refresh_hz: None,
             wooting_profile: None,
+            force_high_perf_gpu: false,
+            quiet_notifications: false,
             author: None,
             notes: Some("Fallback profile used whenever no game profile matches.".to_string()),
         }
@@ -418,6 +428,8 @@ mod tests {
             display_height: Some(960),
             display_refresh_hz: Some(240),
             wooting_profile: Some(1),
+            force_high_perf_gpu: true,
+            quiet_notifications: true,
             author: Some("k1jaa".to_string()),
             notes: Some("Tournament config".to_string()),
         });
@@ -480,6 +492,8 @@ mod tests {
             display_height: None,
             display_refresh_hz: None,
             wooting_profile: None,
+            force_high_perf_gpu: false,
+            quiet_notifications: false,
             author: Some("k1jaa".to_string()),
             notes: Some("Low LOD + 4K".to_string()),
         };

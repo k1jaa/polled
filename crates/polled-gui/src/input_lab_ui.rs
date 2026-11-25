@@ -18,16 +18,17 @@ use eframe::egui::{
 };
 use polled_core::win::{SystemEnv, UsbMouseTopology, WindowsEnv};
 use polled_core::{
-    build_diagnostic_advice, compute_sensitivity, format_advice_summary,
-    format_audio_benchmark_summary, format_diagnostic_report, format_intervals_csv,
-    format_network_benchmark_summary, format_watchdog_report, render_ab_comparison_png,
-    render_report_png, render_rig_scorecard_png, run_audio_latency_benchmark,
-    run_network_jitter_benchmark, run_timer_jitter_benchmark, AppPaths, AudioLatencyBenchmark,
-    CheckReport, DiagnosticAdvice, DiagnosticsSnapshot, MatchWatchdogSession,
+    build_diagnostic_advice, compute_reaction_summary, compute_sensitivity, current_qpc_ns,
+    format_advice_summary, format_audio_benchmark_summary, format_diagnostic_report,
+    format_intervals_csv, format_network_benchmark_summary, format_watchdog_report,
+    render_ab_comparison_png, render_report_png, render_rig_scorecard_png,
+    run_audio_latency_benchmark, run_network_jitter_benchmark, run_timer_jitter_benchmark,
+    AppPaths, AudioLatencyBenchmark, CheckReport, CoreDpcMetrics, DiagnosticAdvice,
+    DiagnosticsSnapshot, DpcMonitorSession, DpcMonitorSnapshot, MatchWatchdogSession,
     NetworkJitterBenchmark, PinnedBenchmark, PollingStats, PollingTarget, RawInputCaptureSession,
-    RigScorecardInput, SensitivityGame, Severity, TimerJitterBenchmark, TrackingStats,
-    WatchdogSnapshot, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS,
-    SCROLL_DOUBLE_NOTCH_MS, STANDARD_RATES_HZ,
+    ReactionTestSummary, RigScorecardInput, SensitivityGame, Severity, TimerJitterBenchmark,
+    TrackingStats, WatchdogSnapshot, BOUNCE_THRESHOLD_MS, HISTOGRAM_BASE_BINS,
+    KEY_CHATTER_THRESHOLD_MS, SCROLL_DOUBLE_NOTCH_MS, STANDARD_RATES_HZ,
 };
 
 use crate::theme::{Palette, ThemeMode};
@@ -124,6 +125,25 @@ impl CaptureMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ReactionPhase {
+    Idle,
+    WaitingForFlash {
+        armed_at: Instant,
+        flash_at: Instant,
+        prev_click_ns: u64,
+    },
+    Flashed {
+        flash_qpc_ns: u64,
+        prev_click_ns: u64,
+    },
+    ResultFlash {
+        last_ms: Option<f64>,
+        false_start: bool,
+    },
+    Finished,
+}
+
 pub struct InputLabUiState {
     active_tab: BenchSubTab,
     session: Option<RawInputCaptureSession>,
@@ -158,6 +178,13 @@ pub struct InputLabUiState {
     watchdog_session: Option<MatchWatchdogSession>,
     watchdog_target_ip: String,
     last_watchdog: WatchdogSnapshot,
+    dpc_session: Option<DpcMonitorSession>,
+    last_dpc: DpcMonitorSnapshot,
+    reaction_phase: ReactionPhase,
+    reaction_target_trials: usize,
+    reaction_trials: Vec<f64>,
+    reaction_false_starts: u32,
+    reaction_owns_capture: bool,
     pinned_baseline: Option<PinnedBenchmark>,
     baseline_label: String,
     current_label: String,
@@ -207,6 +234,13 @@ impl InputLabUiState {
             watchdog_session: None,
             watchdog_target_ip: "1.1.1.1".to_string(),
             last_watchdog: WatchdogSnapshot::default(),
+            dpc_session: None,
+            last_dpc: DpcMonitorSnapshot::default(),
+            reaction_phase: ReactionPhase::Idle,
+            reaction_target_trials: 10,
+            reaction_trials: Vec::new(),
+            reaction_false_starts: 0,
+            reaction_owns_capture: false,
             pinned_baseline: None,
             baseline_label: "Baseline (A)".to_string(),
             current_label: "Current (B)".to_string(),
@@ -273,12 +307,195 @@ impl InputLabUiState {
         self.countdown_ends_at = None;
         self.capture_ends_at = None;
         self.dpi_measuring = false;
+        self.reaction_owns_capture = false;
+        if matches!(
+            self.reaction_phase,
+            ReactionPhase::WaitingForFlash { .. } | ReactionPhase::Flashed { .. }
+        ) {
+            self.reaction_phase = ReactionPhase::Idle;
+        }
         if let Some(mut session) = self.session.take() {
             session.set_dpi_measuring(false);
             self.last_snapshot = session.snapshot();
             session.stop();
             self.last_snapshot.capturing = false;
             self.last_snapshot.dpi_measurement.active = false;
+        }
+    }
+
+    /// Stops Raw Input capture, active reaction tests, and live per-core DPC monitoring when hiding
+    /// to tray (leaves Passive Match Watchdog running intentionally for in-match monitoring).
+    pub fn stop_background_monitors(&mut self) {
+        self.stop_capture();
+        self.stop_dpc_monitor();
+    }
+
+    fn start_dpc_monitor(&mut self, ctx: &egui::Context) {
+        if self.dpc_session.is_some() {
+            return;
+        }
+        let ctx_bg = ctx.clone();
+        let session = DpcMonitorSession::start(move || {
+            ctx_bg.request_repaint();
+        });
+        self.last_dpc = session.snapshot();
+        self.dpc_session = Some(session);
+    }
+
+    fn stop_dpc_monitor(&mut self) {
+        if let Some(mut dpc) = self.dpc_session.take() {
+            self.last_dpc = dpc.snapshot();
+            dpc.stop();
+            self.last_dpc.running = false;
+        }
+    }
+
+    fn next_reaction_delay() -> Duration {
+        let seed = current_qpc_ns()
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let ms = 1_400 + ((seed >> 16) % 2_401);
+        Duration::from_millis(ms)
+    }
+
+    fn begin_reaction_round(&mut self, ctx: &egui::Context) {
+        self.countdown_ends_at = None;
+        self.capture_ends_at = None;
+        if self.session.is_none() {
+            self.start_live_session(ctx);
+            self.reaction_owns_capture = true;
+        }
+        let prev_click_ns = self
+            .session
+            .as_ref()
+            .map_or(0, |s| s.last_left_click_qpc_ns());
+        let now = Instant::now();
+        self.reaction_phase = ReactionPhase::WaitingForFlash {
+            armed_at: now,
+            flash_at: now + Self::next_reaction_delay(),
+            prev_click_ns,
+        };
+        ctx.request_repaint_after(Duration::from_millis(8));
+    }
+
+    fn start_new_reaction_test(&mut self, ctx: &egui::Context) {
+        self.reaction_trials.clear();
+        self.reaction_false_starts = 0;
+        self.begin_reaction_round(ctx);
+    }
+
+    fn cancel_reaction_test(&mut self) {
+        self.reaction_phase = ReactionPhase::Idle;
+        if self.reaction_owns_capture {
+            self.reaction_owns_capture = false;
+            self.stop_capture();
+        }
+    }
+
+    fn reset_reaction_test(&mut self) {
+        self.cancel_reaction_test();
+        self.reaction_trials.clear();
+        self.reaction_false_starts = 0;
+    }
+
+    fn advance_reaction_state(&mut self, ctx: &egui::Context, box_clicked_fallback: bool) {
+        let cur_click_ns = self
+            .session
+            .as_ref()
+            .map_or(0, |s| s.last_left_click_qpc_ns());
+        let now = Instant::now();
+
+        match self.reaction_phase {
+            ReactionPhase::WaitingForFlash {
+                armed_at,
+                flash_at,
+                prev_click_ns,
+            } => {
+                if cur_click_ns > prev_click_ns {
+                    if now.saturating_duration_since(armed_at) < Duration::from_millis(90) {
+                        // Ignore the tail edge of the button click that started/advanced the trial.
+                        self.reaction_phase = ReactionPhase::WaitingForFlash {
+                            armed_at,
+                            flash_at,
+                            prev_click_ns: cur_click_ns,
+                        };
+                    } else {
+                        self.reaction_false_starts += 1;
+                        self.reaction_phase = ReactionPhase::ResultFlash {
+                            last_ms: None,
+                            false_start: true,
+                        };
+                        return;
+                    }
+                }
+                if now >= flash_at {
+                    self.reaction_phase = ReactionPhase::Flashed {
+                        flash_qpc_ns: current_qpc_ns(),
+                        prev_click_ns: cur_click_ns,
+                    };
+                    ctx.request_repaint();
+                } else {
+                    let rem = flash_at.saturating_duration_since(now);
+                    let wake = if rem <= Duration::from_millis(45) {
+                        Duration::from_millis(2)
+                    } else {
+                        Duration::from_millis(8)
+                    };
+                    ctx.request_repaint_after(wake);
+                }
+            }
+            ReactionPhase::Flashed {
+                flash_qpc_ns,
+                prev_click_ns,
+            } => {
+                ctx.request_repaint();
+                let click_ns = if cur_click_ns > prev_click_ns {
+                    Some(cur_click_ns)
+                } else if box_clicked_fallback {
+                    Some(current_qpc_ns())
+                } else {
+                    None
+                };
+
+                if let Some(ts_ns) = click_ns {
+                    if ts_ns <= flash_qpc_ns {
+                        self.reaction_false_starts += 1;
+                        self.reaction_phase = ReactionPhase::ResultFlash {
+                            last_ms: None,
+                            false_start: true,
+                        };
+                    } else {
+                        let ms = (ts_ns - flash_qpc_ns) as f64 / 1_000_000.0;
+                        if ms < 60.0 {
+                            self.reaction_false_starts += 1;
+                            self.reaction_phase = ReactionPhase::ResultFlash {
+                                last_ms: None,
+                                false_start: true,
+                            };
+                        } else if ms <= 2_500.0 {
+                            self.reaction_trials.push(ms);
+                            if self.reaction_trials.len() >= self.reaction_target_trials {
+                                self.reaction_phase = ReactionPhase::Finished;
+                                if self.reaction_owns_capture {
+                                    self.reaction_owns_capture = false;
+                                    self.stop_capture();
+                                }
+                            } else {
+                                self.reaction_phase = ReactionPhase::ResultFlash {
+                                    last_ms: Some(ms),
+                                    false_start: false,
+                                };
+                            }
+                        } else {
+                            self.reaction_phase = ReactionPhase::ResultFlash {
+                                last_ms: Some(ms),
+                                false_start: false,
+                            };
+                        }
+                    }
+                }
+            }
+            ReactionPhase::Idle | ReactionPhase::ResultFlash { .. } | ReactionPhase::Finished => {}
         }
     }
 
@@ -398,6 +615,13 @@ impl InputLabUiState {
         }
         if let Some(wd) = &self.watchdog_session {
             self.last_watchdog = wd.snapshot();
+        }
+        if let Some(dpc) = &self.dpc_session {
+            self.last_dpc = dpc.snapshot();
+            if let Some(err) = self.last_dpc.error.clone() {
+                self.notice = Some((Severity::Bad, err));
+                self.stop_dpc_monitor();
+            }
         }
         if let Some(rx) = &self.timer_rx {
             if let Ok(result) = rx.try_recv() {
@@ -627,6 +851,8 @@ impl InputLabUiState {
                         }
                     }
                     BenchSubTab::AimSwitches => {
+                        self.render_reaction_test_card(ctx, ui, p, mode, scroll_w);
+                        ui.add_space(12.0);
                         self.render_sensitivity_converter_card(ctx, ui, p, scroll_w);
                         ui.add_space(12.0);
                         self.render_dpi_calibrator_card(ctx, ui, p, mode, scroll_w);
@@ -660,6 +886,8 @@ impl InputLabUiState {
                         self.render_scroll_encoder_card(ui, p, mode, scroll_w);
                     }
                     BenchSubTab::SystemUsb => {
+                        self.render_dpc_monitor_card(ctx, ui, p, mode, scroll_w);
+                        ui.add_space(12.0);
                         self.render_system_stall_card(ui, p, mode, scroll_w);
                         ui.add_space(12.0);
                         self.render_match_watchdog_card(ctx, ui, p, mode, scroll_w);
@@ -2804,6 +3032,520 @@ impl InputLabUiState {
         });
     }
 
+    fn render_dpc_monitor_card(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(160.0);
+        let running = self.dpc_session.is_some();
+        let snap = self.last_dpc.clone();
+        let mut toggle_dpc = false;
+
+        card_frame(ui, p, card_w, |ui| {
+            let status_badge = if running {
+                if snap.core_count > 0 {
+                    format!("LIVE · {} CORES · 500ms", snap.core_count)
+                } else {
+                    "SAMPLING...".to_string()
+                }
+            } else {
+                "IDLE · 0% CPU".to_string()
+            };
+            let status_col = if running { p.ok } else { p.text_muted };
+            let btn_lbl = if running {
+                "Stop Monitor"
+            } else {
+                "Start Monitor"
+            };
+
+            if inner_w < 540.0 {
+                ui.label(
+                    RichText::new("Per-Core Interrupt & DPC Monitor (Mini LatencyMon)")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(primary_btn(btn_lbl, p)).clicked() {
+                        toggle_dpc = true;
+                    }
+                    ui.label(
+                        RichText::new(&status_badge)
+                            .size(11.0)
+                            .strong()
+                            .monospace()
+                            .color(status_col),
+                    );
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Per-Core Interrupt & DPC Monitor (Mini LatencyMon)")
+                            .size(14.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(primary_btn(btn_lbl, p)).clicked() {
+                            toggle_dpc = true;
+                        }
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(&status_badge)
+                                .size(11.0)
+                                .strong()
+                                .monospace()
+                                .color(status_col),
+                        );
+                    });
+                });
+            }
+
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Pure user-mode ntdll.dll NtQuerySystemInformation (zero kernel drivers, zero admin, 0% CPU when stopped). Plots live per-logical-core Interrupt + DPC % (25% full-scale bar) and flags Core 0 IRQ starvation.",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(8.0);
+
+            if !snap.cores.is_empty() {
+                let hottest_lbl = snap
+                    .hottest_core
+                    .map(|c| format!("C{c:02} ({:.1}%)", snap.hottest_dpc_irq_pct))
+                    .unwrap_or_else(|| "—".to_string());
+                let status_txt = if snap.core0_starved {
+                    "CORE 0 STARVED"
+                } else if snap.severity == Severity::Bad {
+                    "HEAVY SPIKE"
+                } else if snap.severity == Severity::Warn {
+                    "ELEVATED"
+                } else {
+                    "BALANCED"
+                };
+                let pills = vec![
+                    ("CORES".to_string(), snap.core_count.to_string()),
+                    ("HOTTEST CORE".to_string(), hottest_lbl),
+                    (
+                        "CORE 0 DPC+IRQ".to_string(),
+                        format!("{:.1}%", snap.core0_dpc_irq_pct),
+                    ),
+                    (
+                        "OTHERS AVG".to_string(),
+                        format!("{:.1}%", snap.other_cores_avg_dpc_irq_pct),
+                    ),
+                    (
+                        "SESSION PEAK".to_string(),
+                        format!("{:.1}%", snap.peak_dpc_irq_pct),
+                    ),
+                    ("STATUS".to_string(), status_txt.to_string()),
+                ];
+                render_status_pill_rows(ui, p, inner_w, &pills);
+                ui.add_space(8.0);
+
+                let use_two_cols = inner_w >= 540.0 && snap.cores.len() > 1;
+                if use_two_cols {
+                    let gap = 12.0;
+                    let col_w = ((inner_w - gap) * 0.5).max(160.0);
+                    let mid = snap.cores.len().div_ceil(2);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(col_w, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                for core in &snap.cores[..mid] {
+                                    paint_dpc_core_row(
+                                        ui,
+                                        p,
+                                        col_w,
+                                        core,
+                                        snap.core0_starved,
+                                        snap.hottest_core == Some(core.core_index),
+                                    );
+                                }
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(col_w, 0.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                for core in &snap.cores[mid..] {
+                                    paint_dpc_core_row(
+                                        ui,
+                                        p,
+                                        col_w,
+                                        core,
+                                        snap.core0_starved,
+                                        snap.hottest_core == Some(core.core_index),
+                                    );
+                                }
+                            },
+                        );
+                    });
+                } else {
+                    for core in &snap.cores {
+                        paint_dpc_core_row(
+                            ui,
+                            p,
+                            inner_w,
+                            core,
+                            snap.core0_starved,
+                            snap.hottest_core == Some(core.core_index),
+                        );
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Bar scale: subtle gray = total CPU % (0-100%) · foreground = DPC+IRQ % (0-25% full width) · tick = session peak · hover any core for breakdown",
+                    )
+                    .size(10.5)
+                    .color(p.text_muted),
+                );
+                ui.add_space(8.0);
+                semantic_banner(ui, p, mode, inner_w, snap.severity, &snap.diagnosis);
+            } else {
+                paint_empty_chart_box(
+                    ui,
+                    p,
+                    inner_w,
+                    108.0,
+                    if running {
+                        "Sampling initial Windows per-core Interrupt & DPC counters..."
+                    } else {
+                        "Click Start Monitor to inspect real-time per-core Interrupt & DPC load across all logical CPUs."
+                    },
+                );
+            }
+        });
+
+        if toggle_dpc {
+            if running {
+                self.stop_dpc_monitor();
+            } else {
+                self.start_dpc_monitor(ctx);
+            }
+        }
+    }
+
+    fn render_reaction_test_card(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        p: Palette,
+        mode: ThemeMode,
+        card_w: f32,
+    ) {
+        let inner_w = (card_w - 24.0).max(160.0);
+        let active_round = matches!(
+            self.reaction_phase,
+            ReactionPhase::WaitingForFlash { .. } | ReactionPhase::Flashed { .. }
+        );
+        let summary: ReactionTestSummary =
+            compute_reaction_summary(&self.reaction_trials, self.reaction_false_starts);
+
+        let mut do_start = false;
+        let mut do_cancel = false;
+        let mut do_reset = false;
+        let mut box_clicked = false;
+        let mut next_trials = self.reaction_target_trials;
+
+        card_frame(ui, p, card_w, |ui| {
+            let controls = |ui: &mut egui::Ui,
+                            do_start: &mut bool,
+                            do_cancel: &mut bool,
+                            do_reset: &mut bool,
+                            next_trials: &mut usize| {
+                if ui
+                    .add_enabled(
+                        !self.reaction_trials.is_empty()
+                            || self.reaction_false_starts > 0
+                            || !matches!(self.reaction_phase, ReactionPhase::Idle),
+                        secondary_btn("Reset", p),
+                    )
+                    .clicked()
+                {
+                    *do_reset = true;
+                }
+                ui.add_enabled_ui(!active_round, |ui| {
+                    for count in [10usize, 5usize] {
+                        let lbl = format!("{count} trials");
+                        let btn = if *next_trials == count {
+                            primary_btn(&lbl, p)
+                        } else {
+                            secondary_btn(&lbl, p)
+                        };
+                        if ui.add(btn).clicked() {
+                            *next_trials = count;
+                        }
+                    }
+                });
+                if active_round {
+                    if ui.add(secondary_btn("Cancel", p)).clicked() {
+                        *do_cancel = true;
+                    }
+                } else if ui
+                    .add(primary_btn(
+                        if matches!(self.reaction_phase, ReactionPhase::Finished) {
+                            "Run Again"
+                        } else {
+                            "Start Reaction Test"
+                        },
+                        p,
+                    ))
+                    .clicked()
+                {
+                    *do_start = true;
+                }
+            };
+
+            if inner_w < 580.0 {
+                ui.label(
+                    RichText::new("Raw-Input Click Reaction & Switch Consistency Test")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    controls(
+                        ui,
+                        &mut do_start,
+                        &mut do_cancel,
+                        &mut do_reset,
+                        &mut next_trials,
+                    );
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Raw-Input Click Reaction & Switch Consistency Test")
+                            .size(14.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        controls(
+                            ui,
+                            &mut do_start,
+                            &mut do_cancel,
+                            &mut do_reset,
+                            &mut next_trials,
+                        );
+                    });
+                });
+            }
+
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Times mouse left-button down directly on the decoupled WM_INPUT QueryPerformanceCounter thread (bypassing GUI message-loop jitter) to measure your reaction median, P95, and switch consistency.",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(8.0);
+
+            // Interactive monochrome flash stage
+            let stage_h = 114.0;
+            let (rect, resp) =
+                ui.allocate_exact_size(Vec2::new(inner_w, stage_h), egui::Sense::click());
+            if resp.clicked() {
+                box_clicked = true;
+            }
+            if ui.is_rect_visible(rect) {
+                let painter = ui.painter_at(rect);
+                let (bg, border, title_col, sub_col, headline, subline) = match self.reaction_phase
+                {
+                    ReactionPhase::Idle => (
+                        p.bg,
+                        p.border,
+                        p.text,
+                        p.text_muted,
+                        "CLICK HERE OR START TEST".to_string(),
+                        format!(
+                            "{} trials · wait for the solid high-contrast flash, then press Left Click immediately",
+                            self.reaction_target_trials
+                        ),
+                    ),
+                    ReactionPhase::WaitingForFlash { .. } => (
+                        p.surface_alt,
+                        p.warn,
+                        p.text,
+                        p.text_muted,
+                        "WAIT FOR FLASH...".to_string(),
+                        format!(
+                            "Trial {} of {} · Raw Input QPC clock armed (do not click early)",
+                            self.reaction_trials.len() + 1,
+                            self.reaction_target_trials
+                        ),
+                    ),
+                    ReactionPhase::Flashed { .. } => (
+                        p.btn_primary_bg,
+                        p.btn_primary_bg,
+                        p.btn_primary_fg,
+                        p.btn_primary_fg,
+                        "CLICK NOW!".to_string(),
+                        "Press Left Mouse Button immediately".to_string(),
+                    ),
+                    ReactionPhase::ResultFlash {
+                        last_ms,
+                        false_start,
+                    } => {
+                        if false_start {
+                            (
+                                p.severity_bg(Severity::Bad, mode),
+                                p.bad,
+                                p.bad,
+                                p.text,
+                                "TOO EARLY — FALSE START".to_string(),
+                                format!(
+                                    "Click anywhere inside this box to retry Trial {} of {}",
+                                    self.reaction_trials.len() + 1,
+                                    self.reaction_target_trials
+                                ),
+                            )
+                        } else if let Some(ms) = last_ms {
+                            let valid = (60.0..=2_500.0).contains(&ms);
+                            (
+                                p.bg,
+                                if valid { p.ok } else { p.warn },
+                                p.text,
+                                p.text_muted,
+                                if valid {
+                                    format!("{ms:.1} ms")
+                                } else {
+                                    format!("{ms:.0} ms (timed out)")
+                                },
+                                format!(
+                                    "Click this box for Trial {} of {}",
+                                    self.reaction_trials.len() + 1,
+                                    self.reaction_target_trials
+                                ),
+                            )
+                        } else {
+                            (
+                                p.bg,
+                                p.border,
+                                p.text,
+                                p.text_muted,
+                                "READY".to_string(),
+                                "Click this box for the next trial".to_string(),
+                            )
+                        }
+                    }
+                    ReactionPhase::Finished => (
+                        p.severity_bg(summary.severity, mode),
+                        p.severity_fg(summary.severity),
+                        p.text,
+                        p.text_muted,
+                        format!(
+                            "MEDIAN {:.1} ms · BEST {:.1} ms",
+                            summary.median_ms, summary.best_ms
+                        ),
+                        format!(
+                            "{} · P95 {:.1} ms · SD {:.1} ms · Click box to run again",
+                            summary.rating, summary.p95_ms, summary.stddev_ms
+                        ),
+                    ),
+                };
+
+                painter.rect(
+                    rect,
+                    CornerRadius::same(8),
+                    bg,
+                    Stroke::new(1.5_f32, border),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    Pos2::new(rect.center().x, rect.center().y - 12.0),
+                    Align2::CENTER_CENTER,
+                    headline,
+                    FontId::monospace(20.0),
+                    title_col,
+                );
+                painter.text(
+                    Pos2::new(rect.center().x, rect.center().y + 18.0),
+                    Align2::CENTER_CENTER,
+                    subline,
+                    FontId::proportional(11.5),
+                    sub_col,
+                );
+            }
+
+            if !self.reaction_trials.is_empty() || self.reaction_false_starts > 0 {
+                ui.add_space(8.0);
+                let mut pills = vec![(
+                    "TRIALS".to_string(),
+                    format!(
+                        "{}/{}",
+                        self.reaction_trials.len(),
+                        self.reaction_target_trials
+                    ),
+                )];
+                if summary.trial_count > 0 {
+                    pills.push(("MEDIAN".to_string(), format!("{:.1} ms", summary.median_ms)));
+                    pills.push(("BEST".to_string(), format!("{:.1} ms", summary.best_ms)));
+                    pills.push(("MEAN".to_string(), format!("{:.1} ms", summary.mean_ms)));
+                    pills.push(("P95".to_string(), format!("{:.1} ms", summary.p95_ms)));
+                    pills.push((
+                        "JITTER (SD)".to_string(),
+                        format!("{:.1} ms", summary.stddev_ms),
+                    ));
+                    pills.push(("RATING".to_string(), summary.rating.clone()));
+                }
+                pills.push((
+                    "FALSE STARTS".to_string(),
+                    self.reaction_false_starts.to_string(),
+                ));
+                render_status_pill_rows(ui, p, inner_w, &pills);
+            }
+
+            if !self.reaction_trials.is_empty() {
+                ui.add_space(8.0);
+                paint_reaction_trials_chart(ui, p, inner_w, 66.0, &self.reaction_trials, &summary);
+            }
+        });
+
+        self.reaction_target_trials = next_trials;
+        if do_reset {
+            self.reset_reaction_test();
+        } else if do_cancel {
+            self.cancel_reaction_test();
+        } else if do_start {
+            self.start_new_reaction_test(ctx);
+        } else if box_clicked {
+            match self.reaction_phase {
+                ReactionPhase::Idle | ReactionPhase::Finished => {
+                    self.start_new_reaction_test(ctx);
+                }
+                ReactionPhase::ResultFlash { .. } => {
+                    self.begin_reaction_round(ctx);
+                }
+                ReactionPhase::WaitingForFlash { .. } | ReactionPhase::Flashed { .. } => {
+                    self.advance_reaction_state(ctx, true);
+                }
+            }
+        } else if active_round {
+            self.advance_reaction_state(ctx, false);
+        }
+    }
+
     fn render_timer_benchmark_card(
         &mut self,
         ctx: &egui::Context,
@@ -4204,6 +4946,208 @@ fn paint_network_sparkline(
         FontId::monospace(9.5),
         p.text_muted,
     );
+}
+
+fn paint_dpc_core_row(
+    ui: &mut egui::Ui,
+    p: Palette,
+    width: f32,
+    core: &CoreDpcMetrics,
+    core0_starved: bool,
+    is_hottest: bool,
+) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 21.0), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        let is_core0_warn = core.core_index == 0 && core0_starved;
+        let bar_col = if core.dpc_irq_pct >= 15.0 || (is_core0_warn && core.dpc_irq_pct >= 12.0) {
+            p.bad
+        } else if core.dpc_irq_pct >= 5.0 || is_core0_warn {
+            p.warn
+        } else {
+            p.text
+        };
+
+        let lbl_col = if is_core0_warn || (is_hottest && core.dpc_irq_pct >= 5.0) {
+            bar_col
+        } else {
+            p.text_muted
+        };
+        painter.text(
+            Pos2::new(rect.left(), rect.center().y),
+            Align2::LEFT_CENTER,
+            format!("C{:02}", core.core_index),
+            FontId::monospace(10.5),
+            lbl_col,
+        );
+
+        let track_left = rect.left() + 30.0;
+        let track_right = (rect.right() - 104.0).max(track_left + 24.0);
+        let track = Rect::from_min_max(
+            Pos2::new(track_left, rect.center().y - 5.0),
+            Pos2::new(track_right, rect.center().y + 5.0),
+        );
+        painter.rect(
+            track,
+            CornerRadius::same(3),
+            p.bg,
+            Stroke::new(1.0_f32, p.border),
+            egui::StrokeKind::Inside,
+        );
+
+        let cpu_frac = (core.cpu_pct / 100.0).clamp(0.0, 1.0) as f32;
+        if cpu_frac > 0.005 {
+            let cpu_rect = Rect::from_min_size(
+                track.min,
+                Vec2::new((track.width() * cpu_frac).max(1.5), track.height()),
+            );
+            let cpu_fill = Color32::from_rgba_unmultiplied(
+                p.text_muted.r(),
+                p.text_muted.g(),
+                p.text_muted.b(),
+                60,
+            );
+            painter.rect_filled(cpu_rect, CornerRadius::same(2), cpu_fill);
+        }
+
+        // Full bar width = 25% DPC+IRQ so low-level 1%-5% spikes stay immediately visible.
+        let dpc_frac = (core.dpc_irq_pct / 25.0).clamp(0.0, 1.0) as f32;
+        if dpc_frac > 0.004 {
+            let dpc_rect = Rect::from_min_size(
+                track.min,
+                Vec2::new((track.width() * dpc_frac).max(2.0), track.height()),
+            );
+            painter.rect_filled(dpc_rect, CornerRadius::same(2), bar_col);
+        }
+
+        if core.peak_dpc_irq_pct > 0.2 {
+            let peak_x = track.left()
+                + track.width() * ((core.peak_dpc_irq_pct / 25.0).clamp(0.0, 1.0) as f32);
+            painter.line_segment(
+                [
+                    Pos2::new(peak_x, track.top() - 1.0),
+                    Pos2::new(peak_x, track.bottom() + 1.0),
+                ],
+                Stroke::new(1.5_f32, p.text_muted),
+            );
+        }
+
+        let irq_str = if core.interrupts_per_sec >= 1_000.0 {
+            format!("{:.1}k/s", core.interrupts_per_sec / 1_000.0)
+        } else {
+            format!("{:.0}/s", core.interrupts_per_sec)
+        };
+        painter.text(
+            Pos2::new(rect.right(), rect.center().y),
+            Align2::RIGHT_CENTER,
+            format!("{:4.1}% · {:>6}", core.dpc_irq_pct, irq_str),
+            FontId::monospace(10.0),
+            if core.dpc_irq_pct >= 5.0 || is_core0_warn {
+                bar_col
+            } else {
+                p.text
+            },
+        );
+    }
+
+    let dpc_rate_note = core
+        .dpcs_per_sec
+        .map(|r| format!("\nDPCs/sec: {r:.0}/s"))
+        .unwrap_or_default();
+    resp.on_hover_text(format!(
+        "Logical Core {}\nCPU Total: {:.1}% (Kernel {:.1}%)\nDPC: {:.2}% · Hardware IRQ: {:.2}%\nCombined DPC+IRQ: {:.2}% (Peak {:.2}%)\nInterrupts/sec: {:.0}/s{dpc_rate_note}",
+        core.core_index,
+        core.cpu_pct,
+        core.kernel_pct,
+        core.dpc_pct,
+        core.interrupt_pct,
+        core.dpc_irq_pct,
+        core.peak_dpc_irq_pct,
+        core.interrupts_per_sec,
+    ));
+}
+
+fn paint_reaction_trials_chart(
+    ui: &mut egui::Ui,
+    p: Palette,
+    width: f32,
+    height: f32,
+    trials: &[f64],
+    summary: &ReactionTestSummary,
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) || trials.is_empty() {
+        return;
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect(
+        rect,
+        CornerRadius::same(6),
+        p.bg,
+        Stroke::new(1.0_f32, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    let plot = Rect::from_min_max(
+        Pos2::new(rect.left() + 10.0, rect.top() + 16.0),
+        Pos2::new(rect.right() - 10.0, rect.bottom() - 14.0),
+    );
+    if plot.width() <= 10.0 || plot.height() <= 10.0 {
+        return;
+    }
+
+    let max_ms = trials
+        .iter()
+        .copied()
+        .fold(250.0_f64, f64::max)
+        .clamp(200.0, 2_500.0)
+        * 1.12;
+    let n = trials.len();
+    let slot_w = plot.width() / (n.max(1) as f32);
+    let bar_w = (slot_w * 0.62).clamp(8.0, 36.0);
+
+    if summary.median_ms > 0.0 {
+        let med_y =
+            plot.bottom() - ((summary.median_ms / max_ms).clamp(0.0, 1.0) as f32) * plot.height();
+        painter.line_segment(
+            [
+                Pos2::new(plot.left(), med_y),
+                Pos2::new(plot.right(), med_y),
+            ],
+            Stroke::new(1.0_f32, p.border),
+        );
+    }
+
+    for (idx, &ms) in trials.iter().enumerate() {
+        let cx = plot.left() + (idx as f32 + 0.5) * slot_w;
+        let h = ((ms / max_ms).clamp(0.0, 1.0) as f32) * plot.height();
+        let bar = Rect::from_min_max(
+            Pos2::new(cx - bar_w * 0.5, plot.bottom() - h.max(2.0)),
+            Pos2::new(cx + bar_w * 0.5, plot.bottom()),
+        );
+        let col = if (ms - summary.best_ms).abs() < 0.05 {
+            p.ok
+        } else if summary.median_ms > 0.0 && ms > summary.median_ms + 35.0 {
+            p.warn
+        } else {
+            p.text
+        };
+        painter.rect_filled(bar, CornerRadius::same(2), col);
+        painter.text(
+            Pos2::new(cx, (bar.top() - 2.0).max(rect.top() + 11.0)),
+            Align2::CENTER_BOTTOM,
+            format!("{ms:.0}"),
+            FontId::monospace(9.5),
+            p.text_muted,
+        );
+        painter.text(
+            Pos2::new(cx, rect.bottom() - 2.0),
+            Align2::CENTER_BOTTOM,
+            format!("#{}", idx + 1),
+            FontId::monospace(9.0),
+            p.text_muted,
+        );
+    }
 }
 
 fn paint_empty_chart_box(ui: &mut egui::Ui, p: Palette, width: f32, height: f32, msg: &str) {

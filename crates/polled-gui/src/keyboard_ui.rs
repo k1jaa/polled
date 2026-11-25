@@ -10,7 +10,7 @@
 //! - Opt-in live analog key-travel visualizer (`0xFF53` / `0xFF54` stream, 0% CPU when stopped)
 //! - Confirm-gated ARM Base Analog & Global Settings tuning with mandatory read-back verification
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
@@ -43,11 +43,126 @@ struct SmoothedAnalogKey {
     last_active: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct StrafeSample {
+    direction: &'static str,
+    /// Negative = overlap (ms both A & D actuated), Positive = gap/dead-time (ms), 0 = instant transition.
+    signed_ms: f64,
+}
+
+#[derive(Debug, Default)]
+struct CounterStrafeTracker {
+    prev_a: bool,
+    prev_d: bool,
+    overlap_start: Option<(Instant, &'static str)>,
+    last_release: Option<(Instant, char)>,
+    samples: VecDeque<StrafeSample>,
+}
+
+impl CounterStrafeTracker {
+    fn reset(&mut self) {
+        self.prev_a = false;
+        self.prev_d = false;
+        self.overlap_start = None;
+        self.last_release = None;
+        self.samples.clear();
+    }
+
+    fn record(&mut self, a_act: bool, d_act: bool, now: Instant) {
+        let a_rise = a_act && !self.prev_a;
+        let a_fall = !a_act && self.prev_a;
+        let d_rise = d_act && !self.prev_d;
+        let d_fall = !d_act && self.prev_d;
+
+        // Instant swap on the exact same packet (e.g. SOCD Last Input Priority or frame-perfect release)
+        if a_fall && d_rise {
+            self.push(StrafeSample {
+                direction: "A->D",
+                signed_ms: 0.0,
+            });
+            self.overlap_start = None;
+            self.last_release = None;
+        } else if d_fall && a_rise {
+            self.push(StrafeSample {
+                direction: "D->A",
+                signed_ms: 0.0,
+            });
+            self.overlap_start = None;
+            self.last_release = None;
+        } else {
+            // Overlap start: opposite key pressed while current key still actuated
+            if d_rise && a_act {
+                self.overlap_start = Some((now, "A->D"));
+                self.last_release = None;
+            } else if a_rise && d_act {
+                self.overlap_start = Some((now, "D->A"));
+                self.last_release = None;
+            }
+
+            // Overlap finish: first key finally released while opposite stays held
+            if (a_fall && d_act) || (d_fall && a_act) {
+                if let Some((t0, dir)) = self.overlap_start.take() {
+                    let ms = now.saturating_duration_since(t0).as_secs_f64() * 1000.0;
+                    if ms <= 500.0 {
+                        self.push(StrafeSample {
+                            direction: dir,
+                            signed_ms: -ms,
+                        });
+                    }
+                }
+            }
+
+            // Clean gap transition: first key released while opposite is up
+            if a_fall && !d_act {
+                self.overlap_start = None;
+                self.last_release = Some((now, 'A'));
+            } else if d_fall && !a_act {
+                self.overlap_start = None;
+                self.last_release = Some((now, 'D'));
+            }
+
+            // Opposite key pressed after clean release -> measure gap ms
+            if d_rise && !a_act {
+                if let Some((t0, 'A')) = self.last_release.take() {
+                    let ms = now.saturating_duration_since(t0).as_secs_f64() * 1000.0;
+                    if ms <= 500.0 {
+                        self.push(StrafeSample {
+                            direction: "A->D",
+                            signed_ms: ms,
+                        });
+                    }
+                }
+            } else if a_rise && !d_act {
+                if let Some((t0, 'D')) = self.last_release.take() {
+                    let ms = now.saturating_duration_since(t0).as_secs_f64() * 1000.0;
+                    if ms <= 500.0 {
+                        self.push(StrafeSample {
+                            direction: "D->A",
+                            signed_ms: ms,
+                        });
+                    }
+                }
+            }
+        }
+
+        self.prev_a = a_act;
+        self.prev_d = d_act;
+    }
+
+    fn push(&mut self, s: StrafeSample) {
+        self.samples.push_back(s);
+        while self.samples.len() > 20 {
+            self.samples.pop_front();
+        }
+    }
+}
+
 pub struct KeyboardUiState {
     selected_index: usize,
     analog_stream: Option<WootingAnalogStream>,
     smoothed_keys: BTreeMap<u16, SmoothedAnalogKey>,
     last_analog_frame: Instant,
+    strafe_tracker: CounterStrafeTracker,
     stream_error: Option<String>,
     // Draft values for ARM base analog tuning (synced when keyboard or active profile changes).
     synced_key: Option<(String, Option<u8>)>,
@@ -79,6 +194,7 @@ impl KeyboardUiState {
             analog_stream: None,
             smoothed_keys: BTreeMap::new(),
             last_analog_frame: Instant::now(),
+            strafe_tracker: CounterStrafeTracker::default(),
             stream_error: None,
             synced_key: None,
             draft_actuation_mm: 0.40,
@@ -104,10 +220,40 @@ impl KeyboardUiState {
             s.stop();
         }
         self.smoothed_keys.clear();
+        self.strafe_tracker.reset();
     }
 
-    fn update_smoothed_analog(&mut self, ctx: &egui::Context, live: &[WootingAnalogKeyReading]) {
+    fn update_smoothed_analog(
+        &mut self,
+        ctx: &egui::Context,
+        live: &[WootingAnalogKeyReading],
+        kb: Option<&WootingKeyboardInfo>,
+    ) {
         let now = Instant::now();
+        // Feed raw (unsmoothed) A & D hardware actuation state into Counter-Strafe Tracker
+        // so overlap & gap timings have crisp 1 ms accuracy.
+        let base_act = kb
+            .and_then(|k| k.analog_profile.as_ref())
+            .and_then(|a| a.actuation_mm)
+            .unwrap_or(self.draft_actuation_mm);
+        let a_act_thresh = kb
+            .and_then(|k| k.per_key_actuation.iter().find(|o| o.matrix_index == 0x61))
+            .map(|o| o.actuation_mm)
+            .unwrap_or(base_act);
+        let d_act_thresh = kb
+            .and_then(|k| k.per_key_actuation.iter().find(|o| o.matrix_index == 0x63))
+            .map(|o| o.actuation_mm)
+            .unwrap_or(base_act);
+
+        let a_is_act = live
+            .iter()
+            .find(|k| k.matrix_index == Some(0x61) || k.usage == 0x04)
+            .is_some_and(|k| k.actuated.unwrap_or(k.travel_mm >= a_act_thresh));
+        let d_is_act = live
+            .iter()
+            .find(|k| k.matrix_index == Some(0x63) || k.usage == 0x07)
+            .is_some_and(|k| k.actuated.unwrap_or(k.travel_mm >= d_act_thresh));
+        self.strafe_tracker.record(a_is_act, d_is_act, now);
         let dt = now
             .saturating_duration_since(self.last_analog_frame)
             .as_secs_f32()
@@ -224,25 +370,26 @@ impl KeyboardUiState {
         snap: Option<&ProfileRuntimeSnapshot>,
         runtime: &ProfileRuntimeHandle,
     ) {
-        if let Some(stream) = &self.analog_stream {
-            let (keys, err) = stream.snapshot();
-            if let Some(e) = err {
-                self.stream_error = Some(e);
-                self.stop_analog_stream();
-            } else {
-                self.update_smoothed_analog(ctx, &keys);
-            }
-        }
-
-        let content_w = ui.available_width().max(320.0);
-        ui.set_max_width(content_w);
-
         let boards: &[WootingKeyboardInfo] =
             snap.map(|s| s.wooting_keyboards.as_slice()).unwrap_or(&[]);
         if !boards.is_empty() && self.selected_index >= boards.len() {
             self.selected_index = 0;
         }
         let active_kb = boards.get(self.selected_index).cloned();
+
+        if let Some(stream) = &self.analog_stream {
+            let (keys, err) = stream.snapshot();
+            if let Some(e) = err {
+                self.stream_error = Some(e);
+                self.stop_analog_stream();
+            } else {
+                self.update_smoothed_analog(ctx, &keys, active_kb.as_ref());
+            }
+        }
+
+        let content_w = ui.available_width().max(320.0);
+        ui.set_max_width(content_w);
+
         if let Some(ref kb) = active_kb {
             self.sync_drafts_from(kb);
         }
@@ -354,7 +501,11 @@ impl KeyboardUiState {
                 self.render_profile_switcher_card(ui, p, scroll_w, &kb, runtime);
                 ui.add_space(12.0);
 
-                // --- LIVE ANALOG KEY-TRAVEL VISUALIZER ---
+                // --- INTERACTIVE 60% VISUAL KEYMAP & LIVE ANALOG HEATMAP ---
+                self.render_visual_keymap_card(ui, p, scroll_w, &kb);
+                ui.add_space(12.0);
+
+                // --- LIVE ANALOG KEY-TRAVEL VISUALIZER & A/D COUNTER-STRAFE TIMING ---
                 self.render_analog_stream_card(ctx, ui, p, mode, scroll_w, &kb);
                 ui.add_space(12.0);
 
@@ -877,6 +1028,817 @@ impl KeyboardUiState {
                         ui.add_space(4.0);
                     }
                 }
+
+                // --- LIVE A <-> D COUNTER-STRAFE TIMING ANALYZER ---
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("A <-> D COUNTER-STRAFE TIMING")
+                            .size(10.5)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.strafe_tracker.samples.is_empty()
+                            && ui.add(secondary_btn("Reset Strafes", p)).clicked()
+                        {
+                            self.strafe_tracker.reset();
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                if self.strafe_tracker.samples.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "Alternate A and D to measure exact overlap (-ms) vs gap (+ms) timing from hardware actuation flags.",
+                        )
+                        .size(11.5)
+                        .color(p.text_muted),
+                    );
+                } else {
+                    let count = self.strafe_tracker.samples.len();
+                    let last = self.strafe_tracker.samples.back().unwrap();
+                    let avg_abs: f64 = self
+                        .strafe_tracker
+                        .samples
+                        .iter()
+                        .map(|s| s.signed_ms.abs())
+                        .sum::<f64>()
+                        / (count as f64);
+                    let clean_cnt = self
+                        .strafe_tracker
+                        .samples
+                        .iter()
+                        .filter(|s| s.signed_ms.abs() <= 20.0)
+                        .count();
+                    let overlap_cnt = self
+                        .strafe_tracker
+                        .samples
+                        .iter()
+                        .filter(|s| s.signed_ms < -1.0)
+                        .count();
+
+                    let last_txt = if last.signed_ms.abs() < 0.5 {
+                        format!("{}: 0 ms (perfect)", last.direction)
+                    } else if last.signed_ms < 0.0 {
+                        format!("{}: {:.0} ms overlap", last.direction, -last.signed_ms)
+                    } else {
+                        format!("{}: +{:.0} ms gap", last.direction, last.signed_ms)
+                    };
+                    let last_col = if last.signed_ms.abs() <= 15.0 {
+                        p.ok
+                    } else if last.signed_ms.abs() <= 35.0 {
+                        p.warn
+                    } else {
+                        p.bad
+                    };
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(last_txt)
+                                .size(12.0)
+                                .strong()
+                                .monospace()
+                                .color(last_col),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "  ·  Avg |delta|: {avg_abs:.1} ms  ·  Clean (<=20ms): {clean_cnt}/{count}  ·  Overlaps: {overlap_cnt}"
+                            ))
+                            .size(11.5)
+                            .monospace()
+                            .color(p.text_muted),
+                        );
+                    });
+
+                    // Centered timeline bar plot (-60 ms overlap .. 0 ms .. +60 ms gap)
+                    ui.add_space(6.0);
+                    let plot_h = 46.0;
+                    let (rect, _) =
+                        ui.allocate_exact_size(Vec2::new(inner_w, plot_h), egui::Sense::hover());
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, CornerRadius::same(6), p.surface_alt);
+                    painter.rect_stroke(
+                        rect,
+                        CornerRadius::same(6),
+                        Stroke::new(1.0_f32, p.border_subtle),
+                        egui::StrokeKind::Inside,
+                    );
+                    let mid_y = rect.center().y;
+                    painter.hline(
+                        (rect.left() + 6.0)..=(rect.right() - 6.0),
+                        mid_y,
+                        Stroke::new(1.0_f32, p.border),
+                    );
+                    let slot_w = ((rect.width() - 12.0) / 20.0).max(8.0);
+                    for (i, s) in self.strafe_tracker.samples.iter().enumerate() {
+                        let x = rect.left() + 6.0 + (i as f32) * slot_w;
+                        let mag = ((s.signed_ms.abs() / 60.0).clamp(0.08, 1.0) as f32)
+                            * ((plot_h * 0.5) - 6.0);
+                        let col = if s.signed_ms.abs() <= 15.0 {
+                            p.ok
+                        } else if s.signed_ms.abs() <= 35.0 {
+                            p.warn
+                        } else {
+                            p.bad
+                        };
+                        let bar = if s.signed_ms < 0.0 {
+                            // Overlap extends downward from center line
+                            Rect::from_min_max(
+                                Pos2::new(x + 1.0, mid_y + 1.0),
+                                Pos2::new((x + slot_w - 3.0).max(x + 4.0), mid_y + 1.0 + mag),
+                            )
+                        } else {
+                            // Gap extends upward from center line
+                            Rect::from_min_max(
+                                Pos2::new(x + 1.0, mid_y - 1.0 - mag),
+                                Pos2::new((x + slot_w - 3.0).max(x + 4.0), mid_y - 1.0),
+                            )
+                        };
+                        painter.rect_filled(bar, CornerRadius::same(2), col);
+                    }
+                    painter.text(
+                        Pos2::new(rect.right() - 8.0, rect.top() + 8.0),
+                        Align2::RIGHT_CENTER,
+                        "+gap",
+                        FontId::monospace(9.5),
+                        p.text_muted,
+                    );
+                    painter.text(
+                        Pos2::new(rect.right() - 8.0, rect.bottom() - 8.0),
+                        Align2::RIGHT_CENTER,
+                        "-overlap",
+                        FontId::monospace(9.5),
+                        p.text_muted,
+                    );
+                }
+            }
+        });
+    }
+
+    fn render_visual_keymap_card(
+        &self,
+        ui: &mut egui::Ui,
+        p: Palette,
+        card_w: f32,
+        kb: &WootingKeyboardInfo,
+    ) {
+        struct KeySpec {
+            label: &'static str,
+            width_u: f32,
+            matrix: u16,
+            alt_matrix: Option<u16>,
+            hid_usage: u16,
+        }
+        const ROWS: &[&[KeySpec]] = &[
+            &[
+                KeySpec {
+                    label: "Esc",
+                    width_u: 1.0,
+                    matrix: 0x20,
+                    alt_matrix: None,
+                    hid_usage: 0x29,
+                },
+                KeySpec {
+                    label: "1",
+                    width_u: 1.0,
+                    matrix: 0x21,
+                    alt_matrix: None,
+                    hid_usage: 0x1E,
+                },
+                KeySpec {
+                    label: "2",
+                    width_u: 1.0,
+                    matrix: 0x22,
+                    alt_matrix: None,
+                    hid_usage: 0x1F,
+                },
+                KeySpec {
+                    label: "3",
+                    width_u: 1.0,
+                    matrix: 0x23,
+                    alt_matrix: None,
+                    hid_usage: 0x20,
+                },
+                KeySpec {
+                    label: "4",
+                    width_u: 1.0,
+                    matrix: 0x24,
+                    alt_matrix: None,
+                    hid_usage: 0x21,
+                },
+                KeySpec {
+                    label: "5",
+                    width_u: 1.0,
+                    matrix: 0x25,
+                    alt_matrix: None,
+                    hid_usage: 0x22,
+                },
+                KeySpec {
+                    label: "6",
+                    width_u: 1.0,
+                    matrix: 0x26,
+                    alt_matrix: None,
+                    hid_usage: 0x23,
+                },
+                KeySpec {
+                    label: "7",
+                    width_u: 1.0,
+                    matrix: 0x27,
+                    alt_matrix: None,
+                    hid_usage: 0x24,
+                },
+                KeySpec {
+                    label: "8",
+                    width_u: 1.0,
+                    matrix: 0x28,
+                    alt_matrix: None,
+                    hid_usage: 0x25,
+                },
+                KeySpec {
+                    label: "9",
+                    width_u: 1.0,
+                    matrix: 0x29,
+                    alt_matrix: None,
+                    hid_usage: 0x26,
+                },
+                KeySpec {
+                    label: "0",
+                    width_u: 1.0,
+                    matrix: 0x2A,
+                    alt_matrix: None,
+                    hid_usage: 0x27,
+                },
+                KeySpec {
+                    label: "-",
+                    width_u: 1.0,
+                    matrix: 0x2B,
+                    alt_matrix: None,
+                    hid_usage: 0x2D,
+                },
+                KeySpec {
+                    label: "=",
+                    width_u: 1.0,
+                    matrix: 0x2C,
+                    alt_matrix: None,
+                    hid_usage: 0x2E,
+                },
+                KeySpec {
+                    label: "Bksp",
+                    width_u: 2.0,
+                    matrix: 0x2D,
+                    alt_matrix: None,
+                    hid_usage: 0x2A,
+                },
+            ],
+            &[
+                KeySpec {
+                    label: "Tab",
+                    width_u: 1.5,
+                    matrix: 0x40,
+                    alt_matrix: None,
+                    hid_usage: 0x2B,
+                },
+                KeySpec {
+                    label: "Q",
+                    width_u: 1.0,
+                    matrix: 0x41,
+                    alt_matrix: None,
+                    hid_usage: 0x14,
+                },
+                KeySpec {
+                    label: "W",
+                    width_u: 1.0,
+                    matrix: 0x42,
+                    alt_matrix: None,
+                    hid_usage: 0x1A,
+                },
+                KeySpec {
+                    label: "E",
+                    width_u: 1.0,
+                    matrix: 0x43,
+                    alt_matrix: None,
+                    hid_usage: 0x08,
+                },
+                KeySpec {
+                    label: "R",
+                    width_u: 1.0,
+                    matrix: 0x44,
+                    alt_matrix: None,
+                    hid_usage: 0x15,
+                },
+                KeySpec {
+                    label: "T",
+                    width_u: 1.0,
+                    matrix: 0x45,
+                    alt_matrix: None,
+                    hid_usage: 0x17,
+                },
+                KeySpec {
+                    label: "Y",
+                    width_u: 1.0,
+                    matrix: 0x46,
+                    alt_matrix: None,
+                    hid_usage: 0x1C,
+                },
+                KeySpec {
+                    label: "U",
+                    width_u: 1.0,
+                    matrix: 0x47,
+                    alt_matrix: None,
+                    hid_usage: 0x18,
+                },
+                KeySpec {
+                    label: "I",
+                    width_u: 1.0,
+                    matrix: 0x48,
+                    alt_matrix: None,
+                    hid_usage: 0x0C,
+                },
+                KeySpec {
+                    label: "O",
+                    width_u: 1.0,
+                    matrix: 0x49,
+                    alt_matrix: None,
+                    hid_usage: 0x12,
+                },
+                KeySpec {
+                    label: "P",
+                    width_u: 1.0,
+                    matrix: 0x4A,
+                    alt_matrix: None,
+                    hid_usage: 0x13,
+                },
+                KeySpec {
+                    label: "[",
+                    width_u: 1.0,
+                    matrix: 0x4B,
+                    alt_matrix: None,
+                    hid_usage: 0x2F,
+                },
+                KeySpec {
+                    label: "]",
+                    width_u: 1.0,
+                    matrix: 0x4C,
+                    alt_matrix: None,
+                    hid_usage: 0x30,
+                },
+                KeySpec {
+                    label: "\\",
+                    width_u: 1.5,
+                    matrix: 0x4D,
+                    alt_matrix: None,
+                    hid_usage: 0x31,
+                },
+            ],
+            &[
+                KeySpec {
+                    label: "Caps",
+                    width_u: 1.75,
+                    matrix: 0x60,
+                    alt_matrix: None,
+                    hid_usage: 0x39,
+                },
+                KeySpec {
+                    label: "A",
+                    width_u: 1.0,
+                    matrix: 0x61,
+                    alt_matrix: None,
+                    hid_usage: 0x04,
+                },
+                KeySpec {
+                    label: "S",
+                    width_u: 1.0,
+                    matrix: 0x62,
+                    alt_matrix: None,
+                    hid_usage: 0x16,
+                },
+                KeySpec {
+                    label: "D",
+                    width_u: 1.0,
+                    matrix: 0x63,
+                    alt_matrix: None,
+                    hid_usage: 0x07,
+                },
+                KeySpec {
+                    label: "F",
+                    width_u: 1.0,
+                    matrix: 0x64,
+                    alt_matrix: None,
+                    hid_usage: 0x09,
+                },
+                KeySpec {
+                    label: "G",
+                    width_u: 1.0,
+                    matrix: 0x65,
+                    alt_matrix: None,
+                    hid_usage: 0x0A,
+                },
+                KeySpec {
+                    label: "H",
+                    width_u: 1.0,
+                    matrix: 0x66,
+                    alt_matrix: None,
+                    hid_usage: 0x0B,
+                },
+                KeySpec {
+                    label: "J",
+                    width_u: 1.0,
+                    matrix: 0x67,
+                    alt_matrix: None,
+                    hid_usage: 0x0D,
+                },
+                KeySpec {
+                    label: "K",
+                    width_u: 1.0,
+                    matrix: 0x68,
+                    alt_matrix: None,
+                    hid_usage: 0x0E,
+                },
+                KeySpec {
+                    label: "L",
+                    width_u: 1.0,
+                    matrix: 0x69,
+                    alt_matrix: None,
+                    hid_usage: 0x0F,
+                },
+                KeySpec {
+                    label: ";",
+                    width_u: 1.0,
+                    matrix: 0x6A,
+                    alt_matrix: None,
+                    hid_usage: 0x33,
+                },
+                KeySpec {
+                    label: "'",
+                    width_u: 1.0,
+                    matrix: 0x6B,
+                    alt_matrix: None,
+                    hid_usage: 0x34,
+                },
+                KeySpec {
+                    label: "Enter",
+                    width_u: 2.25,
+                    matrix: 0x6D,
+                    alt_matrix: None,
+                    hid_usage: 0x28,
+                },
+            ],
+            &[
+                KeySpec {
+                    label: "LShift",
+                    width_u: 2.25,
+                    matrix: 0x80,
+                    alt_matrix: None,
+                    hid_usage: 0xE1,
+                },
+                KeySpec {
+                    label: "Z",
+                    width_u: 1.0,
+                    matrix: 0x82,
+                    alt_matrix: None,
+                    hid_usage: 0x1D,
+                },
+                KeySpec {
+                    label: "X",
+                    width_u: 1.0,
+                    matrix: 0x83,
+                    alt_matrix: None,
+                    hid_usage: 0x1B,
+                },
+                KeySpec {
+                    label: "C",
+                    width_u: 1.0,
+                    matrix: 0x84,
+                    alt_matrix: None,
+                    hid_usage: 0x06,
+                },
+                KeySpec {
+                    label: "V",
+                    width_u: 1.0,
+                    matrix: 0x85,
+                    alt_matrix: None,
+                    hid_usage: 0x19,
+                },
+                KeySpec {
+                    label: "B",
+                    width_u: 1.0,
+                    matrix: 0x86,
+                    alt_matrix: None,
+                    hid_usage: 0x05,
+                },
+                KeySpec {
+                    label: "N",
+                    width_u: 1.0,
+                    matrix: 0x87,
+                    alt_matrix: None,
+                    hid_usage: 0x11,
+                },
+                KeySpec {
+                    label: "M",
+                    width_u: 1.0,
+                    matrix: 0x88,
+                    alt_matrix: None,
+                    hid_usage: 0x10,
+                },
+                KeySpec {
+                    label: ",",
+                    width_u: 1.0,
+                    matrix: 0x89,
+                    alt_matrix: None,
+                    hid_usage: 0x36,
+                },
+                KeySpec {
+                    label: ".",
+                    width_u: 1.0,
+                    matrix: 0x8A,
+                    alt_matrix: None,
+                    hid_usage: 0x37,
+                },
+                KeySpec {
+                    label: "/",
+                    width_u: 1.0,
+                    matrix: 0x8B,
+                    alt_matrix: None,
+                    hid_usage: 0x38,
+                },
+                KeySpec {
+                    label: "RShift",
+                    width_u: 2.75,
+                    matrix: 0x8D,
+                    alt_matrix: None,
+                    hid_usage: 0xE5,
+                },
+            ],
+            &[
+                KeySpec {
+                    label: "LCtrl",
+                    width_u: 1.25,
+                    matrix: 0xA0,
+                    alt_matrix: None,
+                    hid_usage: 0xE0,
+                },
+                KeySpec {
+                    label: "Win",
+                    width_u: 1.25,
+                    matrix: 0xA1,
+                    alt_matrix: None,
+                    hid_usage: 0xE3,
+                },
+                KeySpec {
+                    label: "LAlt",
+                    width_u: 1.25,
+                    matrix: 0xA2,
+                    alt_matrix: None,
+                    hid_usage: 0xE2,
+                },
+                KeySpec {
+                    label: "Space",
+                    width_u: 6.25,
+                    matrix: 0xA6,
+                    alt_matrix: None,
+                    hid_usage: 0x2C,
+                },
+                KeySpec {
+                    label: "RAlt",
+                    width_u: 1.25,
+                    matrix: 0xAA,
+                    alt_matrix: None,
+                    hid_usage: 0xE6,
+                },
+                KeySpec {
+                    label: "Menu",
+                    width_u: 1.25,
+                    matrix: 0xAC,
+                    alt_matrix: None,
+                    hid_usage: 0x65,
+                },
+                KeySpec {
+                    label: "RCtrl",
+                    width_u: 1.25,
+                    matrix: 0xAB,
+                    alt_matrix: Some(0xAD),
+                    hid_usage: 0xE4,
+                },
+                KeySpec {
+                    label: "Fn",
+                    width_u: 1.25,
+                    matrix: 0xAE,
+                    alt_matrix: None,
+                    hid_usage: 0x00,
+                },
+            ],
+        ];
+
+        let inner_w = (card_w - 24.0).max(200.0);
+        let base_act = kb
+            .analog_profile
+            .as_ref()
+            .and_then(|a| a.actuation_mm)
+            .unwrap_or(self.draft_actuation_mm);
+
+        card_frame(ui, p, card_w, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Interactive 60% Keymap & Live Analog Heatmap")
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Hover any key for per-key actuation & SOCD/AKC details · start Analog Test below for live depth fill",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
+                );
+            });
+            ui.add_space(8.0);
+
+            let gap = 4.0_f32;
+            let max_board_w = inner_w.min(760.0);
+            let unit_w = ((max_board_w - 13.0 * gap) / 15.0).max(16.0);
+            let key_h = (unit_w * 0.88).clamp(24.0, 42.0);
+            let board_w = 15.0 * unit_w + 13.0 * gap;
+            let board_h = 5.0 * key_h + 4.0 * gap;
+            let left_pad = ((inner_w - board_w) * 0.5).max(0.0);
+
+            let (alloc_rect, _) =
+                ui.allocate_exact_size(Vec2::new(inner_w, board_h), egui::Sense::hover());
+
+            let mut hovered_tooltip: Option<String> = None;
+            let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+
+            let painter = ui.painter_at(alloc_rect);
+            for (r_idx, row) in ROWS.iter().enumerate() {
+                let y = alloc_rect.top() + (r_idx as f32) * (key_h + gap);
+                let mut x = alloc_rect.left() + left_pad;
+                let row_gaps = (row.len().saturating_sub(1)) as f32;
+                let extra_space = (13.0 - row_gaps) * gap;
+                let row_units: f32 = row.iter().map(|k| k.width_u).sum();
+
+                for spec in *row {
+                    let kw = spec.width_u * unit_w + (spec.width_u / row_units) * extra_space;
+                    let key_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(kw, key_h));
+                    x += kw + gap;
+
+                    let ov_mm = kb
+                        .per_key_actuation
+                        .iter()
+                        .find(|o| {
+                            o.matrix_index == spec.matrix || spec.alt_matrix == Some(o.matrix_index)
+                        })
+                        .map(|o| o.actuation_mm);
+                    let akc_match = kb.advanced_keys.iter().find(|a| {
+                        a.primary_key.eq_ignore_ascii_case(spec.label)
+                            || (spec.label == "Esc" && a.primary_key.starts_with("Esc"))
+                            || (spec.label == "Win" && a.primary_key == "LWin")
+                            || (a.kind == "SOCD"
+                                && a.detail.split_whitespace().any(|tok| tok == spec.label))
+                    });
+
+                    // Match live analog sample (V2 matrix_index preferred, V1 HID usage fallback).
+                    let live = self.smoothed_keys.values().find(|s| {
+                        s.matrix_index == Some(spec.matrix)
+                            || (spec.alt_matrix.is_some() && s.matrix_index == spec.alt_matrix)
+                            || (s.matrix_index.is_none()
+                                && spec.hid_usage != 0
+                                && s.label.eq_ignore_ascii_case(spec.label))
+                    });
+
+                    let depth_frac = live.map_or(0.0, |s| (s.display_mm / 4.0).clamp(0.0, 1.0));
+                    let is_act = live.is_some_and(|s| {
+                        s.actuated
+                            .unwrap_or(s.display_mm >= ov_mm.unwrap_or(base_act) && s.is_pressed)
+                    });
+                    let is_hovered = pointer_pos.is_some_and(|pos| key_rect.contains(pos));
+
+                    painter.rect_filled(key_rect, CornerRadius::same(5), p.surface_alt);
+
+                    // Live bottom-to-top analog fill
+                    if depth_frac > 0.004 {
+                        let fill_h = key_rect.height() * depth_frac;
+                        let fill_rect = Rect::from_min_max(
+                            Pos2::new(key_rect.left() + 1.0, key_rect.bottom() - fill_h),
+                            Pos2::new(key_rect.right() - 1.0, key_rect.bottom() - 1.0),
+                        );
+                        let fill_col = if is_act {
+                            Color32::from_rgba_unmultiplied(p.ok.r(), p.ok.g(), p.ok.b(), 72)
+                        } else {
+                            Color32::from_rgba_unmultiplied(p.text.r(), p.text.g(), p.text.b(), 44)
+                        };
+                        painter.rect_filled(fill_rect, CornerRadius::same(4), fill_col);
+                    }
+
+                    let border_col = if is_act {
+                        p.ok
+                    } else if is_hovered {
+                        p.text
+                    } else if ov_mm.is_some() {
+                        p.text_muted
+                    } else {
+                        p.border
+                    };
+                    painter.rect_stroke(
+                        key_rect,
+                        CornerRadius::same(5),
+                        Stroke::new(
+                            if is_act || is_hovered {
+                                1.5_f32
+                            } else {
+                                1.0_f32
+                            },
+                            border_col,
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+
+                    // Top-right dot for SOCD / AKC bindings
+                    if let Some(akc) = akc_match {
+                        let dot_col = if akc.kind == "SOCD" || akc.kind == "Rappy Snappy" {
+                            p.info
+                        } else {
+                            p.text_muted
+                        };
+                        painter.circle_filled(
+                            Pos2::new(key_rect.right() - 5.0, key_rect.top() + 5.0),
+                            2.5,
+                            dot_col,
+                        );
+                    }
+
+                    // Key label + optional tiny override mm label
+                    let font_sz = if unit_w < 30.0 { 9.0 } else { 10.5 };
+                    let label_y = if ov_mm.is_some() && key_h >= 30.0 {
+                        key_rect.center().y - 5.0
+                    } else {
+                        key_rect.center().y
+                    };
+                    painter.text(
+                        Pos2::new(key_rect.center().x, label_y),
+                        Align2::CENTER_CENTER,
+                        spec.label,
+                        FontId::monospace(font_sz),
+                        if is_act || is_hovered {
+                            p.text
+                        } else {
+                            p.text_muted
+                        },
+                    );
+                    if let Some(mm) = ov_mm {
+                        if key_h >= 30.0 {
+                            painter.text(
+                                Pos2::new(key_rect.center().x, key_rect.bottom() - 6.5),
+                                Align2::CENTER_CENTER,
+                                format!("{mm:.2}"),
+                                FontId::monospace(8.5),
+                                p.text,
+                            );
+                        }
+                    }
+
+                    if is_hovered {
+                        let mut lines = vec![format!(
+                            "{}  ·  Actuation: {:.2} mm{}",
+                            spec.label,
+                            ov_mm.unwrap_or(base_act),
+                            if ov_mm.is_some() {
+                                " (per-key override)"
+                            } else {
+                                " (base)"
+                            }
+                        )];
+                        if let Some(akc) = akc_match {
+                            lines.push(format!("AKC: {} — {}", akc.kind, akc.detail));
+                        }
+                        if let Some(lv) = live {
+                            lines.push(format!(
+                                "Live travel: {:.2} mm (peak {:.2} mm){}",
+                                lv.display_mm,
+                                lv.peak_mm,
+                                if is_act { " · ACTUATED" } else { "" }
+                            ));
+                        }
+                        hovered_tooltip = Some(lines.join("\n"));
+                    }
+                }
+            }
+
+            if let Some(tip) = hovered_tooltip {
+                ui.add_space(6.0);
+                ui.label(RichText::new(tip).size(11.5).monospace().color(p.text));
+            } else {
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("Legend: Bright border/number = per-key actuation override  ·  Blue dot = SOCD/Rappy Snappy  ·  Gray dot = Mod Tap/DKS  ·  Green = live ACT")
+                            .size(10.5)
+                            .color(p.text_muted),
+                    );
+                });
             }
         });
     }

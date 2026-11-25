@@ -113,6 +113,8 @@ pub struct HotkeyConfig {
     pub toggle_input_lab: Option<HotkeyBinding>,
     #[serde(default = "default_hotkey_audio")]
     pub cycle_audio_output: Option<HotkeyBinding>,
+    #[serde(default = "default_hotkey_wooting")]
+    pub cycle_wooting_profile: Option<HotkeyBinding>,
 }
 
 fn default_hotkey_cycle() -> Option<HotkeyBinding> {
@@ -131,6 +133,10 @@ fn default_hotkey_audio() -> Option<HotkeyBinding> {
     Some(HotkeyBinding::new(true, true, false, "A"))
 }
 
+fn default_hotkey_wooting() -> Option<HotkeyBinding> {
+    Some(HotkeyBinding::new(true, true, false, "K"))
+}
+
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
@@ -139,6 +145,7 @@ impl Default for HotkeyConfig {
             toggle_lock: default_hotkey_lock(),
             toggle_input_lab: default_hotkey_lab(),
             cycle_audio_output: default_hotkey_audio(),
+            cycle_wooting_profile: default_hotkey_wooting(),
         }
     }
 }
@@ -310,6 +317,7 @@ mod tests {
                 toggle_lock: Some(HotkeyBinding::new(true, true, false, "L")),
                 toggle_input_lab: None,
                 cycle_audio_output: Some(HotkeyBinding::new(true, true, false, "A")),
+                cycle_wooting_profile: Some(HotkeyBinding::new(true, true, false, "K")),
             },
             alerts: TrayAlertConfig {
                 battery_tray_icon: true,

@@ -72,6 +72,8 @@ mod tests {
             display_height: None,
             display_refresh_hz: None,
             wooting_profile: None,
+            force_high_perf_gpu: false,
+            quiet_notifications: false,
             author: None,
             notes: None,
         });
@@ -99,6 +101,8 @@ mod tests {
             display_height: None,
             display_refresh_hz: None,
             wooting_profile: None,
+            force_high_perf_gpu: false,
+            quiet_notifications: false,
             author: None,
             notes: None,
         });

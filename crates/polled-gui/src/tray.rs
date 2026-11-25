@@ -27,8 +27,19 @@ const ID_PROFILE_PREFIX: &str = "profile::";
 const ID_MOUSE_POLL_PREFIX: &str = "mouse_poll::";
 const ID_MOUSE_DPI_PREFIX: &str = "mouse_dpi::";
 const ID_MOUSE_REFRESH: &str = "mouse_refresh";
+const ID_WOOTING_PREFIX: &str = "wooting::";
+const ID_WOOTING_REFRESH: &str = "wooting_refresh";
 const ID_AUDIO_PREFIX: &str = "audio::";
 const ID_QUIT: &str = "quit";
+
+/// Snapshot of the primary connected Wooting keyboard for the tray quick-switch submenu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayWootingState {
+    pub device_id: String,
+    pub name: String,
+    pub active_profile: Option<u8>,
+    pub profiles: Vec<(u8, String)>,
+}
 
 /// Snapshot of the primary connected mouse used to populate the tray Mouse Quick Controls
 /// submenu, live battery icon, and rich hover tooltip.
@@ -116,6 +127,10 @@ pub struct TrayController {
     mouse_menu_items: Vec<MenuItem>,
     mouse_menu_seps: Vec<PredefinedMenuItem>,
     last_mouse_key: Option<Option<TrayMouseState>>,
+    wooting_submenu: Submenu,
+    wooting_menu_items: Vec<MenuItem>,
+    wooting_menu_seps: Vec<PredefinedMenuItem>,
+    last_wooting_key: Option<Option<TrayWootingState>>,
     audio_submenu: Submenu,
     audio_menu_items: Vec<MenuItem>,
     last_audio_key: Vec<(String, String, bool)>,
@@ -147,6 +162,7 @@ impl TrayController {
         let sep_top = PredefinedMenuItem::separator();
         let profiles_submenu = Submenu::new("Switch Profile", true);
         let mouse_submenu = Submenu::new("Mouse Quick Controls", true);
+        let wooting_submenu = Submenu::new("Wooting Keyboard", true);
         let audio_submenu = Submenu::new("Audio Output", true);
         let lock_profile_item =
             CheckMenuItem::with_id(ID_LOCK_PROFILE, "Lock Current Profile", true, false, None);
@@ -166,6 +182,7 @@ impl TrayController {
         let _ = menu.append(&sep_top);
         let _ = menu.append(&profiles_submenu);
         let _ = menu.append(&mouse_submenu);
+        let _ = menu.append(&wooting_submenu);
         let _ = menu.append(&audio_submenu);
         let _ = menu.append(&lock_profile_item);
         let _ = menu.append(&auto_switch_item);
@@ -234,6 +251,17 @@ impl TrayController {
                             }
                             continue;
                         }
+                        if let Some(slot_str) = id_str.strip_prefix(ID_WOOTING_PREFIX) {
+                            if let Ok(slot) = slot_str.parse::<u8>() {
+                                let _ =
+                                    profile_cmd_tx.send(ProfileRuntimeCmd::SwitchWootingProfile {
+                                        device_id: None,
+                                        slot,
+                                    });
+                                ctx.request_repaint();
+                            }
+                            continue;
+                        }
                         if let Some(audio_id) = id_str.strip_prefix(ID_AUDIO_PREFIX) {
                             let _ = profile_cmd_tx
                                 .send(ProfileRuntimeCmd::SwitchAudioOutput(audio_id.to_string()));
@@ -245,6 +273,10 @@ impl TrayController {
                             ID_MOUSE_REFRESH => {
                                 let _ =
                                     profile_cmd_tx.send(ProfileRuntimeCmd::RefreshMouseAndBattery);
+                                ctx.request_repaint();
+                            }
+                            ID_WOOTING_REFRESH => {
+                                let _ = profile_cmd_tx.send(ProfileRuntimeCmd::RefreshWooting);
                                 ctx.request_repaint();
                             }
                             ID_SCAN => {
@@ -315,6 +347,10 @@ impl TrayController {
             mouse_menu_items: Vec::new(),
             mouse_menu_seps: Vec::new(),
             last_mouse_key: None,
+            wooting_submenu,
+            wooting_menu_items: Vec::new(),
+            wooting_menu_seps: Vec::new(),
+            last_wooting_key: None,
             audio_submenu,
             audio_menu_items: Vec::new(),
             last_audio_key: Vec::new(),
@@ -336,6 +372,7 @@ impl TrayController {
         available_profiles: &[(String, String)],
         audio_outputs: &[(String, String, bool)],
         primary_mouse: Option<&TrayMouseState>,
+        primary_wooting: Option<&TrayWootingState>,
         battery_summary: Option<&str>,
         show_battery_icon: bool,
         low_battery_threshold: u8,
@@ -489,6 +526,66 @@ impl TrayController {
             self.mouse_menu_items.push(refresh);
 
             self.last_mouse_key = Some(next_mouse_key);
+        }
+
+        // 3b. Wooting Keyboard quick-switch submenu (real onboard slot names, RAM-only).
+        let next_wooting_key = primary_wooting.cloned();
+        if self.last_wooting_key.as_ref() != Some(&next_wooting_key) {
+            for old in self.wooting_menu_items.drain(..) {
+                let _ = self.wooting_submenu.remove(&old);
+            }
+            for sep in self.wooting_menu_seps.drain(..) {
+                let _ = self.wooting_submenu.remove(&sep);
+            }
+
+            if let Some(kb) = primary_wooting {
+                let header = MenuItem::with_id("wooting_header", &kb.name, false, None);
+                let _ = self.wooting_submenu.append(&header);
+                self.wooting_menu_items.push(header);
+
+                if !kb.profiles.is_empty() {
+                    let sep = PredefinedMenuItem::separator();
+                    let _ = self.wooting_submenu.append(&sep);
+                    self.wooting_menu_seps.push(sep);
+
+                    for (slot, slot_name) in &kb.profiles {
+                        let active = kb.active_profile == Some(*slot);
+                        let label = if active {
+                            format!("● P{} · {slot_name}", slot + 1)
+                        } else {
+                            format!("   P{} · {slot_name}", slot + 1)
+                        };
+                        let item = MenuItem::with_id(
+                            format!("{ID_WOOTING_PREFIX}{slot}"),
+                            label,
+                            true,
+                            None,
+                        );
+                        let _ = self.wooting_submenu.append(&item);
+                        self.wooting_menu_items.push(item);
+                    }
+                }
+
+                let sep_end = PredefinedMenuItem::separator();
+                let _ = self.wooting_submenu.append(&sep_end);
+                self.wooting_menu_seps.push(sep_end);
+            } else {
+                let empty = MenuItem::with_id(
+                    "wooting_empty",
+                    "No Wooting keyboard connected",
+                    false,
+                    None,
+                );
+                let _ = self.wooting_submenu.append(&empty);
+                self.wooting_menu_items.push(empty);
+            }
+
+            let refresh =
+                MenuItem::with_id(ID_WOOTING_REFRESH, "Refresh Wooting Keyboard", true, None);
+            let _ = self.wooting_submenu.append(&refresh);
+            self.wooting_menu_items.push(refresh);
+
+            self.last_wooting_key = Some(next_wooting_key);
         }
 
         // 4. Audio output switcher submenu.

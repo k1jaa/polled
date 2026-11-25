@@ -17,7 +17,7 @@
 //!
 //! 100% anti-cheat safe: standard Win32 Raw Input API, zero hooks, zero DLL injection, no admin.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -63,6 +63,7 @@ pub struct RawInputCaptureSession {
     dpi_measuring: Arc<AtomicBool>,
     dpi_reset_requested: Arc<AtomicBool>,
     target_hz_atomic: Arc<AtomicU32>,
+    last_left_down_qpc_ns: Arc<AtomicU64>,
     msg_hwnd: Arc<AtomicIsize>,
     wake_signal: Arc<(Mutex<u64>, Condvar)>,
     capture_handle: Option<JoinHandle<()>>,
@@ -93,6 +94,7 @@ impl RawInputCaptureSession {
         let dpi_measuring = Arc::new(AtomicBool::new(false));
         let dpi_reset_requested = Arc::new(AtomicBool::new(false));
         let target_hz_atomic = Arc::new(AtomicU32::new(initial_target_raw));
+        let last_left_down_qpc_ns = Arc::new(AtomicU64::new(0));
         let msg_hwnd = Arc::new(AtomicIsize::new(0));
         let event_queue = Arc::new(Mutex::new(Vec::<RawEvent>::with_capacity(
             INITIAL_QUEUE_CAPACITY,
@@ -104,6 +106,7 @@ impl RawInputCaptureSession {
         let run_cap = Arc::clone(&running);
         let stop_cap = Arc::clone(&analyzer_stop);
         let hwnd_cap = Arc::clone(&msg_hwnd);
+        let click_ns_cap = Arc::clone(&last_left_down_qpc_ns);
         let queue_cap = Arc::clone(&event_queue);
         let wake_cap = Arc::clone(&wake_signal);
         let update_cap = Arc::clone(&on_update);
@@ -113,12 +116,19 @@ impl RawInputCaptureSession {
             .spawn(move || {
                 #[cfg(windows)]
                 run_win32_capture_loop(
-                    snap_cap, run_cap, stop_cap, hwnd_cap, queue_cap, wake_cap, update_cap,
+                    snap_cap,
+                    run_cap,
+                    stop_cap,
+                    hwnd_cap,
+                    click_ns_cap,
+                    queue_cap,
+                    wake_cap,
+                    update_cap,
                 );
 
                 #[cfg(not(windows))]
                 {
-                    let _ = (run_cap, hwnd_cap, queue_cap);
+                    let _ = (run_cap, hwnd_cap, click_ns_cap, queue_cap);
                     if let Ok(mut guard) = snap_cap.lock() {
                         guard.capturing = false;
                         guard.error =
@@ -167,6 +177,7 @@ impl RawInputCaptureSession {
             dpi_measuring,
             dpi_reset_requested,
             target_hz_atomic,
+            last_left_down_qpc_ns,
             msg_hwnd,
             wake_signal,
             capture_handle,
@@ -176,6 +187,12 @@ impl RawInputCaptureSession {
 
     pub fn snapshot(&self) -> DiagnosticsSnapshot {
         self.snapshot.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Returns the QPC nanosecond timestamp of the most recent hardware left-button press
+    /// observed on the high-priority `WM_INPUT` thread (0 if none yet).
+    pub fn last_left_click_qpc_ns(&self) -> u64 {
+        self.last_left_down_qpc_ns.load(Ordering::Acquire)
     }
 
     pub fn set_target(&self, target: PollingTarget) {
@@ -251,6 +268,19 @@ fn decode_target(raw: u32) -> PollingTarget {
         PollingTarget::Auto
     } else {
         PollingTarget::FixedHz(raw)
+    }
+}
+
+/// Returns the current monotonic `QueryPerformanceCounter` timestamp in nanoseconds on the
+/// exact same clock domain as `RawInputCaptureSession::last_left_click_qpc_ns()`.
+pub fn current_qpc_ns() -> u64 {
+    #[cfg(windows)]
+    {
+        qpc_now_ns(qpc_frequency())
+    }
+    #[cfg(not(windows))]
+    {
+        0
     }
 }
 
@@ -573,11 +603,13 @@ fn run_analyzer_loop(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn run_win32_capture_loop(
     snapshot: Arc<Mutex<DiagnosticsSnapshot>>,
     running: Arc<AtomicBool>,
     analyzer_stop: Arc<AtomicBool>,
     msg_hwnd: Arc<AtomicIsize>,
+    last_left_down_qpc_ns: Arc<AtomicU64>,
     event_queue: Arc<Mutex<Vec<RawEvent>>>,
     wake_signal: Arc<(Mutex<u64>, Condvar)>,
     on_update: Arc<dyn Fn() + Send + Sync>,
@@ -609,6 +641,7 @@ fn run_win32_capture_loop(
 
     struct CaptureThreadState {
         qpc_freq: u64,
+        last_left_down_qpc_ns: Arc<AtomicU64>,
         queue: Arc<Mutex<Vec<RawEvent>>>,
     }
 
@@ -682,6 +715,7 @@ fn run_win32_capture_loop(
                         }
                         if flags != 0 {
                             if (flags & RI_MOUSE_LEFT_BUTTON_DOWN) != 0 {
+                                state.last_left_down_qpc_ns.store(ts_ns, Ordering::Release);
                                 q.push(RawEvent::MouseButton {
                                     ts_ns,
                                     button: MouseButtonKind::Left,
@@ -895,6 +929,7 @@ fn run_win32_capture_loop(
     STATE.with(|cell| {
         *cell.borrow_mut() = Some(CaptureThreadState {
             qpc_freq,
+            last_left_down_qpc_ns,
             queue: event_queue,
         });
     });

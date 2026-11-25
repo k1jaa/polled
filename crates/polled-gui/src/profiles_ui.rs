@@ -125,6 +125,8 @@ pub struct ProfileDraft {
     pub display_height: u32,
     pub display_refresh_hz: u32,
     pub wooting_profile: Option<u8>,
+    pub force_high_perf_gpu: bool,
+    pub quiet_notifications: bool,
     pub set_win_speed: bool,
     pub win_speed: u32,
     pub set_power_plan: bool,
@@ -181,6 +183,8 @@ impl ProfileDraft {
             display_height: p.display_height.unwrap_or(1080),
             display_refresh_hz: p.display_refresh_hz.unwrap_or(240),
             wooting_profile: p.wooting_profile,
+            force_high_perf_gpu: p.force_high_perf_gpu,
+            quiet_notifications: p.quiet_notifications,
             set_win_speed: p.windows_pointer_speed.is_some(),
             win_speed: p.windows_pointer_speed.unwrap_or(10),
             set_power_plan: p.windows_power_plan.is_some(),
@@ -342,6 +346,8 @@ impl ProfileDraft {
             display_height: copy.set_display_mode.then_some(copy.display_height),
             display_refresh_hz: copy.set_display_mode.then_some(copy.display_refresh_hz),
             wooting_profile: copy.wooting_profile,
+            force_high_perf_gpu: !copy.is_desktop_default && copy.force_high_perf_gpu,
+            quiet_notifications: copy.quiet_notifications,
             author: (!copy.author.trim().is_empty()).then(|| copy.author.trim().to_string()),
             notes: (!copy.notes.trim().is_empty()).then(|| copy.notes.trim().to_string()),
         }
@@ -1620,6 +1626,8 @@ impl ProfilesUiState {
                             display_height: None,
                             display_refresh_hz: None,
                             wooting_profile: None,
+                            force_high_perf_gpu: false,
+                            quiet_notifications: false,
                             author: None,
                             notes: None,
                         };
@@ -2719,6 +2727,28 @@ impl ProfilesUiState {
                                         );
                                 });
                             });
+                            ui.end_row();
+
+                            if !self.editor.is_desktop_default {
+                                ui.label(RichText::new("Windows GPU").color(p.text_muted));
+                                ui.checkbox(
+                                    &mut self.editor.force_high_perf_gpu,
+                                    "Pin High-Performance GPU (HKCU Graphics Settings)",
+                                )
+                                .on_hover_text(
+                                    "Writes GpuPreference=2; for this game's exact .exe under HKCU\\Software\\Microsoft\\DirectX\\UserGpuPreferences (zero admin, anti-cheat safe).",
+                                );
+                                ui.end_row();
+                            }
+
+                            ui.label(RichText::new("Notifications").color(p.text_muted));
+                            ui.checkbox(
+                                &mut self.editor.quiet_notifications,
+                                "Quiet Mode (mute Windows toast popups while active)",
+                            )
+                            .on_hover_text(
+                                "Temporarily disables Windows toast popups while this profile is active and restores your original setting automatically on desktop or exit.",
+                            );
                             ui.end_row();
                             }
                         });

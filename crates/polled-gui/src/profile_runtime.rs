@@ -6,18 +6,21 @@
 //! -> `match_profile` -> multi-mouse `SafeDeviceController` (+ optional Windows pointer speed),
 //! with automatic USB hot-plug discovery across multiple mice.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
 use eframe::egui;
-use polled_core::win::{AudioFlow, DisplayModeInfo, DisplayResolutionMode, SystemEnv, WindowsEnv};
+use polled_core::win::{
+    AudioFlow, DisplayModeInfo, DisplayResolutionMode, RegHive, SystemEnv, WindowsEnv,
+};
 use polled_core::{
     detect_hardware_devices, detect_wooting_keyboards, hid_topology_fingerprint, match_profile,
-    AppPaths, ApplyOutcome, BatteryStatus, DeviceCapabilities, DeviceInfo, DryRunDevice,
-    FocusDebouncer, FocusEvent, ForegroundWatcher, GameProfile, MouseSettings, PolledError,
-    ProfileStore, SafeDeviceController, Severity, TrayAlertConfig, WootingAnalogBasePatch,
-    WootingGlobalSettingsPatch, WootingKeyboardInfo,
+    normalize_exe_name, AppPaths, ApplyOutcome, BatteryStatus, DeviceCapabilities, DeviceInfo,
+    DryRunDevice, FocusDebouncer, FocusEvent, ForegroundWatcher, GameProfile, MouseSettings,
+    PolledError, ProfileStore, SafeDeviceController, Severity, TrayAlertConfig,
+    WootingAnalogBasePatch, WootingGlobalSettingsPatch, WootingKeyboardInfo,
 };
 
 use crate::app::WorkerMsg;
@@ -31,6 +34,11 @@ const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const MIC_LOCK_INTERVAL: Duration = Duration::from_secs(2);
 const AUDIO_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const DISPLAY_TEST_FAILSAFE_TIMEOUT: Duration = Duration::from_secs(11);
+const WAKE_RETRY_WINDOW: Duration = Duration::from_secs(90);
+const WAKE_RETRY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const GPU_PREF_SUBKEY: &str = r"Software\Microsoft\DirectX\UserGpuPreferences";
+const PUSH_NOTIF_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\PushNotifications";
+const PUSH_NOTIF_VALUE: &str = "ToastEnabled";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendSelection {
@@ -112,6 +120,7 @@ pub enum ProfileRuntimeCmd {
     QuickSetMouseDpi(u16),
     RefreshMouseAndBattery,
     RefreshWooting,
+    CycleWootingProfile,
     SwitchWootingProfile {
         device_id: Option<String>,
         slot: u8,
@@ -267,10 +276,16 @@ struct RuntimeState {
     watcher: Option<ForegroundWatcher>,
     focus_rx: Option<Receiver<FocusEvent>>,
     foreground_exe: Option<String>,
+    /// Maps lowercase `.exe` basename -> full Win32 executable path observed by `ForegroundWatcher`.
+    exe_paths: HashMap<String, String>,
     active_profile_id: String,
     active_profile_name: String,
     /// Queued `(profile_id, retry_at)` when a focus switch was deferred by flash-wear cooldown.
     pending_retry: Option<(String, Instant)>,
+    /// Queued `(profile_id, expires_at, next_check_at)` when a wireless mouse was asleep during switch.
+    pending_wake_retry: Option<(String, Instant, Instant)>,
+    /// Captured original `HKCU\...\PushNotifications\ToastEnabled` when a profile enables Quiet Notifications.
+    original_toast_enabled: Option<Option<u32>>,
     log: Vec<ProfileLogEntry>,
 }
 
@@ -1103,6 +1118,91 @@ impl RuntimeState {
             self.restore_original_display(reason);
         }
 
+        // --- Per-Game High-Performance GPU Preference (`HKCU\...\UserGpuPreferences`, zero admin) ---
+        if profile.force_high_perf_gpu && !profile.is_desktop_default {
+            let full_path = self
+                .foreground_exe
+                .as_deref()
+                .map(normalize_exe_name)
+                .filter(|fg| {
+                    profile
+                        .executables
+                        .iter()
+                        .any(|cand| normalize_exe_name(cand) == *fg)
+                })
+                .and_then(|fg| self.exe_paths.get(&fg).cloned())
+                .or_else(|| {
+                    profile
+                        .executables
+                        .iter()
+                        .find_map(|cand| self.exe_paths.get(&normalize_exe_name(cand)).cloned())
+                });
+            if let Some(exe_path) = full_path {
+                let env = WindowsEnv;
+                let existing = env
+                    .reg_get_string(RegHive::Hkcu, GPU_PREF_SUBKEY, &exe_path)
+                    .ok()
+                    .flatten();
+                let updated = upsert_gpu_preference_high_perf(existing.as_deref());
+                if existing.as_deref() != Some(updated.as_str()) {
+                    match env.reg_set_string(RegHive::Hkcu, GPU_PREF_SUBKEY, &exe_path, &updated) {
+                        Ok(()) => {
+                            self.push_log(
+                                Severity::Ok,
+                                format!(
+                                    "Windows Graphics Preference -> High Performance GPU for {exe_path} (applies on launch)."
+                                ),
+                            );
+                        }
+                        Err(err) => {
+                            self.push_log(
+                                Severity::Warn,
+                                format!("Could not set High-Perf GPU preference: {err}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Per-Game Quiet Notifications / Do Not Disturb (zero admin, auto-reverts on desktop/exit) ---
+        if profile.quiet_notifications {
+            let env = WindowsEnv;
+            if self.original_toast_enabled.is_none() {
+                let orig = env
+                    .reg_get_dword(RegHive::Hkcu, PUSH_NOTIF_SUBKEY, PUSH_NOTIF_VALUE)
+                    .ok()
+                    .flatten();
+                self.original_toast_enabled = Some(orig);
+            }
+            if env
+                .reg_get_dword(RegHive::Hkcu, PUSH_NOTIF_SUBKEY, PUSH_NOTIF_VALUE)
+                .ok()
+                .flatten()
+                != Some(0)
+            {
+                match env.reg_set_dword(RegHive::Hkcu, PUSH_NOTIF_SUBKEY, PUSH_NOTIF_VALUE, 0) {
+                    Ok(()) => {
+                        self.push_log(
+                            Severity::Ok,
+                            format!(
+                                "Muted Windows toast notifications while '{}' is active (auto-restores on desktop/exit).",
+                                profile.name
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        self.push_log(
+                            Severity::Warn,
+                            format!("Could not mute Windows notifications: {err}"),
+                        );
+                    }
+                }
+            }
+        } else if self.original_toast_enabled.is_some() {
+            self.restore_quiet_notifications(reason);
+        }
+
         // --- Wooting Keyboard Volatile Profile Switching (0..=7, zero flash wear) ---
         if let Some(slot) = profile.wooting_profile {
             match detect_wooting_keyboards() {
@@ -1151,6 +1251,7 @@ impl RuntimeState {
         let mut logs: Vec<(Severity, String)> = Vec::new();
         let mut max_rate_limit_wait: Option<u64> = None;
         let mut any_succeeded = false;
+        let mut any_asleep_timeout = false;
 
         for managed in &mut self.controllers {
             let dev_info = managed.controller.info();
@@ -1232,18 +1333,45 @@ impl RuntimeState {
                     ));
                 }
                 Err(err) => {
-                    if let Ok(actual) = managed.controller.read_settings() {
+                    let err_str = err.to_string();
+                    let lower = err_str.to_ascii_lowercase();
+                    if lower.contains("timed out")
+                        || lower.contains("asleep")
+                        || lower.contains("wake")
+                        || lower.contains("did not reply")
+                    {
+                        any_asleep_timeout = true;
+                        managed.last_settings = None;
+                    } else if let Ok(actual) = managed.controller.read_settings() {
                         managed.last_settings = Some(actual);
                     }
                     logs.push((
                         Severity::Warn,
-                        format!("[{dev_name}] '{}' ({reason}): {err}", profile.name),
+                        format!("[{dev_name}] '{}' ({reason}): {err_str}", profile.name),
                     ));
                 }
             }
             managed.refresh_battery(&self.alerts);
         }
         self.last_battery_poll = Instant::now();
+
+        if any_asleep_timeout && max_rate_limit_wait.is_none() {
+            let now = Instant::now();
+            self.pending_wake_retry = Some((
+                profile.id.clone(),
+                now + WAKE_RETRY_WINDOW,
+                now + WAKE_RETRY_POLL_INTERVAL,
+            ));
+            logs.push((
+                Severity::Info,
+                format!(
+                    "Wireless mouse appears asleep — will auto-apply '{}' as soon as it wakes up.",
+                    profile.name
+                ),
+            ));
+        } else if !any_asleep_timeout {
+            self.pending_wake_retry = None;
+        }
 
         let switched_profile = self.active_profile_id != profile.id;
         let mut osd_msg: Option<(String, String)> = None;
@@ -1298,6 +1426,39 @@ impl RuntimeState {
         }
         osd_msg
     }
+
+    fn restore_quiet_notifications(&mut self, reason: &str) {
+        let Some(orig) = self.original_toast_enabled.take() else {
+            return;
+        };
+        let env = WindowsEnv;
+        let res = match orig {
+            Some(v) => env.reg_set_dword(RegHive::Hkcu, PUSH_NOTIF_SUBKEY, PUSH_NOTIF_VALUE, v),
+            None => env.reg_delete_value(RegHive::Hkcu, PUSH_NOTIF_SUBKEY, PUSH_NOTIF_VALUE),
+        };
+        match res {
+            Ok(()) => self.push_log(
+                Severity::Info,
+                format!("Restored Windows notification settings ({reason})."),
+            ),
+            Err(err) => self.push_log(
+                Severity::Warn,
+                format!("Could not restore Windows notifications ({reason}): {err}"),
+            ),
+        }
+    }
+}
+
+fn upsert_gpu_preference_high_perf(existing: Option<&str>) -> String {
+    let mut tokens: Vec<String> = existing
+        .unwrap_or("")
+        .split(';')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.to_ascii_lowercase().starts_with("gpupreference="))
+        .map(str::to_string)
+        .collect();
+    tokens.push("GpuPreference=2".to_string());
+    format!("{};", tokens.join(";"))
 }
 
 fn run_runtime_loop(
@@ -1342,9 +1503,12 @@ fn run_runtime_loop(
         watcher: None,
         focus_rx: None,
         foreground_exe: None,
+        exe_paths: HashMap::new(),
         active_profile_id: "desktop".to_string(),
         active_profile_name: desktop_name,
         pending_retry: None,
+        pending_wake_retry: None,
+        original_toast_enabled: None,
         log: Vec::new(),
     };
 
@@ -1377,11 +1541,59 @@ fn run_runtime_loop(
 
         if let Some(rx) = &state.focus_rx {
             while let Ok(evt) = rx.try_recv() {
+                if let (Some(name), Some(path)) = (&evt.exe_name, &evt.exe_path) {
+                    state.exe_paths.insert(name.clone(), path.clone());
+                }
                 state.foreground_exe = evt.exe_name.clone();
                 state
                     .debouncer
                     .observe(evt.exe_name.as_deref(), evt.observed_at);
                 changed = true;
+            }
+        }
+
+        // Auto-retry a missed profile switch once a sleeping wireless mouse wakes up.
+        if let Some((wake_profile_id, expires_at, next_check_at)) = state.pending_wake_retry.clone()
+        {
+            let now = Instant::now();
+            if now >= expires_at {
+                state.pending_wake_retry = None;
+            } else if now >= next_check_at {
+                let mut woke = false;
+                for m in &mut state.controllers {
+                    if m.last_settings.is_none() {
+                        if let Ok(actual) = m.controller.read_settings() {
+                            m.last_settings = Some(actual);
+                            woke = true;
+                        }
+                    }
+                }
+                if woke {
+                    state.pending_wake_retry = None;
+                    let still_wanted = !state.auto_switch_enabled
+                        || state.profile_locked
+                        || match_profile(&state.store, state.foreground_exe.as_deref())
+                            .is_some_and(|p| p.id == wake_profile_id);
+                    if still_wanted {
+                        if let Some(profile) = state
+                            .store
+                            .profiles
+                            .iter()
+                            .find(|p| p.id == wake_profile_id)
+                            .cloned()
+                        {
+                            if let Some((title, subtitle)) =
+                                state.apply_profile(&profile, "mouse wake retry")
+                            {
+                                let _ = ui_tx.send(WorkerMsg::ShowOsdPill { title, subtitle });
+                            }
+                            changed = true;
+                        }
+                    }
+                } else {
+                    state.pending_wake_retry =
+                        Some((wake_profile_id, expires_at, now + WAKE_RETRY_POLL_INTERVAL));
+                }
             }
         }
 
@@ -1465,11 +1677,16 @@ fn run_runtime_loop(
             let rem = deadline.saturating_duration_since(Instant::now());
             wait = wait.min(rem.max(Duration::from_millis(50)));
         }
+        if let Some((_, _, next_wake)) = state.pending_wake_retry {
+            let rem = next_wake.saturating_duration_since(Instant::now());
+            wait = wait.min(rem.max(Duration::from_millis(100)));
+        }
 
         match cmd_rx.recv_timeout(wait) {
             Ok(ProfileRuntimeCmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                 let _ = state.revert_test_display_if_pending("shutdown");
                 state.restore_original_display("shutdown");
+                state.restore_quiet_notifications("shutdown");
                 state.stop_watcher();
                 break;
             }
@@ -1532,6 +1749,74 @@ fn run_runtime_loop(
                     ok: count > 0,
                     message: msg,
                 });
+                state.emit(&ui_tx, &ctx);
+            }
+            Ok(ProfileRuntimeCmd::CycleWootingProfile) => {
+                match detect_wooting_keyboards() {
+                    Ok(boards) if !boards.is_empty() => {
+                        let mut updated = Vec::with_capacity(boards.len());
+                        let mut osd_sub: Option<String> = None;
+                        let mut any_ok = false;
+                        let mut messages = Vec::new();
+                        for kb in boards {
+                            let before = kb.read_full_status();
+                            let slots: Vec<u8> = before.profiles.iter().map(|p| p.index).collect();
+                            if slots.len() >= 2 {
+                                let cur = before.active_profile.unwrap_or(slots[0]);
+                                let pos = slots.iter().position(|&s| s == cur).unwrap_or(0);
+                                let next_slot = slots[(pos + 1) % slots.len()];
+                                let kb_name = kb.name().to_string();
+                                match kb.switch_profile(next_slot) {
+                                    Ok(_) => {
+                                        let full = kb.read_full_status();
+                                        let lbl = full.profile_display_name(next_slot);
+                                        let msg = format!(
+                                            "[{kb_name}] Cycled to {lbl} (hotkey, volatile RAM)."
+                                        );
+                                        state.push_log(Severity::Ok, msg.clone());
+                                        messages.push(msg);
+                                        osd_sub = Some(format!("{kb_name} -> {lbl}"));
+                                        any_ok = true;
+                                        updated.push(full);
+                                    }
+                                    Err(err) => {
+                                        let msg =
+                                            format!("[{kb_name}] Wooting cycle failed: {err}");
+                                        state.push_log(Severity::Warn, msg.clone());
+                                        messages.push(msg);
+                                        updated.push(before);
+                                    }
+                                }
+                            } else {
+                                updated.push(before);
+                            }
+                        }
+                        state.wooting_keyboards = updated;
+                        if let Some(sub) = osd_sub {
+                            if state.alerts.osd_pill_enabled {
+                                let _ = ui_tx.send(WorkerMsg::ShowOsdPill {
+                                    title: "Polled · Wooting Keyboard".to_string(),
+                                    subtitle: sub,
+                                });
+                            }
+                        }
+                        if !messages.is_empty() {
+                            let _ = ui_tx.send(WorkerMsg::WootingActionResult {
+                                ok: any_ok,
+                                message: messages.join(" "),
+                            });
+                        }
+                    }
+                    Ok(_) => {
+                        state.wooting_keyboards.clear();
+                    }
+                    Err(err) => {
+                        state.push_log(
+                            Severity::Warn,
+                            format!("Wooting detection failed on hotkey cycle: {err}"),
+                        );
+                    }
+                }
                 state.emit(&ui_tx, &ctx);
             }
             Ok(ProfileRuntimeCmd::SwitchWootingProfile { device_id, slot }) => {

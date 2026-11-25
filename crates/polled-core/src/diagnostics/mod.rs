@@ -8,8 +8,10 @@
 //! - On-demand 1-second OS timer jitter benchmark
 
 pub mod analyzer;
+pub mod dpc_monitor;
 pub mod export;
 pub mod raw_capture;
+pub mod reaction;
 pub mod sensitivity;
 pub mod watchdog;
 
@@ -24,11 +26,15 @@ pub use analyzer::{
     HISTOGRAM_BASE_BINS, KEY_CHATTER_THRESHOLD_MS, PAUSE_THRESHOLD_US, SCROLL_DOUBLE_NOTCH_MS,
     SCROLL_REVERSE_GLITCH_WINDOW_MS, STANDARD_RATES_HZ,
 };
+pub use dpc_monitor::{
+    compute_dpc_snapshot, CoreDpcMetrics, DpcMonitorSession, DpcMonitorSnapshot, RawCorePerfSample,
+};
 pub use export::{
     format_intervals_csv, render_ab_comparison_png, render_report_png, render_rig_scorecard_png,
     RigScorecardInput,
 };
-pub use raw_capture::RawInputCaptureSession;
+pub use raw_capture::{current_qpc_ns, RawInputCaptureSession};
+pub use reaction::{compute_reaction_summary, ReactionTestSummary};
 pub use sensitivity::{compute_sensitivity, SensitivityConversion, SensitivityGame};
 pub use watchdog::{
     format_watchdog_report, MatchWatchdogSession, WatchdogEvent, WatchdogSample, WatchdogSnapshot,

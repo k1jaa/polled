@@ -28,7 +28,7 @@ use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRun
 use crate::profiles_ui::ProfilesUiState;
 use crate::single_instance::SingleInstanceGuard;
 use crate::theme::{Palette, ThemeMode};
-use crate::tray::{find_own_main_hwnd, TrayController, TrayMouseState};
+use crate::tray::{find_own_main_hwnd, TrayController, TrayMouseState, TrayWootingState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveView {
@@ -739,6 +739,10 @@ impl PolledApp {
                         self.profile_runtime
                             .send(ProfileRuntimeCmd::CycleAudioOutput);
                     }
+                    HotkeyAction::CycleWootingProfile => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::CycleWootingProfile);
+                    }
                 },
                 WorkerMsg::ScanFinished {
                     result,
@@ -858,6 +862,16 @@ impl PolledApp {
                 polling_rates_hz: d.caps.polling_rates_hz.clone(),
                 battery: d.battery,
             });
+        let primary_wooting = snap.wooting_keyboards.first().map(|kb| TrayWootingState {
+            device_id: kb.id.clone(),
+            name: kb.name.clone(),
+            active_profile: kb.active_profile,
+            profiles: kb
+                .profiles
+                .iter()
+                .map(|slot| (slot.index, slot.name.clone()))
+                .collect(),
+        });
         self.tray.update_status(
             snap.auto_switch_enabled,
             snap.profile_locked,
@@ -866,6 +880,7 @@ impl PolledApp {
             &snap.available_profiles,
             &snap.audio_outputs,
             primary_mouse.as_ref(),
+            primary_wooting.as_ref(),
             battery_summary.as_deref(),
             self.settings.alerts.battery_tray_icon,
             self.settings.alerts.clamped_threshold(),
@@ -886,7 +901,7 @@ impl eframe::App for PolledApp {
         if ctx.input(|i| i.viewport().close_requested())
             && !self.quit_requested.load(Ordering::SeqCst)
         {
-            self.input_lab_ui.stop_capture();
+            self.input_lab_ui.stop_background_monitors();
             self.keyboard_ui.stop_analog_stream();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -2262,6 +2277,14 @@ impl eframe::App for PolledApp {
                                     "hk_audio",
                                     &mut self.settings.hotkeys.cycle_audio_output,
                                     "A",
+                                );
+                                ui.end_row();
+                                render_hotkey_binding_row(
+                                    ui,
+                                    "Cycle Wooting Profile",
+                                    "hk_wooting",
+                                    &mut self.settings.hotkeys.cycle_wooting_profile,
+                                    "K",
                                 );
                                 ui.end_row();
                             });

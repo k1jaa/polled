@@ -23,6 +23,7 @@ pub enum HotkeyAction {
     ToggleProfileLock,
     ToggleInputLab,
     CycleAudioOutput,
+    CycleWootingProfile,
 }
 
 #[cfg(windows)]
@@ -35,6 +36,8 @@ const HK_ID_LOCK: i32 = 2;
 const HK_ID_LAB: i32 = 3;
 #[cfg(windows)]
 const HK_ID_AUDIO: i32 = 4;
+#[cfg(windows)]
+const HK_ID_WOOTING: i32 = 5;
 
 pub struct HotkeyManager {
     config: Arc<Mutex<HotkeyConfig>>,
@@ -152,6 +155,7 @@ fn run_win32_hotkey_loop(
             let _ = UnregisterHotKey(Some(hwnd), HK_ID_LOCK);
             let _ = UnregisterHotKey(Some(hwnd), HK_ID_LAB);
             let _ = UnregisterHotKey(Some(hwnd), HK_ID_AUDIO);
+            let _ = UnregisterHotKey(Some(hwnd), HK_ID_WOOTING);
         }
         if !cfg.enabled {
             return;
@@ -161,6 +165,7 @@ fn run_win32_hotkey_loop(
             (HK_ID_LOCK, cfg.toggle_lock.as_ref()),
             (HK_ID_LAB, cfg.toggle_input_lab.as_ref()),
             (HK_ID_AUDIO, cfg.cycle_audio_output.as_ref()),
+            (HK_ID_WOOTING, cfg.cycle_wooting_profile.as_ref()),
         ];
         for (id, binding) in entries {
             if let Some(b) = binding {
@@ -188,6 +193,7 @@ fn run_win32_hotkey_loop(
                     HK_ID_LOCK => Some(HotkeyAction::ToggleProfileLock),
                     HK_ID_LAB => Some(HotkeyAction::ToggleInputLab),
                     HK_ID_AUDIO => Some(HotkeyAction::CycleAudioOutput),
+                    HK_ID_WOOTING => Some(HotkeyAction::CycleWootingProfile),
                     _ => None,
                 };
                 if let Some(act) = action {
