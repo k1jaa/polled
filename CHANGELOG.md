@@ -28,8 +28,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Per-Game Keyboard Presets Beyond Slot Switching (`profiles/mod.rs`, `profile_runtime.rs`, `profiles_ui.rs`, `wooting_adapter.rs`):**
   - Added optional `keyboard_preset` (`KeyboardProfileSettings`: polling rate, base actuation mm, Rapid Trigger ON/OFF & sensitivity mm, SOCD / Snap Tap, and Gaming/Typing debounce) to `GameProfile` and the **Profiles → Keyboard** sub-tab.
   - Automatically diffs each requested setting against live keyboard telemetry and applies only controls supported by the connected board (Wooting ARM, Wuque/SparkLink, Keychron HE, SteelSeries Apex Pro, Razer Keyboards, Arbiter Studio, Logitech HID++ 2.0, Geonworks Venom 8K) with zero redundant writes.
+- **Duplicate Profile, Live `cm/360°` DPI Sync Helper, & Tray Display Restore (`profiles_ui.rs`, `tray.rs`, `profile_runtime.rs`, `daemon.rs`):**
+  - Added a 1-click **Duplicate** button in the Profile Editor header to clone an existing profile's mouse, keyboard, audio, and display setup into a new game profile.
+  - Added a collapsible **`cm/360`** sensitivity helper next to the Profile Editor DPI field that auto-detects the game engine and calculates exact converted in-game sensitivity (with 1-click **Copy Sens**) when stepping DPI up or down.
+  - Added a dynamic **Restore Native Display** system tray action enabled whenever a temporary per-game display override is active.
 
 ### Changed
+- **Near-Zero Steady-State Idle Wake-Ups (`profiles/watcher.rs`, `profile_runtime.rs`):**
+  - Routed Win32 `SetWinEventHook` foreground focus transitions directly into the profile runtime command channel (`ForegroundWatcher::start_with_callback`), eliminating the `150 ms` idle polling timeout (~6.7 wake-ups/sec) and computing exact next-deadline sleep intervals (30s hot-plug/audio safety fallback, 60s battery poll — ~0.03 idle wake-ups/sec and 0 ms focus-switch wakeup lag).
 - **Ultra-Light Pure-Win32 Background Tray Daemon & On-Demand GPU GUI (`daemon.rs`, `ipc.rs`, `main.rs`, `app.rs`, `tray.rs`, `single_instance.rs`, `profile_runtime.rs`, `hotkeys.rs`, `notifications.rs`):**
   - Split `polled-gui.exe` into a pure-Win32 zero-OpenGL background tray daemon (`polled-gui.exe` / `--minimized`) and an on-demand GPU UI child window (`polled-gui.exe --ui --ipc-pid <pid>`) synchronized over two local-only Win32 Named Pipes (`\\.\pipe\PolledIpcC2S_<pid>` and `PolledIpcS2C_<pid>`, `PIPE_REJECT_REMOTE_CLIENTS`, zero network sockets).
   - Because the tray daemon never initializes `eframe` / OpenGL, GPU drivers (`nvoglv64.dll` / AMD ICD) are never loaded while Polled sits in the tray, and closing `[X]` exits the `--ui` child process to return 100% of GPU memory back to Windows immediately (cutting idle tray RAM from ~77 MB down to ~3 MB private bytes / <1 MB trimmed working set).

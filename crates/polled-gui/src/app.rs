@@ -995,6 +995,10 @@ impl PolledApp {
                     TrayAction::ToggleMicMute => {
                         self.profile_runtime.send(ProfileRuntimeCmd::ToggleMicMute);
                     }
+                    TrayAction::RestoreNativeDisplay => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::RestoreOriginalDisplay);
+                    }
                     TrayAction::ToggleProfileLock => {
                         let next = !self.profile_locked_state.load(Ordering::SeqCst);
                         self.profile_locked_state.store(next, Ordering::SeqCst);

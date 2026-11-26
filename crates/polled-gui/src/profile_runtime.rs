@@ -20,10 +20,9 @@ use polled_core::{
     detect_all_keyboards, detect_hardware_devices, detect_wooting_keyboards,
     duck_app_audio_sessions, hid_topology_fingerprint, match_profile, normalize_exe_name,
     restore_app_audio_sessions, AppPaths, ApplyOutcome, BatteryStatus, DeviceCapabilities,
-    DeviceInfo, DryRunDevice, FocusDebouncer, FocusEvent, ForegroundWatcher, GameProfile,
-    KeyboardStatus, MouseSettings, PolledError, ProfileStore, SafeDeviceController,
-    SavedAppAudioVolume, Severity, SupportTier, TrayAlertConfig, WootingAnalogBasePatch,
-    WootingGlobalSettingsPatch,
+    DeviceInfo, DryRunDevice, FocusDebouncer, ForegroundWatcher, GameProfile, KeyboardStatus,
+    MouseSettings, PolledError, ProfileStore, SafeDeviceController, SavedAppAudioVolume, Severity,
+    SupportTier, TrayAlertConfig, WootingAnalogBasePatch, WootingGlobalSettingsPatch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,11 +31,11 @@ use crate::hotplug::UsbHotplugWatcher;
 use crate::notifications::{notify_low_battery, notify_profile_switched};
 
 const MAX_LOG_ENTRIES: usize = 50;
-const HOTPLUG_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const HOTPLUG_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const HOTPLUG_EVENT_DEBOUNCE: Duration = Duration::from_millis(300);
 const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const MIC_LOCK_INTERVAL: Duration = Duration::from_secs(2);
-const AUDIO_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const AUDIO_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DISPLAY_TEST_FAILSAFE_TIMEOUT: Duration = Duration::from_secs(11);
 const WAKE_RETRY_WINDOW: Duration = Duration::from_secs(90);
 const WAKE_RETRY_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -127,6 +126,7 @@ pub enum ProfileRuntimeCmd {
     },
     KeepTestDisplayMode,
     RevertTestDisplayMode,
+    RestoreOriginalDisplay,
     QuickSetMousePolling(u16),
     QuickSetMouseDpi(u16),
     RefreshMouseAndBattery,
@@ -178,6 +178,10 @@ pub enum ProfileRuntimeCmd {
     ReadFromMouseForEditor(Option<String>),
     UpdateAlertConfig(TrayAlertConfig),
     UsbDeviceChanged,
+    FocusChanged {
+        exe_name: Option<String>,
+        exe_path: Option<String>,
+    },
     UpdateStore(ProfileStore),
     SelectBackend(BackendSelection),
     RedetectHardware,
@@ -211,6 +215,7 @@ impl ProfileRuntimeHandle {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let hotplug_watcher = UsbHotplugWatcher::start(cmd_tx.clone());
+        let loop_cmd_tx = cmd_tx.clone();
 
         let thread_handle = std::thread::Builder::new()
             .name("polled-profile-runtime".to_string())
@@ -220,6 +225,7 @@ impl ProfileRuntimeHandle {
                     initial_auto_switch,
                     initial_alerts,
                     initial_audio_cycle_ids,
+                    loop_cmd_tx,
                     cmd_rx,
                     ui_tx,
                     wake,
@@ -360,7 +366,7 @@ struct RuntimeState {
     pending_display_test_revert: Option<(String, u32, u32, u32, Instant)>,
     debouncer: FocusDebouncer,
     watcher: Option<ForegroundWatcher>,
-    focus_rx: Option<Receiver<FocusEvent>>,
+    cmd_tx: Sender<ProfileRuntimeCmd>,
     foreground_exe: Option<String>,
     /// Maps lowercase `.exe` basename -> full Win32 executable path observed by `ForegroundWatcher`.
     exe_paths: HashMap<String, String>,
@@ -463,14 +469,18 @@ impl RuntimeState {
         if self.watcher.is_some() {
             return;
         }
-        let (tx, rx) = mpsc::channel();
-        match ForegroundWatcher::start(tx) {
+        let tx = self.cmd_tx.clone();
+        match ForegroundWatcher::start_with_callback(move |evt| {
+            let _ = tx.send(ProfileRuntimeCmd::FocusChanged {
+                exe_name: evt.exe_name,
+                exe_path: evt.exe_path,
+            });
+        }) {
             Ok(watcher) => {
                 self.watcher = Some(watcher);
-                self.focus_rx = Some(rx);
                 self.push_log(
                     Severity::Ok,
-                    "Started foreground window watcher (SetWinEventHook, out-of-context).",
+                    "Started foreground window watcher (SetWinEventHook, event-driven).",
                 );
             }
             Err(err) => {
@@ -487,7 +497,6 @@ impl RuntimeState {
         if let Some(mut watcher) = self.watcher.take() {
             watcher.stop();
         }
-        self.focus_rx = None;
     }
 
     fn refresh_keyboards(&mut self) {
@@ -1997,11 +2006,13 @@ fn run_generic_keyboard_action<F>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_runtime_loop(
     initial_store: ProfileStore,
     initial_auto_switch: bool,
     initial_alerts: TrayAlertConfig,
     initial_audio_cycle_ids: Vec<String>,
+    cmd_tx: Sender<ProfileRuntimeCmd>,
     cmd_rx: Receiver<ProfileRuntimeCmd>,
     ui_tx: Sender<WorkerMsg>,
     wake: Arc<dyn Fn() + Send + Sync>,
@@ -2040,7 +2051,7 @@ fn run_runtime_loop(
         pending_display_test_revert: None,
         debouncer: FocusDebouncer::new(debounce),
         watcher: None,
-        focus_rx: None,
+        cmd_tx,
         foreground_exe: None,
         exe_paths: HashMap::new(),
         active_profile_id: "desktop".to_string(),
@@ -2080,19 +2091,6 @@ fn run_runtime_loop(
         {
             if let Some(msg) = state.revert_test_display_if_pending("10s auto-revert failsafe") {
                 let _ = ui_tx.send(WorkerMsg::DisplayTestReverted(msg));
-                changed = true;
-            }
-        }
-
-        if let Some(rx) = &state.focus_rx {
-            while let Ok(evt) = rx.try_recv() {
-                if let (Some(name), Some(path)) = (&evt.exe_name, &evt.exe_path) {
-                    state.exe_paths.insert(name.clone(), path.clone());
-                }
-                state.foreground_exe = evt.exe_name.clone();
-                state
-                    .debouncer
-                    .observe(evt.exe_name.as_deref(), evt.observed_at);
                 changed = true;
             }
         }
@@ -2205,27 +2203,37 @@ fn run_runtime_loop(
             state.emit(&ui_tx, &wake);
         }
 
-        let mut wait = if !state.auto_switch_enabled {
-            HOTPLUG_FALLBACK_POLL_INTERVAL
-        } else {
+        let now = Instant::now();
+        let wait = compute_idle_wait(
+            now,
+            state.last_topology_check,
+            state.last_audio_refresh,
+            state.last_battery_poll,
+            !state.controllers.is_empty(),
             state
-                .debouncer
-                .time_until_ready(Instant::now())
-                .map(|rem| rem.min(Duration::from_millis(100)))
-                .unwrap_or(Duration::from_millis(150))
-        };
-        if let Some(hp_at) = state.pending_hotplug_at {
-            let rem = hp_at.saturating_duration_since(Instant::now());
-            wait = wait.min(rem.max(Duration::from_millis(10)));
-        }
-        if let Some((_, _, _, _, deadline)) = state.pending_display_test_revert {
-            let rem = deadline.saturating_duration_since(Instant::now());
-            wait = wait.min(rem.max(Duration::from_millis(50)));
-        }
-        if let Some((_, _, next_wake)) = state.pending_wake_retry {
-            let rem = next_wake.saturating_duration_since(Instant::now());
-            wait = wait.min(rem.max(Duration::from_millis(100)));
-        }
+                .mic_lock_target
+                .as_ref()
+                .map(|_| state.last_mic_lock_check + MIC_LOCK_INTERVAL),
+            if state.auto_switch_enabled && !state.profile_locked {
+                state.debouncer.time_until_ready(now)
+            } else {
+                None
+            },
+            if state.auto_switch_enabled && !state.profile_locked {
+                state.pending_retry.as_ref().map(|(_, at)| *at)
+            } else {
+                None
+            },
+            state.pending_hotplug_at,
+            state
+                .pending_display_test_revert
+                .as_ref()
+                .map(|(_, _, _, _, deadline)| *deadline),
+            state
+                .pending_wake_retry
+                .as_ref()
+                .map(|(_, _, next_wake)| *next_wake),
+        );
 
         match cmd_rx.recv_timeout(wait) {
             Ok(ProfileRuntimeCmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
@@ -2239,6 +2247,14 @@ fn run_runtime_loop(
             Err(RecvTimeoutError::Timeout) => continue,
             Ok(ProfileRuntimeCmd::UsbDeviceChanged) => {
                 state.pending_hotplug_at = Some(Instant::now() + HOTPLUG_EVENT_DEBOUNCE);
+            }
+            Ok(ProfileRuntimeCmd::FocusChanged { exe_name, exe_path }) => {
+                if let (Some(name), Some(path)) = (&exe_name, &exe_path) {
+                    state.exe_paths.insert(name.clone(), path.clone());
+                }
+                state.foreground_exe = exe_name.clone();
+                state.debouncer.observe(exe_name.as_deref(), Instant::now());
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::UpdateAlertConfig(next_alerts)) => {
                 state.alerts = next_alerts;
@@ -2869,6 +2885,21 @@ fn run_runtime_loop(
                 }
                 state.emit(&ui_tx, &wake);
             }
+            Ok(ProfileRuntimeCmd::RestoreOriginalDisplay) => {
+                let had_override = state.original_display_mode.is_some()
+                    || state.pending_display_test_revert.is_some();
+                if let Some(msg) = state.revert_test_display_if_pending("tray restore") {
+                    let _ = ui_tx.send(WorkerMsg::DisplayTestReverted(msg));
+                }
+                state.restore_original_display("tray restore");
+                if had_override && state.alerts.osd_pill_enabled {
+                    let _ = ui_tx.send(WorkerMsg::ShowOsdPill {
+                        title: "Polled · Display".to_string(),
+                        subtitle: "Restored native desktop display mode".to_string(),
+                    });
+                }
+                state.emit(&ui_tx, &wake);
+            }
             Ok(ProfileRuntimeCmd::UpdateStore(new_store)) => {
                 state
                     .debouncer
@@ -2903,6 +2934,50 @@ fn run_runtime_loop(
             }
         }
     }
+}
+
+/// Computes the exact sleep duration until the next scheduled background deadline so the
+/// profile runtime thread stays completely asleep (~0.03 wake-ups/sec) during steady-state gaming
+/// while waking immediately via `cmd_rx` on focus switches, USB hot-plug, hotkeys, or tray actions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_idle_wait(
+    now: Instant,
+    last_topology_check: Instant,
+    last_audio_refresh: Instant,
+    last_battery_poll: Instant,
+    has_controllers: bool,
+    next_mic_lock_at: Option<Instant>,
+    debounce_remaining: Option<Duration>,
+    pending_retry_at: Option<Instant>,
+    pending_hotplug_at: Option<Instant>,
+    display_revert_at: Option<Instant>,
+    wake_retry_at: Option<Instant>,
+) -> Duration {
+    let mut wait = (last_topology_check + HOTPLUG_FALLBACK_POLL_INTERVAL)
+        .saturating_duration_since(now)
+        .min((last_audio_refresh + AUDIO_REFRESH_INTERVAL).saturating_duration_since(now));
+
+    if has_controllers {
+        wait = wait.min((last_battery_poll + BATTERY_POLL_INTERVAL).saturating_duration_since(now));
+    }
+
+    if let Some(rem) = debounce_remaining {
+        wait = wait.min(rem);
+    }
+    for deadline in [
+        next_mic_lock_at,
+        pending_retry_at,
+        pending_hotplug_at,
+        display_revert_at,
+        wake_retry_at,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        wait = wait.min(deadline.saturating_duration_since(now));
+    }
+
+    wait.max(Duration::from_millis(10))
 }
 
 /// Selects the next playback endpoint for `CycleAudioOutput`, honoring optional user-pinned
@@ -3000,5 +3075,30 @@ mod tests {
         // Fewer than 2 active pinned devices returns None cleanly.
         let one_pin = vec!["id_headset".to_string(), "id_unplugged".to_string()];
         assert_eq!(select_next_audio_output(&outputs, &one_pin), None);
+    }
+
+    #[test]
+    fn compute_idle_wait_sleeps_long_when_steady_and_snaps_to_debounce_when_active() {
+        let now = Instant::now();
+        let steady =
+            compute_idle_wait(now, now, now, now, true, None, None, None, None, None, None);
+        // Steady-state idle sleeps for the full 30s fallback cadence (zero 150ms polling!).
+        assert!(steady >= Duration::from_secs(29));
+
+        // When a focus transition is debouncing, snaps cleanly to the exact remaining delay.
+        let debouncing = compute_idle_wait(
+            now,
+            now,
+            now,
+            now,
+            true,
+            None,
+            Some(Duration::from_millis(450)),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(debouncing, Duration::from_millis(450));
     }
 }

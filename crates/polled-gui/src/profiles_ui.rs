@@ -15,10 +15,11 @@ use eframe::egui::{
 };
 use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
-    discover_installed_games, discover_running_apps, dump_hid_devices, export_profile_json,
-    format_unsupported_mouse_issue, import_profile_json, AppPaths, DeviceCapabilities,
-    DiscoveredGame, GameProfile, GameSource, KeyboardProfileSettings, LiftOffDistance,
-    MouseSettings, PowerPlanPreset, ProfileStore, Severity, SupportTier, WootingKeyboardInfo,
+    compute_sensitivity, discover_installed_games, discover_running_apps, dump_hid_devices,
+    export_profile_json, format_unsupported_mouse_issue, import_profile_json, AppPaths,
+    DeviceCapabilities, DiscoveredGame, GameProfile, GameSource, KeyboardProfileSettings,
+    LiftOffDistance, MouseSettings, PowerPlanPreset, ProfileStore, SensitivityGame, Severity,
+    SupportTier, WootingKeyboardInfo,
 };
 
 use crate::profile_runtime::{
@@ -93,6 +94,10 @@ pub struct ProfilesUiState {
     display_test_countdown: Option<DisplayTestCountdown>,
     acknowledged_unverified_devices: HashSet<String>,
     pending_unverified_action: Option<PendingUnverifiedWrite>,
+    sens_helper_open: bool,
+    sens_helper_game: SensitivityGame,
+    sens_helper_base_dpi: u16,
+    sens_helper_in_game: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +500,10 @@ impl ProfilesUiState {
             display_test_countdown: None,
             acknowledged_unverified_devices: HashSet::new(),
             pending_unverified_action: None,
+            sens_helper_open: false,
+            sens_helper_game: SensitivityGame::Cs2,
+            sens_helper_base_dpi: 800,
+            sens_helper_in_game: 1.0,
         }
     }
 
@@ -2044,6 +2053,41 @@ impl ProfilesUiState {
                                 Some((Severity::Info, format!("Deleted profile '{del_id}'.")));
                         }
                     }
+                    if ui
+                        .add(secondary_btn("Duplicate", p))
+                        .on_hover_text(
+                            "Clone this profile's mouse, keyboard, audio, and display settings into a new game profile",
+                        )
+                        .clicked()
+                    {
+                        let mut cloned = self.editor.to_profile();
+                        let base_id = if cloned.id == "desktop" {
+                            "game".to_string()
+                        } else {
+                            format!("{}_copy", cloned.id)
+                        };
+                        let mut new_id = base_id.clone();
+                        let mut n = 2usize;
+                        while self.store.profiles.iter().any(|pr| pr.id == new_id) {
+                            new_id = format!("{base_id}_{n}");
+                            n += 1;
+                        }
+                        cloned.id = new_id.clone();
+                        cloned.name = format!("{} (Copy)", cloned.name);
+                        cloned.is_desktop_default = false;
+                        cloned.executables.clear();
+                        let cloned_name = cloned.name.clone();
+                        self.store.upsert_profile(cloned);
+                        self.select_profile(&new_id);
+                        self.editor_tab = ProfileEditorTab::General;
+                        runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
+                        self.notice = Some((
+                            Severity::Ok,
+                            format!(
+                                "Duplicated into '{cloned_name}' — pick a game executable in General and click Save."
+                            ),
+                        ));
+                    }
                     if ui.add(secondary_btn("Export", p)).clicked() {
                         let profile = self.editor.to_profile();
                         match export_profile_json(&profile) {
@@ -2351,13 +2395,141 @@ impl ProfilesUiState {
                             ui.end_row();
 
                             ui.checkbox(&mut self.editor.set_dpi, "DPI");
-                            ui.add_enabled(
-                                self.editor.set_dpi,
-                                egui::DragValue::new(&mut self.editor.dpi)
-                                    .range(dpi_min..=dpi_max)
-                                    .speed(f64::from(dpi_step))
-                                    .suffix(" DPI"),
-                            );
+                            ui.vertical(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add_enabled(
+                                        self.editor.set_dpi,
+                                        egui::DragValue::new(&mut self.editor.dpi)
+                                            .range(dpi_min..=dpi_max)
+                                            .speed(f64::from(dpi_step))
+                                            .suffix(" DPI"),
+                                    );
+                                    let calc_lbl = if self.sens_helper_open {
+                                        "cm/360 ▴"
+                                    } else {
+                                        "cm/360 ▾"
+                                    };
+                                    if ui
+                                        .add(secondary_btn(calc_lbl, p))
+                                        .on_hover_text(
+                                            "Show live eDPI, cm/360, and exact in-game sensitivity conversion when changing DPI",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.sens_helper_open = !self.sens_helper_open;
+                                        if self.sens_helper_open {
+                                            self.sens_helper_base_dpi = self.editor.dpi.max(100);
+                                            self.sens_helper_game = guess_sensitivity_game(
+                                                &self.editor.name,
+                                                &self.editor.executables_csv,
+                                            );
+                                        }
+                                    }
+                                });
+                                if self.sens_helper_open {
+                                    ui.add_space(4.0);
+                                    egui::Frame::NONE
+                                        .fill(p.surface_alt)
+                                        .stroke(Stroke::new(1.0_f32, p.border))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(Margin::symmetric(8, 6))
+                                        .show(ui, |ui| {
+                                            ui.horizontal_wrapped(|ui| {
+                                                egui::ComboBox::from_id_salt("prof_sens_game")
+                                                    .selected_text(self.sens_helper_game.label())
+                                                    .width(138.0)
+                                                    .show_ui(ui, |ui| {
+                                                        for g in SensitivityGame::ALL {
+                                                            ui.selectable_value(
+                                                                &mut self.sens_helper_game,
+                                                                g,
+                                                                g.label(),
+                                                            );
+                                                        }
+                                                    });
+                                                ui.label(
+                                                    RichText::new("Old DPI:")
+                                                        .size(11.0)
+                                                        .color(p.text_muted),
+                                                );
+                                                ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut self.sens_helper_base_dpi,
+                                                    )
+                                                    .range(100..=32000)
+                                                    .speed(50),
+                                                );
+                                                ui.label(
+                                                    RichText::new("Sens:")
+                                                        .size(11.0)
+                                                        .color(p.text_muted),
+                                                );
+                                                ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut self.sens_helper_in_game,
+                                                    )
+                                                    .range(0.001..=100.0)
+                                                    .speed(0.01)
+                                                    .fixed_decimals(3),
+                                                );
+                                            });
+                                            if let Some(conv) = compute_sensitivity(
+                                                self.sens_helper_game,
+                                                f64::from(self.sens_helper_base_dpi),
+                                                self.sens_helper_in_game,
+                                                self.sens_helper_game,
+                                                f64::from(self.editor.dpi.max(1)),
+                                            ) {
+                                                ui.add_space(4.0);
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{:.2} cm/360 · {:.2} in/360 · {:.0} eDPI",
+                                                            conv.cm_per_360,
+                                                            conv.inches_per_360,
+                                                            conv.source_edpi
+                                                        ))
+                                                        .size(11.5)
+                                                        .monospace()
+                                                        .color(p.text),
+                                                    );
+                                                });
+                                                if self.editor.dpi != self.sens_helper_base_dpi {
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "At {} DPI -> set sens to {:.4}",
+                                                                self.editor.dpi,
+                                                                conv.target_sens_same_game
+                                                            ))
+                                                            .size(11.5)
+                                                            .strong()
+                                                            .monospace()
+                                                            .color(p.info),
+                                                        );
+                                                        if ui
+                                                            .add(secondary_btn("Copy Sens", p))
+                                                            .clicked()
+                                                        {
+                                                            ui.ctx().copy_text(format!(
+                                                                "{:.4}",
+                                                                conv.target_sens_same_game
+                                                            ));
+                                                            self.notice = Some((
+                                                                Severity::Ok,
+                                                                format!(
+                                                                    "Copied converted sensitivity {:.4} for {} DPI.",
+                                                                    conv.target_sens_same_game,
+                                                                    self.editor.dpi
+                                                                ),
+                                                            ));
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        });
+                                }
+                            });
                             ui.end_row();
 
                             if supports_xy_dpi {
@@ -3481,6 +3653,23 @@ fn primary_btn(label: &str, p: Palette) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).color(p.btn_primary_fg).strong())
         .fill(p.btn_primary_bg)
         .corner_radius(CornerRadius::same(6))
+}
+
+fn guess_sensitivity_game(name: &str, executables_csv: &str) -> SensitivityGame {
+    let hay = format!("{name} {executables_csv}").to_ascii_lowercase();
+    if hay.contains("valorant") {
+        SensitivityGame::Valorant
+    } else if hay.contains("apex") || hay.contains("r5apex") {
+        SensitivityGame::ApexLegends
+    } else if hay.contains("overwatch") || hay.contains("cod.exe") || hay.contains("call of duty") {
+        SensitivityGame::Overwatch2
+    } else if hay.contains("rainbow") || hay.contains("siege") {
+        SensitivityGame::RainbowSix
+    } else if hay.contains("fortnite") {
+        SensitivityGame::Fortnite
+    } else {
+        SensitivityGame::Cs2
+    }
 }
 
 fn format_sleep_secs(secs: u16) -> String {

@@ -337,6 +337,10 @@ mod win32_daemon {
                     TrayAction::ToggleMicMute => {
                         self.profile_runtime.send(ProfileRuntimeCmd::ToggleMicMute);
                     }
+                    TrayAction::RestoreNativeDisplay => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::RestoreOriginalDisplay);
+                    }
                     TrayAction::ToggleProfileLock => {
                         let next = !self.profile_locked;
                         self.profile_locked = next;

@@ -43,9 +43,11 @@ mod platform {
     use crate::profiles::matcher::normalize_exe_name;
     use crate::profiles::watcher::FocusEvent;
 
-    // Thread-local sender used strictly on the dedicated Win32 hook message-loop thread.
+    type FocusCallback = Box<dyn Fn(FocusEvent)>;
+
+    // Thread-local callback used strictly on the dedicated Win32 hook message-loop thread.
     thread_local! {
-        static HOOK_SENDER: RefCell<Option<Sender<FocusEvent>>> = const { RefCell::new(None) };
+        static HOOK_CALLBACK: RefCell<Option<FocusCallback>> = const { RefCell::new(None) };
     }
 
     pub struct ForegroundWatcher {
@@ -54,8 +56,20 @@ mod platform {
     }
 
     impl ForegroundWatcher {
-        /// Starts a dedicated Win32 message-loop thread hooked to `EVENT_SYSTEM_FOREGROUND`.
+        /// Starts a dedicated Win32 message-loop thread hooked to `EVENT_SYSTEM_FOREGROUND`,
+        /// forwarding every focus change into `sender`.
         pub fn start(sender: Sender<FocusEvent>) -> Result<Self> {
+            Self::start_with_callback(move |evt| {
+                let _ = sender.send(evt);
+            })
+        }
+
+        /// Starts a dedicated Win32 message-loop thread hooked to `EVENT_SYSTEM_FOREGROUND`,
+        /// invoking `on_focus` directly on each focus transition with zero polling delay.
+        pub fn start_with_callback<F>(on_focus: F) -> Result<Self>
+        where
+            F: Fn(FocusEvent) + Send + 'static,
+        {
             let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<u32, String>>();
 
             let handle = thread::Builder::new()
@@ -68,14 +82,14 @@ mod platform {
                     // SAFETY: `GetForegroundWindow` returns a window handle or null.
                     let initial_hwnd = unsafe { GetForegroundWindow() };
                     let (exe_name, exe_path) = exe_info_from_hwnd(initial_hwnd);
-                    let _ = sender.send(FocusEvent {
+                    on_focus(FocusEvent {
                         exe_name,
                         exe_path,
                         observed_at: Instant::now(),
                     });
 
-                    HOOK_SENDER.with(|slot| {
-                        *slot.borrow_mut() = Some(sender);
+                    HOOK_CALLBACK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(on_focus));
                     });
 
                     // SAFETY: `WINEVENT_OUTOFCONTEXT` delivers callbacks asynchronously on this
@@ -93,7 +107,7 @@ mod platform {
                     };
 
                     if hook.is_invalid() {
-                        HOOK_SENDER.with(|slot| *slot.borrow_mut() = None);
+                        HOOK_CALLBACK.with(|slot| *slot.borrow_mut() = None);
                         let _ = ready_tx.send(Err("SetWinEventHook returned null handle".into()));
                         return;
                     }
@@ -110,17 +124,17 @@ mod platform {
                         let _ = UnhookWinEvent(hook);
                     }
 
-                    HOOK_SENDER.with(|slot| *slot.borrow_mut() = None);
+                    HOOK_CALLBACK.with(|slot| *slot.borrow_mut() = None);
                 })
                 .map_err(|e| PolledError::Win32 {
-                    context: "ForegroundWatcher::start".to_string(),
+                    context: "ForegroundWatcher::start_with_callback".to_string(),
                     message: e.to_string(),
                 })?;
 
             let thread_id = ready_rx
                 .recv()
                 .map_err(|_| PolledError::Win32 {
-                    context: "ForegroundWatcher::start".to_string(),
+                    context: "ForegroundWatcher::start_with_callback".to_string(),
                     message: "Watcher thread terminated before installing hook".to_string(),
                 })?
                 .map_err(|msg| PolledError::Win32 {
@@ -175,9 +189,9 @@ mod platform {
         } else {
             exe_info_from_hwnd(hwnd)
         };
-        HOOK_SENDER.with(|slot| {
-            if let Some(tx) = slot.borrow().as_ref() {
-                let _ = tx.send(FocusEvent {
+        HOOK_CALLBACK.with(|slot| {
+            if let Some(cb) = slot.borrow().as_ref() {
+                cb(FocusEvent {
                     exe_name,
                     exe_path,
                     observed_at: Instant::now(),
@@ -249,6 +263,13 @@ pub struct ForegroundWatcher;
 #[cfg(not(windows))]
 impl ForegroundWatcher {
     pub fn start(_sender: std::sync::mpsc::Sender<FocusEvent>) -> crate::error::Result<Self> {
+        Err(crate::error::PolledError::UnsupportedPlatform)
+    }
+
+    pub fn start_with_callback<F>(_on_focus: F) -> crate::error::Result<Self>
+    where
+        F: Fn(FocusEvent) + Send + 'static,
+    {
         Err(crate::error::PolledError::UnsupportedPlatform)
     }
 

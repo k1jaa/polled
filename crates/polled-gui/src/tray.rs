@@ -26,6 +26,7 @@ const ID_WOOTING_PREFIX: &str = "wooting::";
 const ID_WOOTING_REFRESH: &str = "wooting_refresh";
 const ID_AUDIO_PREFIX: &str = "audio::";
 const ID_MIC_MUTE: &str = "mic_mute";
+const ID_RESTORE_DISPLAY: &str = "restore_display";
 const ID_QUIT: &str = "quit";
 
 /// High-level action emitted by the native Windows system tray icon or its context menu.
@@ -41,6 +42,7 @@ pub enum TrayAction {
     RefreshKeyboards,
     SwitchAudioOutput(String),
     ToggleMicMute,
+    RestoreNativeDisplay,
     ToggleProfileLock,
     ToggleAutoSwitch,
     Quit,
@@ -101,6 +103,7 @@ pub fn parse_menu_action(id_str: &str) -> Option<TrayAction> {
         ID_MOUSE_REFRESH => Some(TrayAction::RefreshMouseAndBattery),
         ID_WOOTING_REFRESH => Some(TrayAction::RefreshKeyboards),
         ID_MIC_MUTE => Some(TrayAction::ToggleMicMute),
+        ID_RESTORE_DISPLAY => Some(TrayAction::RestoreNativeDisplay),
         ID_LOCK_PROFILE => Some(TrayAction::ToggleProfileLock),
         ID_AUTO_SWITCH => Some(TrayAction::ToggleAutoSwitch),
         ID_QUIT => Some(TrayAction::Quit),
@@ -189,6 +192,7 @@ pub struct TrayController {
     audio_menu_items: Vec<MenuItem>,
     last_audio_key: Vec<(String, String, bool)>,
     mic_mute_item: CheckMenuItem,
+    restore_display_item: MenuItem,
     auto_switch_item: CheckMenuItem,
     lock_profile_item: CheckMenuItem,
     /// Cached rendered icon state: `None` = unset, `Some(None)` = default crosshair,
@@ -216,6 +220,8 @@ impl TrayController {
         let audio_submenu = Submenu::new("Audio Output", true);
         let mic_mute_item =
             CheckMenuItem::with_id(ID_MIC_MUTE, "Mute Microphone", true, false, None);
+        let restore_display_item =
+            MenuItem::with_id(ID_RESTORE_DISPLAY, "Display: Native", false, None);
         let lock_profile_item =
             CheckMenuItem::with_id(ID_LOCK_PROFILE, "Lock Current Profile", true, false, None);
         let auto_switch_item = CheckMenuItem::with_id(
@@ -237,6 +243,7 @@ impl TrayController {
         let _ = menu.append(&wooting_submenu);
         let _ = menu.append(&audio_submenu);
         let _ = menu.append(&mic_mute_item);
+        let _ = menu.append(&restore_display_item);
         let _ = menu.append(&lock_profile_item);
         let _ = menu.append(&auto_switch_item);
         let _ = menu.append(&sep_bottom);
@@ -298,6 +305,7 @@ impl TrayController {
             audio_menu_items: Vec::new(),
             last_audio_key: Vec::new(),
             mic_mute_item,
+            restore_display_item,
             auto_switch_item,
             lock_profile_item,
             last_icon_key: Some(None),
@@ -356,6 +364,7 @@ impl TrayController {
             snap.auto_switch_enabled,
             snap.profile_locked,
             snap.mic_muted == Some(true),
+            snap.active_display_override.as_deref(),
             &snap.active_profile_id,
             &snap.active_profile_name,
             &snap.available_profiles,
@@ -376,6 +385,7 @@ impl TrayController {
         auto_switch_enabled: bool,
         profile_locked: bool,
         mic_muted: bool,
+        active_display_override: Option<&str>,
         active_profile_id: &str,
         active_profile_name: &str,
         available_profiles: &[(String, String)],
@@ -389,6 +399,17 @@ impl TrayController {
         self.auto_switch_item.set_checked(auto_switch_enabled);
         self.lock_profile_item.set_checked(profile_locked);
         self.mic_mute_item.set_checked(mic_muted);
+        match active_display_override {
+            Some(mode_lbl) => {
+                self.restore_display_item
+                    .set_text(format!("Restore Native Display ({mode_lbl})"));
+                self.restore_display_item.set_enabled(true);
+            }
+            None => {
+                self.restore_display_item.set_text("Display: Native");
+                self.restore_display_item.set_enabled(false);
+            }
+        }
 
         let lock_tag = if profile_locked { " [LOCKED]" } else { "" };
         let mic_tag = if mic_muted { " [MIC MUTED]" } else { "" };
