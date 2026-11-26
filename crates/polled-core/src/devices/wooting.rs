@@ -304,7 +304,7 @@ impl WootingKeyboardInfo {
 }
 
 /// Requested changes for ARM base analog settings (`OUT_CMD_SET_KEYBOARD_BASE 0x11`).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WootingAnalogBasePatch {
     pub actuation_mm: Option<f32>,
     pub rapid_trigger_enabled: Option<bool>,
@@ -312,7 +312,7 @@ pub struct WootingAnalogBasePatch {
 }
 
 /// Requested changes for ARM global device settings (`OUT_CMD_SET_GLOBAL_SETTINGS 0x17`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WootingGlobalSettingsPatch {
     pub rgb_dim_minutes: Option<u32>,
     pub rgb_off_minutes: Option<u32>,

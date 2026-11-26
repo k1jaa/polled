@@ -16,6 +16,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **Ultra-Light Pure-Win32 Background Tray Daemon & On-Demand GPU GUI (`daemon.rs`, `ipc.rs`, `main.rs`, `app.rs`, `tray.rs`, `single_instance.rs`, `profile_runtime.rs`, `hotkeys.rs`, `notifications.rs`):**
+  - Split `polled-gui.exe` into a pure-Win32 zero-OpenGL background tray daemon (`polled-gui.exe` / `--minimized`) and an on-demand GPU UI child window (`polled-gui.exe --ui --ipc-pid <pid>`) synchronized over two local-only Win32 Named Pipes (`\\.\pipe\PolledIpcC2S_<pid>` and `PolledIpcS2C_<pid>`, `PIPE_REJECT_REMOTE_CLIENTS`, zero network sockets).
+  - Because the tray daemon never initializes `eframe` / OpenGL, GPU drivers (`nvoglv64.dll` / AMD ICD) are never loaded while Polled sits in the tray, and closing `[X]` exits the `--ui` child process to return 100% of GPU memory back to Windows immediately (cutting idle tray RAM from ~77 MB down to ~3 MB private bytes / <1 MB trimmed working set).
+  - Replaced the 50 ms tray polling loop with native event-driven `TrayIconEvent::set_event_handler` / `MenuEvent::set_event_handler` callbacks and replaced the 250 ms single-instance wait loop with kernel-blocking `WaitForMultipleObjects(..., INFINITE)` for true 0% idle CPU.
+  - Added clean `WM_QUERYENDSESSION` / `WM_ENDSESSION` handling and deterministic runtime thread join on quit so temporary display overrides, ducked app mixer volumes, and quiet notifications always restore cleanly.
+  - Tightened release profile (`opt-level = "s"`, `lto = true`, `strip = true`, `panic = "abort"`), shrinking `polled-gui.exe` from `9.19 MB` to `5.53 MB` and `polled.exe` from `2.96 MB` to `1.47 MB`.
+
+---
+
 ## [0.13.0] - 2026-11-26
 
 ### Added

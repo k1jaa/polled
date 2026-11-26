@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::time::Duration;
 
-use eframe::egui;
 use notify_rust::Notification;
 use polled_core::checks::state::PolledState;
 use polled_core::win::{SystemEnv, WindowsEnv};
@@ -69,7 +69,7 @@ pub fn notify_profile_switched(profile_name: &str, details: &str) {
 
 /// Spawns a lightweight watcher that periodically checks whether the Windows build/UBR
 /// changed (e.g., after a Windows Update) and triggers a re-scan + regression alert.
-pub fn spawn_windows_build_watcher(tx: Sender<WorkerMsg>, ctx: egui::Context) {
+pub fn spawn_windows_build_watcher(tx: Sender<WorkerMsg>, wake: Arc<dyn Fn() + Send + Sync>) {
     std::thread::spawn(move || {
         let env = WindowsEnv;
         let paths = AppPaths::default_user_dir();
@@ -95,7 +95,7 @@ pub fn spawn_windows_build_watcher(tx: Sender<WorkerMsg>, ctx: egui::Context) {
                         result: Ok(summary),
                         notify_regressions: false,
                     });
-                    ctx.request_repaint();
+                    wake();
                 }
             }
         }

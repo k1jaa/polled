@@ -11,16 +11,16 @@
 mod platform {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use std::sync::Arc;
+    use std::thread::JoinHandle;
 
-    use eframe::egui;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0,
     };
     use windows::Win32::System::Threading::{
-        CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
+        CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForMultipleObjects,
+        EVENT_MODIFY_STATE, INFINITE,
     };
 
     const MUTEX_NAME: &str = r"Local\PolledGuiSingleInstance";
@@ -51,6 +51,8 @@ mod platform {
     pub struct SingleInstanceGuard {
         _mutex: OwnedHandle,
         show_event: Option<OwnedHandle>,
+        stop_event: Option<OwnedHandle>,
+        listener_handle: Option<JoinHandle<()>>,
     }
 
     pub enum InstanceLock {
@@ -69,6 +71,8 @@ mod platform {
                 return InstanceLock::Primary(Self {
                     _mutex: OwnedHandle(HANDLE::default()),
                     show_event: None,
+                    stop_event: None,
+                    listener_handle: None,
                 });
             };
 
@@ -102,36 +106,59 @@ mod platform {
             InstanceLock::Primary(Self {
                 _mutex: OwnedHandle(mutex),
                 show_event,
+                stop_event: None,
+                listener_handle: None,
             })
         }
 
-        /// Moves the show-event handle into a lightweight background thread that brings the
-        /// window to the foreground whenever a second instance signals it.
-        pub fn start_show_listener(
-            &mut self,
-            main_hwnd: Arc<AtomicIsize>,
-            ctx: egui::Context,
-            quit_requested: Arc<AtomicBool>,
-        ) {
+        /// Moves the show-event handle into a zero-CPU kernel-blocking background thread
+        /// (`WaitForMultipleObjects(..., INFINITE)`) that invokes `on_show` whenever a second
+        /// instance signals the named event.
+        pub fn start_show_listener(&mut self, on_show: Arc<dyn Fn() + Send + Sync>) {
             let Some(event) = self.show_event.take() else {
                 return;
             };
-            std::thread::Builder::new()
+            // Unnamed manual-reset stop event signaled in `Drop` before joining the listener thread.
+            let Ok(stop_raw) = (unsafe { CreateEventW(None, true, false, PCWSTR::null()) }) else {
+                self.show_event = Some(event);
+                return;
+            };
+            let stop_ptr = stop_raw.0 as isize;
+            self.stop_event = Some(OwnedHandle(stop_raw));
+
+            let handle = std::thread::Builder::new()
                 .name("polled-show-listener".to_string())
                 .spawn(move || {
+                    let handles = [event.0, HANDLE(stop_ptr as *mut core::ffi::c_void)];
                     loop {
-                        if quit_requested.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        // SAFETY: `event.0` is an owned valid event handle alive for the entire loop.
-                        let wait = unsafe { WaitForSingleObject(event.0, 250) };
+                        // SAFETY: Both `event.0` (owned by this thread) and `stop_handle` (owned by
+                        // `SingleInstanceGuard`, which signals and joins this thread before closing
+                        // `stop_event` in `Drop`) remain valid for the full wait.
+                        let wait = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
                         if wait == WAIT_OBJECT_0 {
-                            crate::tray::show_and_focus(&main_hwnd, &ctx);
+                            on_show();
+                        } else {
+                            break;
                         }
                     }
                     drop(event);
                 })
                 .ok();
+            self.listener_handle = handle;
+        }
+    }
+
+    impl Drop for SingleInstanceGuard {
+        fn drop(&mut self) {
+            if let Some(stop) = &self.stop_event {
+                // SAFETY: `stop.0` is an owned valid Win32 event handle.
+                unsafe {
+                    let _ = SetEvent(stop.0);
+                }
+            }
+            if let Some(handle) = self.listener_handle.take() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -154,11 +181,5 @@ impl SingleInstanceGuard {
         InstanceLock::Primary(Self)
     }
 
-    pub fn start_show_listener(
-        &mut self,
-        _main_hwnd: std::sync::Arc<std::sync::atomic::AtomicIsize>,
-        _ctx: eframe::egui::Context,
-        _quit_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-    }
+    pub fn start_show_listener(&mut self, _on_show: std::sync::Arc<dyn Fn() + Send + Sync>) {}
 }

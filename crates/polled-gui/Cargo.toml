@@ -16,6 +16,8 @@ chrono.workspace = true
 eframe.workspace = true
 notify-rust.workspace = true
 polled-core = { path = "../polled-core" }
+serde.workspace = true
+serde_json.workspace = true
 tray-icon.workspace = true
 
 [target.'cfg(windows)'.dependencies]

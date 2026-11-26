@@ -21,6 +21,7 @@ use polled_core::{
 use crate::elevation::{run_elevated_cli, ElevatedAction};
 use crate::hotkeys::{HotkeyAction, HotkeyManager};
 use crate::input_lab_ui::{InputLabNavAction, InputLabUiState};
+use crate::ipc::{DaemonToUiMsg, IpcClient, UiToDaemonMsg};
 use crate::keyboard_ui::KeyboardUiState;
 use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
 use crate::osd::OsdController;
@@ -28,7 +29,7 @@ use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRun
 use crate::profiles_ui::ProfilesUiState;
 use crate::single_instance::SingleInstanceGuard;
 use crate::theme::{Palette, ThemeMode};
-use crate::tray::{find_own_main_hwnd, TrayController, TrayMouseState, TrayWootingState};
+use crate::tray::{find_own_main_hwnd, TrayAction, TrayController};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveView {
@@ -222,9 +223,10 @@ fn build_non_elevated_confirm_warning(check: &CheckReport) -> String {
     }
 }
 
-/// Messages sent from background worker/tray threads back to the `egui` UI thread.
+/// Messages sent from background worker/tray/IPC threads back to the `egui` UI thread.
 pub(crate) enum WorkerMsg {
     TraySyncAutoSwitch(bool),
+    TrayAction(TrayAction),
     HotkeyTriggered(HotkeyAction),
     ScanFinished {
         result: Result<ScanSummary, String>,
@@ -258,6 +260,21 @@ pub(crate) enum WorkerMsg {
         message: String,
     },
     UpdateCheckFinished(Result<UpdateCheckResult, String>),
+    DaemonCachedScan(ScanSummary),
+    DaemonFocusWindow,
+    DaemonShutdownUi,
+}
+
+struct StandaloneHost {
+    hotkey_manager: HotkeyManager,
+    osd: OsdController,
+    tray: TrayController,
+    _instance_guard: SingleInstanceGuard,
+}
+
+enum AppHost {
+    Remote { ipc: IpcClient },
+    Standalone(Box<StandaloneHost>),
 }
 
 pub struct PolledApp {
@@ -290,8 +307,7 @@ pub struct PolledApp {
     profile_runtime: ProfileRuntimeHandle,
     keyboard_ui: KeyboardUiState,
     input_lab_ui: InputLabUiState,
-    hotkey_manager: HotkeyManager,
-    osd: OsdController,
+    host: AppHost,
 
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -299,12 +315,16 @@ pub struct PolledApp {
     auto_switch_state: Arc<AtomicBool>,
     profile_locked_state: Arc<AtomicBool>,
     quit_requested: Arc<AtomicBool>,
-    _instance_guard: SingleInstanceGuard,
-    tray: TrayController,
 }
 
 impl PolledApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, mut instance_guard: SingleInstanceGuard) -> Self {
+    /// Starts an on-demand GUI window (`polled-gui.exe --ui --ipc-pid <pid>`) attached to the
+    /// pure-Win32 background tray daemon over local Named Pipes.
+    pub fn new_remote(
+        cc: &eframe::CreationContext<'_>,
+        daemon_pid: u32,
+        open_bench: bool,
+    ) -> Result<Self, String> {
         let paths = AppPaths::default_user_dir();
         let settings = AppSettings::load_or_default(&paths.settings_path());
         let theme = ThemeMode::from(settings.theme);
@@ -318,32 +338,194 @@ impl PolledApp {
         let profile_locked_state = Arc::new(AtomicBool::new(false));
         let quit_requested = Arc::new(AtomicBool::new(false));
 
+        let tx_in = tx.clone();
+        let ctx_in = cc.egui_ctx.clone();
+        let tx_disc = tx.clone();
+        let ctx_disc = cc.egui_ctx.clone();
+
+        let ipc = IpcClient::connect(
+            daemon_pid,
+            move |msg| {
+                let worker_msg = match msg {
+                    DaemonToUiMsg::RuntimeSnapshot(snap) => WorkerMsg::ProfileRuntimeUpdated(snap),
+                    DaemonToUiMsg::CachedScanSummary(scan) => WorkerMsg::DaemonCachedScan(scan),
+                    DaemonToUiMsg::TraySyncAutoSwitch(enabled) => {
+                        WorkerMsg::TraySyncAutoSwitch(enabled)
+                    }
+                    DaemonToUiMsg::ReadFromMouseFinished {
+                        device_name,
+                        settings,
+                        error,
+                    } => WorkerMsg::ReadFromMouseFinished {
+                        device_name,
+                        settings,
+                        error,
+                    },
+                    DaemonToUiMsg::DisplayTestStarted {
+                        device_name,
+                        applied_label,
+                        previous_label,
+                        error,
+                    } => WorkerMsg::DisplayTestStarted {
+                        device_name,
+                        applied_label,
+                        previous_label,
+                        error,
+                    },
+                    DaemonToUiMsg::DisplayTestReverted(msg) => WorkerMsg::DisplayTestReverted(msg),
+                    DaemonToUiMsg::WootingActionResult { ok, message } => {
+                        WorkerMsg::WootingActionResult { ok, message }
+                    }
+                    DaemonToUiMsg::ScanFinished {
+                        result,
+                        notify_regressions,
+                    } => WorkerMsg::ScanFinished {
+                        result,
+                        notify_regressions,
+                    },
+                    DaemonToUiMsg::FocusWindow => WorkerMsg::DaemonFocusWindow,
+                    DaemonToUiMsg::ToggleInputLab => {
+                        WorkerMsg::HotkeyTriggered(HotkeyAction::ToggleInputLab)
+                    }
+                    DaemonToUiMsg::ShutdownUi => WorkerMsg::DaemonShutdownUi,
+                };
+                let _ = tx_in.send(worker_msg);
+                ctx_in.request_repaint();
+            },
+            move || {
+                let _ = tx_disc.send(WorkerMsg::DaemonShutdownUi);
+                ctx_disc.request_repaint();
+            },
+        )?;
+
+        let ipc_tx = ipc
+            .sender()
+            .ok_or_else(|| "IPC client closed immediately after connecting".to_string())?;
+        let profile_runtime = ProfileRuntimeHandle::from_remote_callback(move |cmd| {
+            let _ = ipc_tx.send(UiToDaemonMsg::RuntimeCmd(cmd));
+        });
+
+        let profiles_ui = ProfilesUiState::load();
+        let mut input_lab_ui = InputLabUiState::new();
+        let active_view = if open_bench {
+            input_lab_ui.start_capture(&cc.egui_ctx);
+            ActiveView::InputLab
+        } else {
+            ActiveView::HealthCheck
+        };
+
+        let snapshot_path = paths.baseline_snapshot_path().display().to_string();
+
+        let mut app = Self {
+            settings,
+            autostart_enabled,
+            theme,
+            active_view,
+            summary: None,
+            snapshot_path,
+            filter: FilterMode::All,
+            health_search: String::new(),
+            expanded_checks: HashSet::new(),
+            busy: false,
+            busy_label: String::new(),
+            status_message: None,
+            error_message: None,
+            pending_elevation: None,
+            pending_confirm: None,
+            show_latency_tips: false,
+            hotkeys_modal_open: false,
+            setup_backup_export_json: None,
+            setup_backup_import_open: false,
+            setup_backup_import_text: String::new(),
+            setup_backup_error: None,
+            update_checking: false,
+            update_result: None,
+            custom_tweak_draft: CustomTweakDraft::default(),
+            profiles_ui,
+            profile_runtime,
+            keyboard_ui: KeyboardUiState::new(),
+            input_lab_ui,
+            host: AppHost::Remote { ipc },
+            tx,
+            rx,
+            main_hwnd,
+            auto_switch_state,
+            profile_locked_state,
+            quit_requested,
+        };
+
+        app.sync_theme_to_host();
+        app.start_scan(&cc.egui_ctx, false);
+        Ok(app)
+    }
+
+    /// Starts the single-process fallback (`--standalone` or non-Windows).
+    pub fn new_standalone(
+        cc: &eframe::CreationContext<'_>,
+        mut instance_guard: SingleInstanceGuard,
+    ) -> Self {
+        let paths = AppPaths::default_user_dir();
+        let settings = AppSettings::load_or_default(&paths.settings_path());
+        let theme = ThemeMode::from(settings.theme);
+        theme.apply_to(&cc.egui_ctx);
+
+        let autostart_enabled = is_autostart_enabled(&WindowsEnv).unwrap_or(false);
+
+        let (tx, rx) = mpsc::channel();
+        let main_hwnd = Arc::new(AtomicIsize::new(find_own_main_hwnd()));
+        let auto_switch_state = Arc::new(AtomicBool::new(settings.auto_switch_on_startup));
+        let profile_locked_state = Arc::new(AtomicBool::new(false));
+        let quit_requested = Arc::new(AtomicBool::new(false));
+
+        let ctx_wake = cc.egui_ctx.clone();
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            ctx_wake.request_repaint();
+        });
+
         let profiles_ui = ProfilesUiState::load();
         let profile_runtime = ProfileRuntimeHandle::start(
             profiles_ui.store.clone(),
             settings.auto_switch_on_startup,
             settings.alerts.clone(),
             tx.clone(),
-            cc.egui_ctx.clone(),
+            Arc::clone(&wake),
         );
         let hotkey_manager =
-            HotkeyManager::start(settings.hotkeys.clone(), tx.clone(), cc.egui_ctx.clone());
+            HotkeyManager::start(settings.hotkeys.clone(), tx.clone(), Arc::clone(&wake));
 
-        instance_guard.start_show_listener(
-            Arc::clone(&main_hwnd),
-            cc.egui_ctx.clone(),
-            Arc::clone(&quit_requested),
+        let show_hwnd = Arc::clone(&main_hwnd);
+        let show_ctx = cc.egui_ctx.clone();
+        instance_guard.start_show_listener(Arc::new(move || {
+            crate::tray::show_and_focus(&show_hwnd, &show_ctx);
+        }));
+
+        let tx_tray = tx.clone();
+        let wake_tray = Arc::clone(&wake);
+        let tray_hwnd = Arc::clone(&main_hwnd);
+        let tray_ctx = cc.egui_ctx.clone();
+        let tray_quit = Arc::clone(&quit_requested);
+        let tray = TrayController::new(
+            settings.auto_switch_on_startup,
+            Arc::new(move |action| {
+                match &action {
+                    TrayAction::Open => {
+                        crate::tray::show_and_focus(&tray_hwnd, &tray_ctx);
+                        return;
+                    }
+                    TrayAction::Quit => {
+                        tray_quit.store(true, Ordering::SeqCst);
+                        crate::tray::request_native_close(&tray_hwnd);
+                        tray_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        tray_ctx.request_repaint();
+                        return;
+                    }
+                    _ => {}
+                }
+                let _ = tx_tray.send(WorkerMsg::TrayAction(action));
+                wake_tray();
+            }),
         );
-        let tray = TrayController::init(
-            cc.egui_ctx.clone(),
-            tx.clone(),
-            profile_runtime.command_sender(),
-            Arc::clone(&main_hwnd),
-            Arc::clone(&auto_switch_state),
-            Arc::clone(&profile_locked_state),
-            Arc::clone(&quit_requested),
-        );
-        spawn_windows_build_watcher(tx.clone(), cc.egui_ctx.clone());
+        spawn_windows_build_watcher(tx.clone(), Arc::clone(&wake));
 
         let snapshot_path = paths.baseline_snapshot_path().display().to_string();
 
@@ -376,20 +558,61 @@ impl PolledApp {
             profile_runtime,
             keyboard_ui: KeyboardUiState::new(),
             input_lab_ui: InputLabUiState::new(),
-            hotkey_manager,
-            osd: OsdController::start(),
+            host: AppHost::Standalone(Box::new(StandaloneHost {
+                hotkey_manager,
+                osd: OsdController::start(),
+                tray,
+                _instance_guard: instance_guard,
+            })),
             tx,
             rx,
             main_hwnd,
             auto_switch_state,
             profile_locked_state,
             quit_requested,
-            _instance_guard: instance_guard,
-            tray,
         };
 
         app.start_scan(&cc.egui_ctx, true);
         app
+    }
+
+    fn is_remote_daemon_mode(&self) -> bool {
+        matches!(self.host, AppHost::Remote { .. })
+    }
+
+    fn update_hotkeys(&self, cfg: polled_core::HotkeyConfig) {
+        match &self.host {
+            AppHost::Remote { ipc } => ipc.send(UiToDaemonMsg::UpdateHotkeys(cfg)),
+            AppHost::Standalone(host) => host.hotkey_manager.update_config(cfg),
+        }
+    }
+
+    fn show_osd_pill(&self, title: impl Into<String>, subtitle: impl Into<String>) {
+        match &self.host {
+            AppHost::Remote { ipc } => ipc.send(UiToDaemonMsg::ShowOsdPill {
+                title: title.into(),
+                subtitle: subtitle.into(),
+            }),
+            AppHost::Standalone(host) => {
+                host.osd
+                    .show(title, subtitle, matches!(self.theme, ThemeMode::Dark));
+            }
+        }
+    }
+
+    fn sync_theme_to_host(&self) {
+        if let AppHost::Remote { ipc } = &self.host {
+            ipc.send(UiToDaemonMsg::UpdateThemeDark(matches!(
+                self.theme,
+                ThemeMode::Dark
+            )));
+        }
+    }
+
+    fn sync_scan_to_host(&self, summary: &ScanSummary) {
+        if let AppHost::Remote { ipc } = &self.host {
+            ipc.send(UiToDaemonMsg::SyncScanSummary(summary.clone()));
+        }
     }
 
     fn start_scan(&mut self, ctx: &egui::Context, notify_regressions: bool) {
@@ -717,6 +940,79 @@ impl PolledApp {
                 WorkerMsg::TraySyncAutoSwitch(enabled) => {
                     self.settings.auto_switch_on_startup = enabled;
                 }
+                WorkerMsg::TrayAction(action) => match action {
+                    TrayAction::Open => crate::tray::show_and_focus(&self.main_hwnd, ctx),
+                    TrayAction::ScanNow => {
+                        let tx_scan = self.tx.clone();
+                        let ctx_scan = ctx.clone();
+                        std::thread::spawn(move || {
+                            let paths = AppPaths::default_user_dir();
+                            let engine = HealthEngine::with_default_and_custom_checks(&paths);
+                            let result = engine
+                                .scan_all(&WindowsEnv, &paths, true)
+                                .map_err(|e| e.to_string());
+                            if let Ok(summary) = &result {
+                                notify_if_regressed(summary);
+                            }
+                            let _ = tx_scan.send(WorkerMsg::ScanFinished {
+                                result,
+                                notify_regressions: false,
+                            });
+                            ctx_scan.request_repaint();
+                        });
+                    }
+                    TrayAction::ApplyProfile(id) => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::ApplyProfileNow(id));
+                    }
+                    TrayAction::QuickSetMousePolling(hz) => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::QuickSetMousePolling(hz));
+                    }
+                    TrayAction::QuickSetMouseDpi(dpi) => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::QuickSetMouseDpi(dpi));
+                    }
+                    TrayAction::RefreshMouseAndBattery => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::RefreshMouseAndBattery);
+                    }
+                    TrayAction::SwitchKeyboardProfile(slot) => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::SwitchWootingProfile {
+                                device_id: None,
+                                slot,
+                            });
+                    }
+                    TrayAction::RefreshKeyboards => {
+                        self.profile_runtime.send(ProfileRuntimeCmd::RefreshWooting);
+                    }
+                    TrayAction::SwitchAudioOutput(audio_id) => {
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::SwitchAudioOutput(audio_id));
+                    }
+                    TrayAction::ToggleProfileLock => {
+                        let next = !self.profile_locked_state.load(Ordering::SeqCst);
+                        self.profile_locked_state.store(next, Ordering::SeqCst);
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::SetProfileLock(next));
+                    }
+                    TrayAction::ToggleAutoSwitch => {
+                        let next = !self.auto_switch_state.load(Ordering::SeqCst);
+                        self.auto_switch_state.store(next, Ordering::SeqCst);
+                        self.settings.auto_switch_on_startup = next;
+                        let _ = self
+                            .settings
+                            .save_atomic(&AppPaths::default_user_dir().settings_path());
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::SetAutoSwitch(next));
+                    }
+                    TrayAction::Quit => {
+                        self.quit_requested.store(true, Ordering::SeqCst);
+                        crate::tray::request_native_close(&self.main_hwnd);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                },
                 WorkerMsg::HotkeyTriggered(action) => match action {
                     HotkeyAction::CycleProfile => {
                         self.profile_runtime
@@ -732,6 +1028,7 @@ impl PolledApp {
                         if self.input_lab_ui.is_capturing() {
                             self.input_lab_ui.stop_capture();
                         } else {
+                            self.active_view = ActiveView::InputLab;
                             self.input_lab_ui.start_capture(ctx);
                         }
                     }
@@ -755,6 +1052,7 @@ impl PolledApp {
                             if notify_regressions {
                                 notify_if_regressed(&summary);
                             }
+                            self.sync_scan_to_host(&summary);
                             self.summary = Some(summary);
                         }
                         Err(err) => self.error_message = Some(err),
@@ -769,6 +1067,7 @@ impl PolledApp {
                     self.busy = false;
                     self.busy_label.clear();
                     if let Some(scan) = updated_scan {
+                        self.sync_scan_to_host(&scan);
                         self.summary = Some(scan);
                     }
                     self.status_message = status;
@@ -784,9 +1083,11 @@ impl PolledApp {
                         .store(snap.profile_locked, Ordering::SeqCst);
                     if self.settings.auto_switch_on_startup != snap.auto_switch_enabled {
                         self.settings.auto_switch_on_startup = snap.auto_switch_enabled;
-                        let _ = self
-                            .settings
-                            .save_atomic(&AppPaths::default_user_dir().settings_path());
+                        if !self.is_remote_daemon_mode() {
+                            let _ = self
+                                .settings
+                                .save_atomic(&AppPaths::default_user_dir().settings_path());
+                        }
                     }
                     self.profiles_ui.runtime_snapshot = Some(*snap);
                     self.sync_tray_from_snapshot();
@@ -816,8 +1117,7 @@ impl PolledApp {
                     self.profiles_ui.on_display_test_reverted(msg);
                 }
                 WorkerMsg::ShowOsdPill { title, subtitle } => {
-                    self.osd
-                        .show(title, subtitle, matches!(self.theme, ThemeMode::Dark));
+                    self.show_osd_pill(title, subtitle);
                 }
                 WorkerMsg::WootingActionResult { ok, message } => {
                     self.keyboard_ui.on_action_result(ok, message);
@@ -825,6 +1125,21 @@ impl PolledApp {
                 WorkerMsg::UpdateCheckFinished(res) => {
                     self.update_checking = false;
                     self.update_result = Some(res);
+                }
+                WorkerMsg::DaemonCachedScan(scan) => {
+                    if self.summary.is_none() {
+                        self.summary = Some(scan);
+                    }
+                }
+                WorkerMsg::DaemonFocusWindow => {
+                    crate::tray::show_and_focus(&self.main_hwnd, ctx);
+                }
+                WorkerMsg::DaemonShutdownUi => {
+                    self.quit_requested.store(true, Ordering::SeqCst);
+                    self.input_lab_ui.stop_background_monitors();
+                    self.keyboard_ui.stop_analog_stream();
+                    crate::tray::request_native_close(&self.main_hwnd);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
         }
@@ -834,60 +1149,13 @@ impl PolledApp {
         let Some(snap) = self.profiles_ui.runtime_snapshot.as_ref() else {
             return;
         };
-        let battery_parts: Vec<String> = snap
-            .active_devices
-            .iter()
-            .filter_map(|d| {
-                d.battery
-                    .map(|b| format!("{} {}", d.info.name, b.compact_label()))
-            })
-            .collect();
-        let battery_summary = if battery_parts.is_empty() {
-            None
-        } else {
-            Some(battery_parts.join(", "))
-        };
-        let primary_mouse = snap
-            .active_devices
-            .iter()
-            .find(|d| d.info.support_tier != SupportTier::Simulator)
-            .or_else(|| snap.active_devices.first())
-            .map(|d| TrayMouseState {
-                name: d.info.name.clone(),
-                is_simulator: d.info.support_tier == SupportTier::Simulator,
-                current_dpi: d.settings.as_ref().and_then(|s| s.dpi),
-                current_polling_hz: d.settings.as_ref().and_then(|s| s.polling_rate_hz),
-                dpi_min: d.caps.dpi_min,
-                dpi_max: d.caps.dpi_max,
-                polling_rates_hz: d.caps.polling_rates_hz.clone(),
-                battery: d.battery,
-            });
-        let primary_wooting = snap.keyboards.first().map(|kb| TrayWootingState {
-            device_id: kb.id.clone(),
-            name: kb.name.clone(),
-            active_profile: kb.active_profile,
-            profiles: if kb.capabilities.supports_profile_switch {
-                kb.profiles
-                    .iter()
-                    .map(|slot| (slot.index, slot.name.clone()))
-                    .collect()
-            } else {
-                Vec::new()
-            },
-        });
-        self.tray.update_status(
-            snap.auto_switch_enabled,
-            snap.profile_locked,
-            &snap.active_profile_id,
-            &snap.active_profile_name,
-            &snap.available_profiles,
-            &snap.audio_outputs,
-            primary_mouse.as_ref(),
-            primary_wooting.as_ref(),
-            battery_summary.as_deref(),
-            self.settings.alerts.battery_tray_icon,
-            self.settings.alerts.clamped_threshold(),
-        );
+        if let AppHost::Standalone(host) = &mut self.host {
+            host.tray.sync_from_snapshot(
+                snap,
+                self.settings.alerts.battery_tray_icon,
+                self.settings.alerts.clamped_threshold(),
+            );
+        }
     }
 }
 
@@ -900,14 +1168,16 @@ impl eframe::App for PolledApp {
             }
         }
 
-        // Minimize to system tray instead of exiting when clicking the window [X] button.
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.quit_requested.load(Ordering::SeqCst)
-        {
+        // In daemon-connected mode (`--ui`), closing `[X]` exits the UI child process cleanly
+        // so Windows immediately reclaims 100% of OpenGL/GPU memory while the ~5 MB pure-Win32
+        // tray daemon keeps running. In `--standalone` mode, `[X]` hides the window to tray.
+        if ctx.input(|i| i.viewport().close_requested()) {
             self.input_lab_ui.stop_background_monitors();
             self.keyboard_ui.stop_analog_stream();
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if !self.is_remote_daemon_mode() && !self.quit_requested.load(Ordering::SeqCst) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         }
 
         self.drain_worker_messages(ctx);
@@ -1210,11 +1480,19 @@ impl eframe::App for PolledApp {
 
                     // Bottom utility stack
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.label(
-                            RichText::new("Tray on close · AGPL-3.0")
-                                .size(10.0)
-                                .color(p.text_muted),
+                        let footer_lbl = if self.is_remote_daemon_mode() {
+                            "Tray daemon active · AGPL-3.0"
+                        } else {
+                            "Tray on close · AGPL-3.0"
+                        };
+                        let footer = ui.label(
+                            RichText::new(footer_lbl).size(10.0).color(p.text_muted),
                         );
+                        if self.is_remote_daemon_mode() {
+                            footer.on_hover_text(
+                                "Closing this window frees 100% of GPU memory while Polled's ultra-light tray daemon stays active. Right-click the tray icon -> Quit to exit completely.",
+                            );
+                        }
                         ui.add_space(4.0);
                         if nav_utility_item(ui, p, self.theme.label(), None) {
                             toggle_theme = true;
@@ -2099,6 +2377,7 @@ impl eframe::App for PolledApp {
             self.theme = self.theme.toggle();
             self.theme.apply_to(ctx);
             self.settings.theme = ThemePreference::from(self.theme);
+            self.sync_theme_to_host();
             let _ = self
                 .settings
                 .save_atomic(&AppPaths::default_user_dir().settings_path());
@@ -2215,10 +2494,9 @@ impl eframe::App for PolledApp {
                             "Show monochrome on-screen switch pill (OSD, zero game hooks)",
                         );
                         if ui.add(secondary_button("Test Pill", p)).clicked() {
-                            self.osd.show(
+                            self.show_osd_pill(
                                 "Polled · Profile Switched",
                                 "Counter-Strike 2 · 1600 DPI · 4000 Hz · Wooting P2",
-                                matches!(self.theme, ThemeMode::Dark),
                             );
                         }
                     });
@@ -2470,8 +2748,7 @@ impl eframe::App for PolledApp {
                 let _ = self
                     .settings
                     .save_atomic(&AppPaths::default_user_dir().settings_path());
-                self.hotkey_manager
-                    .update_config(self.settings.hotkeys.clone());
+                self.update_hotkeys(self.settings.hotkeys.clone());
                 self.profile_runtime
                     .send(ProfileRuntimeCmd::UpdateAlertConfig(
                         self.settings.alerts.clone(),
@@ -2633,8 +2910,8 @@ impl eframe::App for PolledApp {
                         self.settings = restored.settings.clone();
                         self.theme = ThemeMode::from(self.settings.theme);
                         self.theme.apply_to(ctx);
-                        self.hotkey_manager
-                            .update_config(self.settings.hotkeys.clone());
+                        self.sync_theme_to_host();
+                        self.update_hotkeys(self.settings.hotkeys.clone());
                         self.profile_runtime
                             .send(ProfileRuntimeCmd::UpdateAlertConfig(
                                 self.settings.alerts.clone(),

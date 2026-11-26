@@ -2,7 +2,7 @@
 
 **A lightweight, open-source Windows 10/11 tray utility for competitive input health checks, per-game mouse & keyboard profiles, and 1K–8K hardware benchmarking.**
 
-Pure Rust (~6 MB, no Electron/WebView2, no account, no telemetry, zero background network calls, and **100% anti-cheat safe** — standard Win32 user-mode APIs only, no kernel drivers or game hooks).
+Pure Rust (~3 MB idle tray RAM with zero GPU/OpenGL memory while minimized, no Electron/WebView2, no account, no telemetry, zero background network calls, and **100% anti-cheat safe** — standard Win32 user-mode APIs only, no kernel drivers or game hooks).
 
 > [!WARNING]
 > **Experimental (`0.x`):** Polled modifies Windows settings and sends USB HID configuration commands to supported peripherals. Every Windows change is snapshotted first for one-click rollback, and unverified (`Implemented from docs`) devices require explicit confirmation before writing. Provided **"AS IS"** under [AGPL-3.0-or-later](LICENSE).
@@ -24,7 +24,7 @@ Polled is split into four clean workspaces:
 
 1. Download `polled-v*-windows-x64.zip` (and `SHA256SUMS.txt`) from [**Releases**](https://github.com/k1jaa/polled/releases).
 2. Extract anywhere (keep `polled-gui.exe` and `polled.exe` in the same folder) and run **`polled-gui.exe`**.
-3. Run a **Health** scan, configure a game in **Profiles** (turn **Auto-Switch: ON**), and close `[X]` to keep Polled running quietly in the system tray.
+3. Run a **Health** scan, configure a game in **Profiles** (turn **Auto-Switch: ON**), and close `[X]` to free all GPU/UI memory while Polled's ~3 MB pure-Win32 tray daemon keeps running quietly in the background.
 
 > **Uninstall:** Click **Undo All** in Health if you want to revert Windows tweaks, turn **Startup** off, right-click the tray icon → **Quit**, and delete the folder. Local data lives in `%LOCALAPPDATA%\Polled\`.
 

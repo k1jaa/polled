@@ -2503,6 +2503,8 @@ dependencies = [
  "eframe",
  "notify-rust",
  "polled-core",
+ "serde",
+ "serde_json",
  "tray-icon",
  "windows 0.61.3",
 ]

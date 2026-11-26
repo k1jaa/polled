@@ -8,10 +8,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use chrono::Local;
-use eframe::egui;
 use polled_core::win::{
     AudioFlow, DisplayModeInfo, DisplayResolutionMode, RegHive, SystemEnv, WindowsEnv,
 };
@@ -24,6 +25,7 @@ use polled_core::{
     SavedAppAudioVolume, Severity, SupportTier, TrayAlertConfig, WootingAnalogBasePatch,
     WootingGlobalSettingsPatch,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::app::WorkerMsg;
 use crate::hotplug::UsbHotplugWatcher;
@@ -42,7 +44,7 @@ const GPU_PREF_SUBKEY: &str = r"Software\Microsoft\DirectX\UserGpuPreferences";
 const PUSH_NOTIF_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\PushNotifications";
 const PUSH_NOTIF_VALUE: &str = "ToastEnabled";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendSelection {
     /// Automatically detects USB hot-plug changes and applies profiles to all connected supported mice.
     AutoConnected,
@@ -51,14 +53,14 @@ pub enum BackendSelection {
     DryRunFlashOnly,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileLogEntry {
     pub timestamp: String,
     pub severity: Severity,
     pub message: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectedDeviceStatus {
     pub info: DeviceInfo,
     pub caps: DeviceCapabilities,
@@ -66,13 +68,13 @@ pub struct ConnectedDeviceStatus {
     pub battery: Option<BatteryStatus>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplayOption {
     pub info: DisplayModeInfo,
     pub modes: Vec<DisplayResolutionMode>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileRuntimeSnapshot {
     pub auto_switch_enabled: bool,
     pub profile_locked: bool,
@@ -103,6 +105,7 @@ pub struct ProfileRuntimeSnapshot {
     pub log: Vec<ProfileLogEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProfileRuntimeCmd {
     SetAutoSwitch(bool),
     SetProfileLock(bool),
@@ -177,9 +180,19 @@ pub enum ProfileRuntimeCmd {
     Shutdown,
 }
 
+enum RuntimeBackend {
+    Local {
+        cmd_tx: Sender<ProfileRuntimeCmd>,
+        hotplug_watcher: Option<UsbHotplugWatcher>,
+        thread_handle: Option<JoinHandle<()>>,
+    },
+    Remote {
+        send_fn: Box<dyn Fn(ProfileRuntimeCmd) + Send + Sync>,
+    },
+}
+
 pub struct ProfileRuntimeHandle {
-    cmd_tx: Sender<ProfileRuntimeCmd>,
-    _hotplug_watcher: UsbHotplugWatcher,
+    backend: RuntimeBackend,
 }
 
 impl ProfileRuntimeHandle {
@@ -188,12 +201,12 @@ impl ProfileRuntimeHandle {
         initial_auto_switch: bool,
         initial_alerts: TrayAlertConfig,
         ui_tx: Sender<WorkerMsg>,
-        ctx: egui::Context,
+        wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let hotplug_watcher = UsbHotplugWatcher::start(cmd_tx.clone());
 
-        std::thread::Builder::new()
+        let thread_handle = std::thread::Builder::new()
             .name("polled-profile-runtime".to_string())
             .spawn(move || {
                 run_runtime_loop(
@@ -202,29 +215,59 @@ impl ProfileRuntimeHandle {
                     initial_alerts,
                     cmd_rx,
                     ui_tx,
-                    ctx,
+                    wake,
                 );
             })
             .expect("failed to spawn profile runtime thread");
 
         Self {
-            cmd_tx,
-            _hotplug_watcher: hotplug_watcher,
+            backend: RuntimeBackend::Local {
+                cmd_tx,
+                hotplug_watcher: Some(hotplug_watcher),
+                thread_handle: Some(thread_handle),
+            },
+        }
+    }
+
+    /// Creates a lightweight proxy handle that forwards commands over local IPC to the
+    /// pure-Win32 background daemon. Dropping this handle does **not** shut down the daemon.
+    pub fn from_remote_callback<F>(send_fn: F) -> Self
+    where
+        F: Fn(ProfileRuntimeCmd) + Send + Sync + 'static,
+    {
+        Self {
+            backend: RuntimeBackend::Remote {
+                send_fn: Box::new(send_fn),
+            },
         }
     }
 
     pub fn send(&self, cmd: ProfileRuntimeCmd) {
-        let _ = self.cmd_tx.send(cmd);
-    }
-
-    pub fn command_sender(&self) -> Sender<ProfileRuntimeCmd> {
-        self.cmd_tx.clone()
+        match &self.backend {
+            RuntimeBackend::Local { cmd_tx, .. } => {
+                let _ = cmd_tx.send(cmd);
+            }
+            RuntimeBackend::Remote { send_fn } => {
+                send_fn(cmd);
+            }
+        }
     }
 }
 
 impl Drop for ProfileRuntimeHandle {
     fn drop(&mut self) {
-        let _ = self.cmd_tx.send(ProfileRuntimeCmd::Shutdown);
+        if let RuntimeBackend::Local {
+            cmd_tx,
+            hotplug_watcher,
+            thread_handle,
+        } = &mut self.backend
+        {
+            let _ = cmd_tx.send(ProfileRuntimeCmd::Shutdown);
+            hotplug_watcher.take();
+            if let Some(handle) = thread_handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -401,9 +444,9 @@ impl RuntimeState {
         }
     }
 
-    fn emit(&self, ui_tx: &Sender<WorkerMsg>, ctx: &egui::Context) {
+    fn emit(&self, ui_tx: &Sender<WorkerMsg>, wake: &Arc<dyn Fn() + Send + Sync>) {
         let _ = ui_tx.send(WorkerMsg::ProfileRuntimeUpdated(Box::new(self.snapshot())));
-        ctx.request_repaint();
+        wake();
     }
 
     fn start_watcher(&mut self) {
@@ -1772,7 +1815,7 @@ fn run_runtime_loop(
     initial_alerts: TrayAlertConfig,
     cmd_rx: Receiver<ProfileRuntimeCmd>,
     ui_tx: Sender<WorkerMsg>,
-    ctx: egui::Context,
+    wake: Arc<dyn Fn() + Send + Sync>,
 ) {
     let debounce = Duration::from_millis(initial_store.debounce_ms);
     let desktop_name = initial_store
@@ -1825,7 +1868,7 @@ fn run_runtime_loop(
     if initial_auto_switch {
         state.start_watcher();
     }
-    state.emit(&ui_tx, &ctx);
+    state.emit(&ui_tx, &wake);
 
     loop {
         let mut changed = state.check_hotplug();
@@ -1968,7 +2011,7 @@ fn run_runtime_loop(
         }
 
         if changed {
-            state.emit(&ui_tx, &ctx);
+            state.emit(&ui_tx, &wake);
         }
 
         let mut wait = if !state.auto_switch_enabled {
@@ -2015,7 +2058,7 @@ fn run_runtime_loop(
                 if let Some((title, subtitle)) = osd {
                     let _ = ui_tx.send(WorkerMsg::ShowOsdPill { title, subtitle });
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::QuickSetMousePolling(hz)) => {
                 let desired = MouseSettings {
@@ -2029,7 +2072,7 @@ fn run_runtime_loop(
                         subtitle: format!("Polling Rate -> {hz} Hz"),
                     });
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::QuickSetMouseDpi(dpi)) => {
                 let desired = MouseSettings {
@@ -2043,11 +2086,11 @@ fn run_runtime_loop(
                         subtitle: format!("DPI -> {dpi}"),
                     });
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::RefreshMouseAndBattery) => {
                 state.force_refresh_mouse_and_battery();
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::RefreshWooting) => {
                 state.refresh_keyboards();
@@ -2066,7 +2109,7 @@ fn run_runtime_loop(
                     ok: count > 0,
                     message: msg,
                 });
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::CycleWootingProfile) => {
                 match detect_all_keyboards() {
@@ -2132,7 +2175,7 @@ fn run_runtime_loop(
                         );
                     }
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::SwitchWootingProfile { device_id, slot }) => {
                 match detect_all_keyboards() {
@@ -2213,7 +2256,7 @@ fn run_runtime_loop(
                         });
                     }
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::WriteWootingAnalogBase { device_id, patch }) => {
                 match detect_wooting_keyboards() {
@@ -2273,7 +2316,7 @@ fn run_runtime_loop(
                         });
                     }
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::WriteWootingPerKeyActuation { device_id, updates }) => {
                 match detect_wooting_keyboards() {
@@ -2337,7 +2380,7 @@ fn run_runtime_loop(
                         });
                     }
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::WriteWootingGlobalSettings { device_id, patch }) => {
                 match detect_wooting_keyboards() {
@@ -2394,7 +2437,7 @@ fn run_runtime_loop(
                         });
                     }
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::SetKeyboardPollingRate { device_id, hz }) => {
                 run_generic_keyboard_action(&mut state, &ui_tx, device_id.as_deref(), |kb| {
@@ -2404,7 +2447,7 @@ fn run_runtime_loop(
                         kb.name()
                     ))
                 });
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::SetKeyboardBaseActuation {
                 device_id,
@@ -2420,7 +2463,7 @@ fn run_runtime_loop(
                         actuation_mm
                     ))
                 });
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::SetKeyboardRapidTrigger { device_id, enabled }) => {
                 run_generic_keyboard_action(&mut state, &ui_tx, device_id.as_deref(), |kb| {
@@ -2431,7 +2474,7 @@ fn run_runtime_loop(
                         if confirmed { "ON" } else { "OFF" }
                     ))
                 });
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::SetKeyboardSystemMode {
                 device_id,
@@ -2444,7 +2487,7 @@ fn run_runtime_loop(
                         kb.name()
                     ))
                 });
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::SetKeyboardSocd { device_id, enabled }) => {
                 run_generic_keyboard_action(&mut state, &ui_tx, device_id.as_deref(), |kb| {
@@ -2455,7 +2498,7 @@ fn run_runtime_loop(
                         if confirmed { "ON" } else { "OFF" }
                     ))
                 });
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::SetKeyboardDebounce {
                 device_id,
@@ -2470,7 +2513,7 @@ fn run_runtime_loop(
                         if typing_mode { "Typing" } else { "Gaming" }
                     ))
                 });
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::ReadFromMouseForEditor(dev_id)) => {
                 let (device_name, settings, error) =
@@ -2480,7 +2523,7 @@ fn run_runtime_loop(
                     settings,
                     error,
                 });
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::SetAutoSwitch(enabled)) => {
                 state.auto_switch_enabled = enabled;
@@ -2491,7 +2534,7 @@ fn run_runtime_loop(
                     state.pending_retry = None;
                     state.push_log(Severity::Info, "Paused automatic per-game switching.");
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::SetProfileLock(locked)) => {
                 state.profile_locked = locked;
@@ -2510,7 +2553,7 @@ fn run_runtime_loop(
                         "Unlocked active profile (auto-switch resumed).".to_string(),
                     );
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::CycleNextProfile) => {
                 if !state.store.profiles.is_empty() {
@@ -2527,12 +2570,12 @@ fn run_runtime_loop(
                     {
                         let _ = ui_tx.send(WorkerMsg::ShowOsdPill { title, subtitle });
                     }
-                    state.emit(&ui_tx, &ctx);
+                    state.emit(&ui_tx, &wake);
                 }
             }
             Ok(ProfileRuntimeCmd::SwitchAudioOutput(endpoint_id)) => {
                 state.switch_audio_output(&endpoint_id, "tray switch");
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::CycleAudioOutput) => {
                 state.refresh_audio_devices();
@@ -2551,15 +2594,15 @@ fn run_runtime_loop(
                         "Audio output cycle skipped: fewer than 2 active playback devices.",
                     );
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::RefreshAudioDevices) => {
                 state.refresh_audio_devices();
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::RefreshDisplays) => {
                 state.refresh_displays();
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::TestDisplayMode {
                 device_name,
@@ -2575,7 +2618,7 @@ fn run_runtime_loop(
                     previous_label,
                     error,
                 });
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::KeepTestDisplayMode) => {
                 if let Some((dev, w, h, hz, _)) = state.pending_display_test_revert.take() {
@@ -2589,13 +2632,13 @@ fn run_runtime_loop(
                         ),
                     );
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::RevertTestDisplayMode) => {
                 if let Some(msg) = state.revert_test_display_if_pending("user/countdown") {
                     let _ = ui_tx.send(WorkerMsg::DisplayTestReverted(msg));
                 }
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::UpdateStore(new_store)) => {
                 state
@@ -2604,16 +2647,16 @@ fn run_runtime_loop(
                 let _ = new_store.save_atomic(&AppPaths::default_user_dir().profiles_path());
                 state.store = new_store;
                 state.push_log(Severity::Info, "Saved updated profiles.json.");
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::SelectBackend(sel)) => {
                 state.rebuild_controllers(sel, "manual selection");
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::RedetectHardware) => {
                 let sel = state.selection.clone();
                 state.rebuild_controllers(sel, "manual redetect");
-                state.emit(&ui_tx, &ctx);
+                state.emit(&ui_tx, &wake);
             }
             Ok(ProfileRuntimeCmd::ApplyProfileNow(profile_id)) => {
                 if let Some(profile) = state
@@ -2626,7 +2669,7 @@ fn run_runtime_loop(
                     if let Some((title, subtitle)) = state.apply_profile(&profile, "manual test") {
                         let _ = ui_tx.send(WorkerMsg::ShowOsdPill { title, subtitle });
                     }
-                    state.emit(&ui_tx, &ctx);
+                    state.emit(&ui_tx, &wake);
                 }
             }
         }

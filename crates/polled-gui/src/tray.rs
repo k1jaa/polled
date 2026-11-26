@@ -2,21 +2,16 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use eframe::egui;
-use polled_core::win::WindowsEnv;
-use polled_core::{AppPaths, AppSettings, BatteryStatus, HealthEngine};
+use polled_core::{BatteryStatus, SupportTier};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use crate::app::WorkerMsg;
 use crate::icon::{tray_battery_icon_image, tray_icon_image};
-use crate::notifications::notify_if_regressed;
-use crate::profile_runtime::ProfileRuntimeCmd;
+use crate::profile_runtime::ProfileRuntimeSnapshot;
 
 const ID_STATUS: &str = "status_info";
 const ID_OPEN: &str = "open";
@@ -32,7 +27,24 @@ const ID_WOOTING_REFRESH: &str = "wooting_refresh";
 const ID_AUDIO_PREFIX: &str = "audio::";
 const ID_QUIT: &str = "quit";
 
-/// Snapshot of the primary connected Wooting keyboard for the tray quick-switch submenu.
+/// High-level action emitted by the native Windows system tray icon or its context menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrayAction {
+    Open,
+    ScanNow,
+    ApplyProfile(String),
+    QuickSetMousePolling(u16),
+    QuickSetMouseDpi(u16),
+    RefreshMouseAndBattery,
+    SwitchKeyboardProfile(u8),
+    RefreshKeyboards,
+    SwitchAudioOutput(String),
+    ToggleProfileLock,
+    ToggleAutoSwitch,
+    Quit,
+}
+
+/// Snapshot of the primary connected keyboard for the tray quick-switch submenu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayWootingState {
     pub device_id: String,
@@ -53,6 +65,44 @@ pub struct TrayMouseState {
     pub dpi_max: u16,
     pub polling_rates_hz: Vec<u16>,
     pub battery: Option<BatteryStatus>,
+}
+
+/// Parses a `tray_icon::menu::MenuEvent` ID string into a typed `TrayAction`.
+pub fn parse_menu_action(id_str: &str) -> Option<TrayAction> {
+    if let Some(prof_id) = id_str.strip_prefix(ID_PROFILE_PREFIX) {
+        return Some(TrayAction::ApplyProfile(prof_id.to_string()));
+    }
+    if let Some(hz_str) = id_str.strip_prefix(ID_MOUSE_POLL_PREFIX) {
+        return hz_str
+            .parse::<u16>()
+            .ok()
+            .map(TrayAction::QuickSetMousePolling);
+    }
+    if let Some(dpi_str) = id_str.strip_prefix(ID_MOUSE_DPI_PREFIX) {
+        return dpi_str
+            .parse::<u16>()
+            .ok()
+            .map(TrayAction::QuickSetMouseDpi);
+    }
+    if let Some(slot_str) = id_str.strip_prefix(ID_WOOTING_PREFIX) {
+        return slot_str
+            .parse::<u8>()
+            .ok()
+            .map(TrayAction::SwitchKeyboardProfile);
+    }
+    if let Some(audio_id) = id_str.strip_prefix(ID_AUDIO_PREFIX) {
+        return Some(TrayAction::SwitchAudioOutput(audio_id.to_string()));
+    }
+    match id_str {
+        ID_OPEN => Some(TrayAction::Open),
+        ID_SCAN => Some(TrayAction::ScanNow),
+        ID_MOUSE_REFRESH => Some(TrayAction::RefreshMouseAndBattery),
+        ID_WOOTING_REFRESH => Some(TrayAction::RefreshKeyboards),
+        ID_LOCK_PROFILE => Some(TrayAction::ToggleProfileLock),
+        ID_AUTO_SWITCH => Some(TrayAction::ToggleAutoSwitch),
+        ID_QUIT => Some(TrayAction::Quit),
+        _ => None,
+    }
 }
 
 /// Finds Polled's own top-level `HWND` on the current Win32 UI thread (including when hidden).
@@ -116,7 +166,8 @@ pub(crate) fn find_own_main_hwnd() -> isize {
     0
 }
 
-/// Holds the active Windows system tray icon and dynamic menu items alive for the lifetime of the app.
+/// Holds the active Windows system tray icon and dynamic menu items alive for the lifetime of
+/// the daemon (or standalone app). Uses native Win32 event callbacks with zero polling threads.
 pub struct TrayController {
     tray: Option<TrayIcon>,
     status_item: MenuItem,
@@ -142,18 +193,13 @@ pub struct TrayController {
 }
 
 impl TrayController {
-    /// Creates the system tray icon (must be called on the main Win32 UI thread) and
-    /// starts a tiny listener thread that wakes the `egui` window on tray interactions.
-    pub fn init(
-        ctx: egui::Context,
-        tx: Sender<WorkerMsg>,
-        profile_cmd_tx: Sender<ProfileRuntimeCmd>,
-        main_hwnd: Arc<AtomicIsize>,
-        auto_switch_state: Arc<AtomicBool>,
-        profile_locked_state: Arc<AtomicBool>,
-        quit_requested: Arc<AtomicBool>,
+    /// Creates the system tray icon (must be called on a thread pumping Win32 messages) and
+    /// registers event-driven callbacks (`TrayIconEvent::set_event_handler` / `MenuEvent::set_event_handler`)
+    /// so tray clicks wake the host immediately with 0% idle CPU and zero polling threads.
+    pub fn new(
+        initial_auto_switch: bool,
+        on_action: Arc<dyn Fn(TrayAction) + Send + Sync>,
     ) -> Self {
-        let initial_auto_switch = auto_switch_state.load(Ordering::SeqCst);
         let menu = Menu::new();
         let status_item = MenuItem::with_id(ID_STATUS, "Polled · Initializing...", false, None);
         let sep_status = PredefinedMenuItem::separator();
@@ -207,134 +253,24 @@ impl TrayController {
         let tray = builder.build().ok();
 
         if tray.is_some() {
-            std::thread::spawn(move || {
-                let tray_rx = TrayIconEvent::receiver();
-                let menu_rx = MenuEvent::receiver();
-
-                loop {
-                    if quit_requested.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    while let Ok(event) = tray_rx.try_recv() {
-                        if let TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        } = event
-                        {
-                            show_and_focus(&main_hwnd, &ctx);
-                        }
-                    }
-
-                    while let Ok(event) = menu_rx.try_recv() {
-                        let id_str = event.id.0.as_str();
-                        if let Some(prof_id) = id_str.strip_prefix(ID_PROFILE_PREFIX) {
-                            let _ = profile_cmd_tx
-                                .send(ProfileRuntimeCmd::ApplyProfileNow(prof_id.to_string()));
-                            ctx.request_repaint();
-                            continue;
-                        }
-                        if let Some(hz_str) = id_str.strip_prefix(ID_MOUSE_POLL_PREFIX) {
-                            if let Ok(hz) = hz_str.parse::<u16>() {
-                                let _ = profile_cmd_tx
-                                    .send(ProfileRuntimeCmd::QuickSetMousePolling(hz));
-                                ctx.request_repaint();
-                            }
-                            continue;
-                        }
-                        if let Some(dpi_str) = id_str.strip_prefix(ID_MOUSE_DPI_PREFIX) {
-                            if let Ok(dpi) = dpi_str.parse::<u16>() {
-                                let _ =
-                                    profile_cmd_tx.send(ProfileRuntimeCmd::QuickSetMouseDpi(dpi));
-                                ctx.request_repaint();
-                            }
-                            continue;
-                        }
-                        if let Some(slot_str) = id_str.strip_prefix(ID_WOOTING_PREFIX) {
-                            if let Ok(slot) = slot_str.parse::<u8>() {
-                                let _ =
-                                    profile_cmd_tx.send(ProfileRuntimeCmd::SwitchWootingProfile {
-                                        device_id: None,
-                                        slot,
-                                    });
-                                ctx.request_repaint();
-                            }
-                            continue;
-                        }
-                        if let Some(audio_id) = id_str.strip_prefix(ID_AUDIO_PREFIX) {
-                            let _ = profile_cmd_tx
-                                .send(ProfileRuntimeCmd::SwitchAudioOutput(audio_id.to_string()));
-                            ctx.request_repaint();
-                            continue;
-                        }
-                        match id_str {
-                            ID_OPEN => show_and_focus(&main_hwnd, &ctx),
-                            ID_MOUSE_REFRESH => {
-                                let _ =
-                                    profile_cmd_tx.send(ProfileRuntimeCmd::RefreshMouseAndBattery);
-                                ctx.request_repaint();
-                            }
-                            ID_WOOTING_REFRESH => {
-                                let _ = profile_cmd_tx.send(ProfileRuntimeCmd::RefreshWooting);
-                                ctx.request_repaint();
-                            }
-                            ID_SCAN => {
-                                // Run directly on a background thread so tray scans work even
-                                // while the main window is hidden in the tray.
-                                let tx_scan = tx.clone();
-                                let ctx_scan = ctx.clone();
-                                std::thread::spawn(move || {
-                                    let paths = AppPaths::default_user_dir();
-                                    let engine =
-                                        HealthEngine::with_default_and_custom_checks(&paths);
-                                    let result = engine
-                                        .scan_all(&WindowsEnv, &paths, true)
-                                        .map_err(|e| e.to_string());
-                                    if let Ok(summary) = &result {
-                                        notify_if_regressed(summary);
-                                    }
-                                    let _ = tx_scan.send(WorkerMsg::ScanFinished {
-                                        result,
-                                        notify_regressions: false,
-                                    });
-                                    ctx_scan.request_repaint();
-                                });
-                            }
-                            ID_LOCK_PROFILE => {
-                                let next = !profile_locked_state.load(Ordering::SeqCst);
-                                profile_locked_state.store(next, Ordering::SeqCst);
-                                let _ =
-                                    profile_cmd_tx.send(ProfileRuntimeCmd::SetProfileLock(next));
-                                ctx.request_repaint();
-                            }
-                            ID_AUTO_SWITCH => {
-                                // Toggle runtime directly so it works even while window is hidden.
-                                let next = !auto_switch_state.load(Ordering::SeqCst);
-                                auto_switch_state.store(next, Ordering::SeqCst);
-                                let paths = AppPaths::default_user_dir();
-                                let mut saved =
-                                    AppSettings::load_or_default(&paths.settings_path());
-                                saved.auto_switch_on_startup = next;
-                                let _ = saved.save_atomic(&paths.settings_path());
-                                let _ = profile_cmd_tx.send(ProfileRuntimeCmd::SetAutoSwitch(next));
-                                let _ = tx.send(WorkerMsg::TraySyncAutoSwitch(next));
-                                ctx.request_repaint();
-                            }
-                            ID_QUIT => {
-                                quit_requested.store(true, Ordering::SeqCst);
-                                request_native_close(&main_hwnd);
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                ctx.request_repaint();
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    std::thread::sleep(Duration::from_millis(50));
+            let on_click = Arc::clone(&on_action);
+            TrayIconEvent::set_event_handler(Some(move |event| {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    on_click(TrayAction::Open);
                 }
-            });
+            }));
+
+            let on_menu = on_action;
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                if let Some(action) = parse_menu_action(event.id.0.as_str()) {
+                    on_menu(action);
+                }
+            }));
         }
 
         Self {
@@ -358,6 +294,69 @@ impl TrayController {
             lock_profile_item,
             last_icon_key: Some(None),
         }
+    }
+
+    /// Convenience adapter that maps a `ProfileRuntimeSnapshot` directly into `update_status`.
+    pub fn sync_from_snapshot(
+        &mut self,
+        snap: &ProfileRuntimeSnapshot,
+        show_battery_icon: bool,
+        low_battery_threshold: u8,
+    ) {
+        let battery_parts: Vec<String> = snap
+            .active_devices
+            .iter()
+            .filter_map(|d| {
+                d.battery
+                    .map(|b| format!("{} {}", d.info.name, b.compact_label()))
+            })
+            .collect();
+        let battery_summary = if battery_parts.is_empty() {
+            None
+        } else {
+            Some(battery_parts.join(", "))
+        };
+        let primary_mouse = snap
+            .active_devices
+            .iter()
+            .find(|d| d.info.support_tier != SupportTier::Simulator)
+            .or_else(|| snap.active_devices.first())
+            .map(|d| TrayMouseState {
+                name: d.info.name.clone(),
+                is_simulator: d.info.support_tier == SupportTier::Simulator,
+                current_dpi: d.settings.as_ref().and_then(|s| s.dpi),
+                current_polling_hz: d.settings.as_ref().and_then(|s| s.polling_rate_hz),
+                dpi_min: d.caps.dpi_min,
+                dpi_max: d.caps.dpi_max,
+                polling_rates_hz: d.caps.polling_rates_hz.clone(),
+                battery: d.battery,
+            });
+        let primary_wooting = snap.keyboards.first().map(|kb| TrayWootingState {
+            device_id: kb.id.clone(),
+            name: kb.name.clone(),
+            active_profile: kb.active_profile,
+            profiles: if kb.capabilities.supports_profile_switch {
+                kb.profiles
+                    .iter()
+                    .map(|slot| (slot.index, slot.name.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        });
+        self.update_status(
+            snap.auto_switch_enabled,
+            snap.profile_locked,
+            &snap.active_profile_id,
+            &snap.active_profile_name,
+            &snap.available_profiles,
+            &snap.audio_outputs,
+            primary_mouse.as_ref(),
+            primary_wooting.as_ref(),
+            battery_summary.as_deref(),
+            show_battery_icon,
+            low_battery_threshold,
+        );
     }
 
     /// Synchronizes the tray menu status header, profile / mouse / audio submenus, dynamic
@@ -528,7 +527,7 @@ impl TrayController {
             self.last_mouse_key = Some(next_mouse_key);
         }
 
-        // 3b. Wooting Keyboard quick-switch submenu (real onboard slot names, RAM-only).
+        // 3b. Keyboard quick-switch submenu (real onboard slot names).
         let next_wooting_key = primary_wooting.cloned();
         if self.last_wooting_key.as_ref() != Some(&next_wooting_key) {
             for old in self.wooting_menu_items.drain(..) {
@@ -680,7 +679,7 @@ pub(crate) fn show_and_focus(main_hwnd: &AtomicIsize, ctx: &egui::Context) {
 }
 
 #[cfg(windows)]
-fn request_native_close(main_hwnd: &AtomicIsize) {
+pub(crate) fn request_native_close(main_hwnd: &AtomicIsize) {
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
@@ -695,4 +694,4 @@ fn request_native_close(main_hwnd: &AtomicIsize) {
 }
 
 #[cfg(not(windows))]
-fn request_native_close(_main_hwnd: &AtomicIsize) {}
+pub(crate) fn request_native_close(_main_hwnd: &AtomicIsize) {}

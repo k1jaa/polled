@@ -12,12 +12,12 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use eframe::egui;
 use polled_core::HotkeyConfig;
+use serde::{Deserialize, Serialize};
 
 use crate::app::WorkerMsg;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HotkeyAction {
     CycleProfile,
     ToggleProfileLock,
@@ -46,7 +46,11 @@ pub struct HotkeyManager {
 }
 
 impl HotkeyManager {
-    pub fn start(initial: HotkeyConfig, ui_tx: Sender<WorkerMsg>, ctx: egui::Context) -> Self {
+    pub fn start(
+        initial: HotkeyConfig,
+        ui_tx: Sender<WorkerMsg>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
         let config = Arc::new(Mutex::new(initial));
         let msg_hwnd = Arc::new(AtomicIsize::new(0));
 
@@ -57,10 +61,10 @@ impl HotkeyManager {
             .name("polled-hotkeys".to_string())
             .spawn(move || {
                 #[cfg(windows)]
-                run_win32_hotkey_loop(cfg_bg, hwnd_bg, ui_tx, ctx);
+                run_win32_hotkey_loop(cfg_bg, hwnd_bg, ui_tx, wake);
                 #[cfg(not(windows))]
                 {
-                    let _ = (cfg_bg, hwnd_bg, ui_tx, ctx);
+                    let _ = (cfg_bg, hwnd_bg, ui_tx, wake);
                 }
             })
             .ok();
@@ -120,7 +124,7 @@ fn run_win32_hotkey_loop(
     config: Arc<Mutex<HotkeyConfig>>,
     msg_hwnd: Arc<AtomicIsize>,
     ui_tx: Sender<WorkerMsg>,
-    ctx: egui::Context,
+    wake: Arc<dyn Fn() + Send + Sync>,
 ) {
     use std::cell::RefCell;
     use std::ffi::OsStr;
@@ -141,7 +145,7 @@ fn run_win32_hotkey_loop(
     struct LoopState {
         config: Arc<Mutex<HotkeyConfig>>,
         ui_tx: Sender<WorkerMsg>,
-        ctx: egui::Context,
+        wake: Arc<dyn Fn() + Send + Sync>,
     }
 
     thread_local! {
@@ -200,7 +204,7 @@ fn run_win32_hotkey_loop(
                     HK_STATE.with(|cell| {
                         if let Some(st) = cell.borrow().as_ref() {
                             let _ = st.ui_tx.send(WorkerMsg::HotkeyTriggered(act));
-                            st.ctx.request_repaint();
+                            (st.wake)();
                         }
                     });
                 }
@@ -222,6 +226,7 @@ fn run_win32_hotkey_loop(
                     let _ = UnregisterHotKey(Some(hwnd), HK_ID_LOCK);
                     let _ = UnregisterHotKey(Some(hwnd), HK_ID_LAB);
                     let _ = UnregisterHotKey(Some(hwnd), HK_ID_AUDIO);
+                    let _ = UnregisterHotKey(Some(hwnd), HK_ID_WOOTING);
                     let _ = DestroyWindow(hwnd);
                 }
                 LRESULT(0)
@@ -290,7 +295,11 @@ fn run_win32_hotkey_loop(
     }
 
     HK_STATE.with(|cell| {
-        *cell.borrow_mut() = Some(LoopState { config, ui_tx, ctx });
+        *cell.borrow_mut() = Some(LoopState {
+            config,
+            ui_tx,
+            wake,
+        });
     });
     msg_hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
 

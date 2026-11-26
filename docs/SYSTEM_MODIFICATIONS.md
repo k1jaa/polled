@@ -129,6 +129,10 @@ All persistent files created by Polled live under **`%LOCALAPPDATA%\Polled\`**:
   - Data: `"<path-to>\polled-gui.exe" --minimized`
 - Turning **Startup: ON → OFF** deletes the `Polled` value cleanly. No scheduled tasks or Windows services are ever created.
 
+### 3.1 Process Architecture & Local-Only IPC
+- **Pure-Win32 Background Tray Daemon (`polled-gui.exe` / `--minimized`):** Runs a native Win32 message loop (`GetMessageW`, zero idle polling threads, zero OpenGL/GPU driver initialization) hosting the system tray icon, `ProfileRuntimeHandle` (foreground window watcher, multi-mouse, multi-brand keyboards, audio/mic lock/app ducking, temporary display overrides, USB hot-plug), Win32 `RegisterHotKey`, pure-Win32 OSD switch pill, and single-instance mutex (`Local\PolledGuiSingleInstance` + `Local\PolledGuiShowEvent`).
+- **On-Demand GUI Window (`polled-gui.exe --ui --ipc-pid <daemon_pid>`):** Spawned only when the user opens Polled from the tray or Start Menu, and communicates strictly with its parent daemon over two local-only Win32 Named Pipes (`\\.\pipe\PolledIpcC2S_<pid>` and `\\.\pipe\PolledIpcS2C_<pid>`, created with `PIPE_REJECT_REMOTE_CLIENTS` — zero network sockets). Clicking `[X]` exits the UI child process immediately so Windows reclaims 100% of OpenGL driver memory (`nvoglv64.dll` / AMD ICD) and VRAM while the ~3 MB daemon stays active in the tray. A `--standalone` flag remains available for single-process debugging.
+
 ---
 
 ## 4. Per-Game Mouse Profiles & USB HID Writes
