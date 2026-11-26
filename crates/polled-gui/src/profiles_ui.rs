@@ -17,8 +17,8 @@ use polled_core::win::{SystemEnv, WindowsEnv};
 use polled_core::{
     discover_installed_games, discover_running_apps, dump_hid_devices, export_profile_json,
     format_unsupported_mouse_issue, import_profile_json, AppPaths, DeviceCapabilities,
-    DiscoveredGame, GameProfile, LiftOffDistance, MouseSettings, PowerPlanPreset, ProfileStore,
-    Severity, SupportTier, WootingKeyboardInfo,
+    DiscoveredGame, GameProfile, GameSource, KeyboardProfileSettings, LiftOffDistance,
+    MouseSettings, PowerPlanPreset, ProfileStore, Severity, SupportTier, WootingKeyboardInfo,
 };
 
 use crate::profile_runtime::{
@@ -56,6 +56,13 @@ enum GamePickerTab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GamePickerMode {
+    #[default]
+    AddExeToCurrent,
+    CreateProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ProfileEditorTab {
     #[default]
     Mouse,
@@ -75,7 +82,9 @@ pub struct ProfilesUiState {
     pub import_modal_open: bool,
     pub import_text: String,
     game_picker_open: bool,
+    game_picker_mode: GamePickerMode,
     game_picker_tab: GamePickerTab,
+    game_picker_source_filter: Option<GameSource>,
     game_picker_search: String,
     discovered_installed: Vec<DiscoveredGame>,
     discovered_running: Vec<DiscoveredGame>,
@@ -125,6 +134,19 @@ pub struct ProfileDraft {
     pub display_height: u32,
     pub display_refresh_hz: u32,
     pub wooting_profile: Option<u8>,
+    pub set_kb_polling: bool,
+    pub kb_polling_rate_hz: u16,
+    pub set_kb_actuation: bool,
+    pub kb_actuation_mm: f32,
+    pub set_kb_rt_toggle: bool,
+    pub kb_rt_enabled: bool,
+    pub set_kb_rt_mm: bool,
+    pub kb_rt_mm: f32,
+    pub set_kb_socd: bool,
+    pub kb_socd_enabled: bool,
+    pub set_kb_debounce: bool,
+    pub kb_debounce_typing: bool,
+    pub kb_debounce_ms: u8,
     pub force_high_perf_gpu: bool,
     pub quiet_notifications: bool,
     pub duck_audio_apps_csv: String,
@@ -185,6 +207,65 @@ impl ProfileDraft {
             display_height: p.display_height.unwrap_or(1080),
             display_refresh_hz: p.display_refresh_hz.unwrap_or(240),
             wooting_profile: p.wooting_profile,
+            set_kb_polling: p
+                .keyboard_preset
+                .as_ref()
+                .is_some_and(|k| k.polling_rate_hz.is_some()),
+            kb_polling_rate_hz: p
+                .keyboard_preset
+                .as_ref()
+                .and_then(|k| k.polling_rate_hz)
+                .unwrap_or(1000),
+            set_kb_actuation: p
+                .keyboard_preset
+                .as_ref()
+                .is_some_and(|k| k.actuation_hundredths_mm.is_some()),
+            kb_actuation_mm: p
+                .keyboard_preset
+                .as_ref()
+                .and_then(KeyboardProfileSettings::actuation_mm)
+                .unwrap_or(0.40),
+            set_kb_rt_toggle: p
+                .keyboard_preset
+                .as_ref()
+                .is_some_and(|k| k.rapid_trigger_enabled.is_some()),
+            kb_rt_enabled: p
+                .keyboard_preset
+                .as_ref()
+                .and_then(|k| k.rapid_trigger_enabled)
+                .unwrap_or(true),
+            set_kb_rt_mm: p
+                .keyboard_preset
+                .as_ref()
+                .is_some_and(|k| k.rapid_trigger_hundredths_mm.is_some()),
+            kb_rt_mm: p
+                .keyboard_preset
+                .as_ref()
+                .and_then(KeyboardProfileSettings::rapid_trigger_mm)
+                .unwrap_or(0.15),
+            set_kb_socd: p
+                .keyboard_preset
+                .as_ref()
+                .is_some_and(|k| k.socd_enabled.is_some()),
+            kb_socd_enabled: p
+                .keyboard_preset
+                .as_ref()
+                .and_then(|k| k.socd_enabled)
+                .unwrap_or(false),
+            set_kb_debounce: p
+                .keyboard_preset
+                .as_ref()
+                .is_some_and(|k| k.debounce_typing_mode.is_some() || k.debounce_ms.is_some()),
+            kb_debounce_typing: p
+                .keyboard_preset
+                .as_ref()
+                .and_then(|k| k.debounce_typing_mode)
+                .unwrap_or(false),
+            kb_debounce_ms: p
+                .keyboard_preset
+                .as_ref()
+                .and_then(|k| k.debounce_ms)
+                .unwrap_or(10),
             force_high_perf_gpu: p.force_high_perf_gpu,
             quiet_notifications: p.quiet_notifications,
             duck_audio_apps_csv: p.duck_audio_apps.join(", "),
@@ -350,6 +431,22 @@ impl ProfileDraft {
             display_height: copy.set_display_mode.then_some(copy.display_height),
             display_refresh_hz: copy.set_display_mode.then_some(copy.display_refresh_hz),
             wooting_profile: copy.wooting_profile,
+            keyboard_preset: KeyboardProfileSettings {
+                polling_rate_hz: copy.set_kb_polling.then_some(copy.kb_polling_rate_hz),
+                actuation_hundredths_mm: copy
+                    .set_kb_actuation
+                    .then_some((copy.kb_actuation_mm.clamp(0.10, 4.00) * 100.0).round() as u16),
+                rapid_trigger_enabled: copy.set_kb_rt_toggle.then_some(copy.kb_rt_enabled),
+                rapid_trigger_hundredths_mm: copy
+                    .set_kb_rt_mm
+                    .then_some((copy.kb_rt_mm.clamp(0.10, 2.50) * 100.0).round() as u16),
+                socd_enabled: copy.set_kb_socd.then_some(copy.kb_socd_enabled),
+                debounce_typing_mode: copy.set_kb_debounce.then_some(copy.kb_debounce_typing),
+                debounce_ms: copy
+                    .set_kb_debounce
+                    .then_some(copy.kb_debounce_ms.clamp(5, 40)),
+            }
+            .sanitized(),
             force_high_perf_gpu: !copy.is_desktop_default && copy.force_high_perf_gpu,
             quiet_notifications: copy.quiet_notifications,
             duck_audio_apps: copy
@@ -387,7 +484,9 @@ impl ProfilesUiState {
             import_modal_open: false,
             import_text: String::new(),
             game_picker_open: false,
+            game_picker_mode: GamePickerMode::AddExeToCurrent,
             game_picker_tab: GamePickerTab::Installed,
+            game_picker_source_filter: None,
             game_picker_search: String::new(),
             discovered_installed: Vec::new(),
             discovered_running: Vec::new(),
@@ -764,13 +863,19 @@ impl ProfilesUiState {
             }
         }
 
-        // --- SMART GAME PICKER MODAL ---
+        // --- SMART GAME PICKER MODAL (1-CLICK CREATE PROFILE OR ADD EXE) ---
         if self.game_picker_open {
             let mut close_picker = false;
             let mut refresh_picker = false;
-            let mut added_exe: Option<(String, String)> = None;
-            let picker_w = (ctx.screen_rect().width() - 48.0).clamp(360.0, 560.0);
-            egui::Window::new("Smart Game Picker (Installed & Running)")
+            let mut picked_game: Option<(String, String)> = None;
+            let is_create_mode = self.game_picker_mode == GamePickerMode::CreateProfile;
+            let modal_title = if is_create_mode {
+                "New Profile from Installed Game / App"
+            } else {
+                "Smart Game Picker (Installed & Running)"
+            };
+            let picker_w = (ctx.screen_rect().width() - 48.0).clamp(380.0, 580.0);
+            egui::Window::new(modal_title)
                 .collapsible(false)
                 .resizable(true)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -809,11 +914,54 @@ impl ProfilesUiState {
                             }
                         });
                     });
+
+                    if self.game_picker_tab == GamePickerTab::Installed
+                        && !self.discovered_installed.is_empty()
+                    {
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let all_btn = if self.game_picker_source_filter.is_none() {
+                                primary_btn("All Stores", p)
+                            } else {
+                                secondary_btn("All Stores", p)
+                            };
+                            if ui.add(all_btn).clicked() {
+                                self.game_picker_source_filter = None;
+                            }
+                            for src in [
+                                GameSource::Steam,
+                                GameSource::Riot,
+                                GameSource::Epic,
+                                GameSource::BattleNet,
+                                GameSource::Ubisoft,
+                                GameSource::EaApp,
+                            ] {
+                                let count = self
+                                    .discovered_installed
+                                    .iter()
+                                    .filter(|g| g.source == src)
+                                    .count();
+                                if count == 0 {
+                                    continue;
+                                }
+                                let lbl = format!("{} ({count})", src.label());
+                                let btn = if self.game_picker_source_filter == Some(src) {
+                                    primary_btn(&lbl, p)
+                                } else {
+                                    secondary_btn(&lbl, p)
+                                };
+                                if ui.add(btn).clicked() {
+                                    self.game_picker_source_filter = Some(src);
+                                }
+                            }
+                        });
+                    }
+
                     ui.add_space(6.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut self.game_picker_search)
                             .desired_width(f32::INFINITY)
-                            .hint_text("Filter by game or .exe name..."),
+                            .hint_text("Filter by game or .exe name (Steam, Riot, Epic, Battle.net, Ubisoft, EA)..."),
                     );
                     ui.add_space(8.0);
 
@@ -822,7 +970,7 @@ impl ProfilesUiState {
                         GamePickerTab::Installed => &self.discovered_installed,
                         GamePickerTab::Running => &self.discovered_running,
                     };
-                    let existing: Vec<String> = self
+                    let existing_in_draft: Vec<String> = self
                         .editor
                         .executables_csv
                         .split([',', ';', '\n'])
@@ -837,6 +985,13 @@ impl ProfilesUiState {
                         .show(ui, |ui| {
                             let mut shown = 0usize;
                             for g in list {
+                                if self.game_picker_tab == GamePickerTab::Installed {
+                                    if let Some(filter_src) = self.game_picker_source_filter {
+                                        if g.source != filter_src {
+                                            continue;
+                                        }
+                                    }
+                                }
                                 if !query.is_empty()
                                     && !g.display_name.to_ascii_lowercase().contains(&query)
                                     && !g.exe_name.contains(&query)
@@ -844,7 +999,15 @@ impl ProfilesUiState {
                                     continue;
                                 }
                                 shown += 1;
-                                let already = existing.iter().any(|e| e == &g.exe_name);
+                                let already = if is_create_mode {
+                                    self.store.profiles.iter().any(|prof| {
+                                        prof.executables
+                                            .iter()
+                                            .any(|e| e.eq_ignore_ascii_case(&g.exe_name))
+                                    })
+                                } else {
+                                    existing_in_draft.iter().any(|e| e == &g.exe_name)
+                                };
                                 egui::Frame::NONE
                                     .fill(p.surface_alt)
                                     .stroke(Stroke::new(1.0_f32, p.border))
@@ -875,19 +1038,28 @@ impl ProfilesUiState {
                                                 |ui| {
                                                     if already {
                                                         ui.label(
-                                                            RichText::new("ADDED")
-                                                                .size(10.5)
-                                                                .strong()
-                                                                .color(p.ok),
+                                                            RichText::new(if is_create_mode {
+                                                                "PROFILE EXISTS"
+                                                            } else {
+                                                                "ADDED"
+                                                            })
+                                                            .size(10.5)
+                                                            .strong()
+                                                            .color(p.ok),
                                                         );
-                                                    } else if ui
-                                                        .add(primary_btn("+ Add", p))
-                                                        .clicked()
-                                                    {
-                                                        added_exe = Some((
-                                                            g.display_name.clone(),
-                                                            g.exe_name.clone(),
-                                                        ));
+                                                    } else {
+                                                        let btn_lbl = if is_create_mode {
+                                                            "+ Create Profile"
+                                                        } else {
+                                                            "+ Add"
+                                                        };
+                                                        if ui.add(primary_btn(btn_lbl, p)).clicked()
+                                                        {
+                                                            picked_game = Some((
+                                                                g.display_name.clone(),
+                                                                g.exe_name.clone(),
+                                                            ));
+                                                        }
                                                     }
                                                 },
                                             );
@@ -898,7 +1070,7 @@ impl ProfilesUiState {
                             if shown == 0 {
                                 ui.label(
                                     RichText::new(
-                                        "No matching applications found. You can also type any .exe manually.",
+                                        "No matching applications found. You can also create a blank profile and type any .exe manually.",
                                     )
                                     .size(12.0)
                                     .color(p.text_muted),
@@ -918,26 +1090,100 @@ impl ProfilesUiState {
                 self.discovered_installed = discover_installed_games();
                 self.discovered_running = discover_running_apps();
             }
-            if let Some((title, exe)) = added_exe {
-                let mut cur: Vec<String> = self
-                    .editor
-                    .executables_csv
-                    .split([',', ';', '\n'])
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("game.exe"))
-                    .map(str::to_string)
-                    .collect();
-                if !cur.iter().any(|e| e.eq_ignore_ascii_case(&exe)) {
-                    cur.push(exe.clone());
+            if let Some((title, exe)) = picked_game {
+                if is_create_mode {
+                    let base_slug: String = title
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() {
+                                c.to_ascii_lowercase()
+                            } else {
+                                '_'
+                            }
+                        })
+                        .collect::<String>()
+                        .split('_')
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("_");
+                    let slug = if base_slug.is_empty() {
+                        format!("game_{}", self.store.profiles.len())
+                    } else {
+                        base_slug
+                    };
+                    let mut unique_id = slug.clone();
+                    let mut suffix = 2usize;
+                    while self.store.profiles.iter().any(|p| p.id == unique_id) {
+                        unique_id = format!("{slug}_{suffix}");
+                        suffix += 1;
+                    }
+                    let new_prof = GameProfile {
+                        id: unique_id.clone(),
+                        name: title.clone(),
+                        is_desktop_default: false,
+                        executables: vec![exe.clone()],
+                        mouse: MouseSettings {
+                            dpi: Some(800),
+                            polling_rate_hz: Some(4000),
+                            lod: Some(LiftOffDistance::Mm10),
+                            debounce_ms: Some(1),
+                            ..Default::default()
+                        },
+                        device_overrides: BTreeMap::new(),
+                        windows_pointer_speed: None,
+                        windows_power_plan: None,
+                        audio_output_device_id: None,
+                        audio_output_device_name: None,
+                        audio_output_volume: None,
+                        audio_input_device_id: None,
+                        audio_input_device_name: None,
+                        audio_input_volume: None,
+                        lock_mic_volume: false,
+                        display_device_name: None,
+                        display_width: None,
+                        display_height: None,
+                        display_refresh_hz: None,
+                        wooting_profile: None,
+                        keyboard_preset: None,
+                        force_high_perf_gpu: false,
+                        quiet_notifications: false,
+                        duck_audio_apps: Vec::new(),
+                        duck_audio_volume_pct: 15,
+                        author: None,
+                        notes: None,
+                    }
+                    .sanitized();
+                    self.store.upsert_profile(new_prof);
+                    self.select_profile(&unique_id);
+                    runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
+                    self.notice = Some((
+                        Severity::Ok,
+                        format!("Created & saved profile '{title}' ({exe}). Tune Mouse, Keyboard, or Display tabs anytime."),
+                    ));
+                    close_picker = true;
+                } else {
+                    let mut cur: Vec<String> = self
+                        .editor
+                        .executables_csv
+                        .split([',', ';', '\n'])
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("game.exe"))
+                        .map(str::to_string)
+                        .collect();
+                    if !cur.iter().any(|e| e.eq_ignore_ascii_case(&exe)) {
+                        cur.push(exe.clone());
+                    }
+                    self.editor.executables_csv = cur.join(", ");
+                    if self.editor.name.starts_with("Game Profile") {
+                        self.editor.name = title.clone();
+                    }
+                    self.notice = Some((
+                        Severity::Ok,
+                        format!(
+                            "Added '{exe}' ({title}) to profile draft — click Save to persist."
+                        ),
+                    ));
                 }
-                self.editor.executables_csv = cur.join(", ");
-                if self.editor.name.starts_with("Game Profile") {
-                    self.editor.name = title.clone();
-                }
-                self.notice = Some((
-                    Severity::Ok,
-                    format!("Added '{exe}' ({title}) to profile draft — click Save to persist."),
-                ));
             }
             if close_picker {
                 self.game_picker_open = false;
@@ -1506,6 +1752,9 @@ impl ProfilesUiState {
                 if let Some((_, audio_name, _)) = s.audio_outputs.iter().find(|(_, _, def)| *def) {
                     status_chunks.push(format!("Audio: {audio_name}"));
                 }
+                if s.mic_muted == Some(true) {
+                    status_chunks.push("Mic: MUTED".to_string());
+                }
                 if let Some(locked_pct) = s.mic_lock_active {
                     status_chunks.push(format!("Mic Lock: {locked_pct}%"));
                 }
@@ -1602,7 +1851,11 @@ impl ProfilesUiState {
                         self.import_modal_open = true;
                         self.import_text.clear();
                     }
-                    if ui.add(primary_btn("+ New", p)).clicked() {
+                    if ui
+                        .add(secondary_btn("+ Blank", p))
+                        .on_hover_text("Create a blank custom profile")
+                        .clicked()
+                    {
                         let next_num = self.store.profiles.len();
                         let new_prof = GameProfile {
                             id: format!("game_{next_num}"),
@@ -1638,6 +1891,7 @@ impl ProfilesUiState {
                             display_height: None,
                             display_refresh_hz: None,
                             wooting_profile: None,
+                            keyboard_preset: None,
                             force_high_perf_gpu: false,
                             quiet_notifications: false,
                             duck_audio_apps: Vec::new(),
@@ -1649,6 +1903,23 @@ impl ProfilesUiState {
                         self.store.upsert_profile(new_prof);
                         self.select_profile(&new_id);
                         runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
+                    }
+                    if ui
+                        .add(primary_btn("+ Game", p))
+                        .on_hover_text(
+                            "1-click create a profile from an installed Steam, Riot, Epic, Battle.net, Ubisoft, or EA game",
+                        )
+                        .clicked()
+                    {
+                        self.game_picker_mode = GamePickerMode::CreateProfile;
+                        self.game_picker_tab = GamePickerTab::Installed;
+                        self.game_picker_source_filter = None;
+                        self.game_picker_search.clear();
+                        self.game_picker_open = true;
+                        self.discovered_running = discover_running_apps();
+                        if self.discovered_installed.is_empty() {
+                            self.discovered_installed = discover_installed_games();
+                        }
                     }
                 });
             });
@@ -2421,18 +2692,180 @@ impl ProfilesUiState {
                                         );
                                     }
                                     ui.add_space(4.0);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(
-                                                "Open the dedicated Keyboard tab in the left sidebar for brand-specific actuation, Rapid Trigger, polling rate, SOCD, debounce, and Wooting visual keymap controls.",
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(
+                                                    "Open the dedicated Keyboard tab in the left sidebar for interactive Wooting keymap, live analog depth, and one-off tuning.",
+                                                )
+                                                .size(11.0)
+                                                .color(p.text_muted),
                                             )
-                                            .size(11.0)
-                                            .color(p.text_muted),
-                                        )
-                                        .wrap(),
-                                    );
-                                });
+                                            .wrap(),
+                                        );
+                                    });
                                 ui.end_row();
+
+                                // --- PER-GAME KEYBOARD HARDWARE OVERRIDES (BEYOND SLOT SWITCHING) ---
+                                let kb_caps = primary_kb.map(|kb| &kb.capabilities);
+                                let show_kb_polling =
+                                    kb_caps.is_none_or(|c| c.supports_polling_rate_write);
+                                let show_kb_actuation =
+                                    kb_caps.is_none_or(|c| c.supports_base_actuation_write);
+                                let show_kb_rt = kb_caps.is_none_or(|c| {
+                                    c.supports_base_actuation_write
+                                        || c.supports_rapid_trigger_toggle
+                                });
+                                let show_kb_socd =
+                                    kb_caps.is_none_or(|c| c.supports_socd_toggle);
+                                let show_kb_debounce =
+                                    kb_caps.is_none_or(|c| c.supports_debounce_tuning);
+
+                                ui.label(
+                                    RichText::new("Per-Game Overrides")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(p.text_muted),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(
+                                            "Optional tuning applied when this game launches (diffed vs live state; skips unsupported controls automatically).",
+                                        )
+                                        .size(11.0)
+                                        .color(p.text_muted),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.end_row();
+
+                                if show_kb_polling {
+                                    let kb_rates: Vec<u16> = kb_caps
+                                        .filter(|c| !c.supported_polling_rates_hz.is_empty())
+                                        .map(|c| c.supported_polling_rates_hz.clone())
+                                        .unwrap_or_else(|| {
+                                            vec![125, 250, 500, 1000, 2000, 4000, 8000]
+                                        });
+                                    ui.checkbox(&mut self.editor.set_kb_polling, "KB Polling Rate");
+                                    ui.add_enabled_ui(self.editor.set_kb_polling, |ui| {
+                                        egui::ComboBox::from_id_salt("kb_preset_polling_combo")
+                                            .selected_text(format!(
+                                                "{} Hz",
+                                                self.editor.kb_polling_rate_hz
+                                            ))
+                                            .show_ui(ui, |ui| {
+                                                for hz in &kb_rates {
+                                                    ui.selectable_value(
+                                                        &mut self.editor.kb_polling_rate_hz,
+                                                        *hz,
+                                                        format!("{hz} Hz"),
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    ui.end_row();
+                                }
+
+                                if show_kb_actuation {
+                                    let (act_min, act_max) = primary_kb
+                                        .and_then(|k| k.actuation_range_mm)
+                                        .unwrap_or((0.10, 4.00));
+                                    ui.checkbox(
+                                        &mut self.editor.set_kb_actuation,
+                                        "Base Actuation",
+                                    );
+                                    ui.add_enabled(
+                                        self.editor.set_kb_actuation,
+                                        egui::DragValue::new(&mut self.editor.kb_actuation_mm)
+                                            .range(act_min..=act_max)
+                                            .speed(0.05)
+                                            .fixed_decimals(2)
+                                            .suffix(" mm"),
+                                    );
+                                    ui.end_row();
+                                }
+
+                                if show_kb_rt {
+                                    ui.checkbox(
+                                        &mut self.editor.set_kb_rt_toggle,
+                                        "Rapid Trigger",
+                                    );
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.add_enabled_ui(self.editor.set_kb_rt_toggle, |ui| {
+                                            let lbl = if self.editor.kb_rt_enabled {
+                                                "ON"
+                                            } else {
+                                                "OFF"
+                                            };
+                                            if ui.add(secondary_btn(lbl, p)).clicked() {
+                                                self.editor.kb_rt_enabled =
+                                                    !self.editor.kb_rt_enabled;
+                                            }
+                                        });
+                                        if show_kb_actuation {
+                                            ui.checkbox(
+                                                &mut self.editor.set_kb_rt_mm,
+                                                "Sensitivity",
+                                            );
+                                            ui.add_enabled(
+                                                self.editor.set_kb_rt_mm,
+                                                egui::DragValue::new(&mut self.editor.kb_rt_mm)
+                                                    .range(0.10..=2.50)
+                                                    .speed(0.05)
+                                                    .fixed_decimals(2)
+                                                    .suffix(" mm"),
+                                            );
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+
+                                if show_kb_socd {
+                                    let socd_lbl = kb_caps
+                                        .and_then(|c| c.socd_label.as_deref())
+                                        .unwrap_or("SOCD / Snap Tap");
+                                    ui.checkbox(&mut self.editor.set_kb_socd, socd_lbl);
+                                    ui.add_enabled_ui(self.editor.set_kb_socd, |ui| {
+                                        let lbl = if self.editor.kb_socd_enabled {
+                                            "ON"
+                                        } else {
+                                            "OFF"
+                                        };
+                                        if ui.add(secondary_btn(lbl, p)).clicked() {
+                                            self.editor.kb_socd_enabled =
+                                                !self.editor.kb_socd_enabled;
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+
+                                if show_kb_debounce {
+                                    ui.checkbox(
+                                        &mut self.editor.set_kb_debounce,
+                                        "KB Debounce",
+                                    );
+                                    ui.add_enabled_ui(self.editor.set_kb_debounce, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let mode_lbl = if self.editor.kb_debounce_typing {
+                                                "Typing"
+                                            } else {
+                                                "Gaming"
+                                            };
+                                            if ui.add(secondary_btn(mode_lbl, p)).clicked() {
+                                                self.editor.kb_debounce_typing =
+                                                    !self.editor.kb_debounce_typing;
+                                            }
+                                            ui.add(
+                                                egui::DragValue::new(
+                                                    &mut self.editor.kb_debounce_ms,
+                                                )
+                                                .range(5..=40)
+                                                .speed(1)
+                                                .suffix(" ms"),
+                                            );
+                                        });
+                                    });
+                                    ui.end_row();
+                                }
                             }
 
                             if self.editor_tab == ProfileEditorTab::AudioPower {
@@ -2857,6 +3290,8 @@ impl ProfilesUiState {
                 ));
             }
             if open_game_picker {
+                self.game_picker_mode = GamePickerMode::AddExeToCurrent;
+                self.game_picker_source_filter = None;
                 self.game_picker_open = true;
                 self.game_picker_search.clear();
                 self.discovered_running = discover_running_apps();

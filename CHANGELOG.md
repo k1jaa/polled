@@ -18,6 +18,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **1-Click Installed Game Discovery Across 6 Launchers (`profiles/game_discovery.rs`, `profiles_ui.rs`):**
+  - Expanded read-only game discovery beyond Steam/Riot/Epic to also detect installed **Battle.net** (Overwatch 2, Call of Duty, World of Warcraft, Diablo IV, Hearthstone, StarCraft II, Heroes of the Storm), **Ubisoft Connect** (Rainbow Six Siege, etc.), and **EA App** (Apex Legends, Battlefield 2042, etc.) games, plus Riot `Metadata\*\*.product_settings.yaml` custom-drive scanning and a 26-title competitive Steam AppID exact `.exe` fast-path (`cs2.exe`, `r5apex.exe`, `marvel-win64-shipping.exe`, `discovery.exe`, `project8.exe`, etc.).
+  - Added a top-level **`+ Game`** button in the Profiles sidebar with store filter chips (`All Stores`, `Steam`, `Riot`, `Epic`, `Battle.net`, `Ubisoft`, `EA App`) for 1-click profile creation directly from any installed game or running app.
+- **Audio Output Cycle Pinning (Headphones ↔ Speakers) & Global Mic Mute Toggle (`win/audio.rs`, `settings.rs`, `hotkeys.rs`, `profile_runtime.rs`, `tray.rs`, `daemon.rs`, `app.rs`):**
+  - Added an **Audio Output Cycle Filter** in **Settings** (`audio_cycle_device_ids` in `settings.json` & `polled.setup.v1`) so **Cycle Audio Output** strictly toggles between pinned playback devices (skipping unused HDMI/monitor audio outputs) and shows the switched device in the monochrome OSD pill.
+  - Added pure user-mode Core Audio microphone mute toggling (`IAudioEndpointVolume::GetMute`/`SetMute`, zero admin) wired to a new **Toggle Mic Mute** global hotkey (`Ctrl+Alt+M` default), a **Mute Microphone** system tray checkmark, `[MIC MUTED]` tray/status indicators, and OSD feedback.
+- **Per-Game Keyboard Presets Beyond Slot Switching (`profiles/mod.rs`, `profile_runtime.rs`, `profiles_ui.rs`, `wooting_adapter.rs`):**
+  - Added optional `keyboard_preset` (`KeyboardProfileSettings`: polling rate, base actuation mm, Rapid Trigger ON/OFF & sensitivity mm, SOCD / Snap Tap, and Gaming/Typing debounce) to `GameProfile` and the **Profiles → Keyboard** sub-tab.
+  - Automatically diffs each requested setting against live keyboard telemetry and applies only controls supported by the connected board (Wooting ARM, Wuque/SparkLink, Keychron HE, SteelSeries Apex Pro, Razer Keyboards, Arbiter Studio, Logitech HID++ 2.0, Geonworks Venom 8K) with zero redundant writes.
+
 ### Changed
 - **Ultra-Light Pure-Win32 Background Tray Daemon & On-Demand GPU GUI (`daemon.rs`, `ipc.rs`, `main.rs`, `app.rs`, `tray.rs`, `single_instance.rs`, `profile_runtime.rs`, `hotkeys.rs`, `notifications.rs`):**
   - Split `polled-gui.exe` into a pure-Win32 zero-OpenGL background tray daemon (`polled-gui.exe` / `--minimized`) and an on-demand GPU UI child window (`polled-gui.exe --ui --ipc-pid <pid>`) synchronized over two local-only Win32 Named Pipes (`\\.\pipe\PolledIpcC2S_<pid>` and `PolledIpcS2C_<pid>`, `PIPE_REJECT_REMOTE_CLIENTS`, zero network sockets).

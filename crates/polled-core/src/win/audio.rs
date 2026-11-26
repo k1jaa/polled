@@ -494,6 +494,74 @@ pub fn set_audio_endpoint_volume(
     })
 }
 
+/// Reads the mute state (`true` = muted) of an audio endpoint (or default endpoint when `None`).
+pub fn get_audio_endpoint_mute(flow: AudioFlow, endpoint_id: Option<&str>) -> Result<bool> {
+    let _com = ComGuard::acquire()?;
+    let enumerator = create_enumerator()?;
+    let device = resolve_device(&enumerator, flow, endpoint_id)?;
+    let vol: IAudioEndpointVolume =
+        unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|e| PolledError::Win32 {
+            context: "Activate(IAudioEndpointVolume)".to_string(),
+            message: e.to_string(),
+        })?;
+    let muted = unsafe { vol.GetMute() }.map_err(|e| PolledError::Win32 {
+        context: "IAudioEndpointVolume::GetMute".to_string(),
+        message: e.to_string(),
+    })?;
+    Ok(muted.as_bool())
+}
+
+/// Sets the mute state of an audio endpoint (or default endpoint when `None`).
+pub fn set_audio_endpoint_mute(
+    flow: AudioFlow,
+    endpoint_id: Option<&str>,
+    muted: bool,
+) -> Result<()> {
+    let _com = ComGuard::acquire()?;
+    let enumerator = create_enumerator()?;
+    let device = resolve_device(&enumerator, flow, endpoint_id)?;
+    let vol: IAudioEndpointVolume =
+        unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|e| PolledError::Win32 {
+            context: "Activate(IAudioEndpointVolume)".to_string(),
+            message: e.to_string(),
+        })?;
+    // SAFETY: Passing `ptr::null()` for event context GUID is documented by Microsoft.
+    unsafe { vol.SetMute(muted, ptr::null()) }.map_err(|e| PolledError::Win32 {
+        context: "IAudioEndpointVolume::SetMute".to_string(),
+        message: e.to_string(),
+    })
+}
+
+/// Toggles mute on an audio endpoint (or default endpoint when `None`), returning
+/// `(friendly_name, is_now_muted)`.
+pub fn toggle_audio_endpoint_mute(
+    flow: AudioFlow,
+    endpoint_id: Option<&str>,
+) -> Result<(String, bool)> {
+    let _com = ComGuard::acquire()?;
+    let enumerator = create_enumerator()?;
+    let device = resolve_device(&enumerator, flow, endpoint_id)?;
+    let name = read_device_friendly_name(&device);
+    let vol: IAudioEndpointVolume =
+        unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|e| PolledError::Win32 {
+            context: "Activate(IAudioEndpointVolume)".to_string(),
+            message: e.to_string(),
+        })?;
+    let currently_muted = unsafe { vol.GetMute() }
+        .map_err(|e| PolledError::Win32 {
+            context: "IAudioEndpointVolume::GetMute".to_string(),
+            message: e.to_string(),
+        })?
+        .as_bool();
+    let next = !currently_muted;
+    // SAFETY: Passing `ptr::null()` for event context GUID is documented by Microsoft.
+    unsafe { vol.SetMute(next, ptr::null()) }.map_err(|e| PolledError::Win32 {
+        context: "IAudioEndpointVolume::SetMute".to_string(),
+        message: e.to_string(),
+    })?;
+    Ok((name, next))
+}
+
 fn resolve_device(
     enumerator: &IMMDeviceEnumerator,
     flow: AudioFlow,

@@ -464,6 +464,18 @@ pub trait SystemEnv: Send + Sync {
         endpoint_id: Option<&str>,
         percent: u8,
     ) -> Result<()>;
+    fn get_audio_endpoint_mute(&self, flow: AudioFlow, endpoint_id: Option<&str>) -> Result<bool>;
+    fn set_audio_endpoint_mute(
+        &self,
+        flow: AudioFlow,
+        endpoint_id: Option<&str>,
+        muted: bool,
+    ) -> Result<()>;
+    fn toggle_audio_endpoint_mute(
+        &self,
+        flow: AudioFlow,
+        endpoint_id: Option<&str>,
+    ) -> Result<(String, bool)>;
     fn list_network_adapters(&self) -> Result<Vec<NetworkAdapterInfo>>;
 }
 
@@ -633,6 +645,27 @@ impl SystemEnv for WindowsEnv {
         percent: u8,
     ) -> Result<()> {
         audio::set_audio_endpoint_volume(flow, endpoint_id, percent)
+    }
+
+    fn get_audio_endpoint_mute(&self, flow: AudioFlow, endpoint_id: Option<&str>) -> Result<bool> {
+        audio::get_audio_endpoint_mute(flow, endpoint_id)
+    }
+
+    fn set_audio_endpoint_mute(
+        &self,
+        flow: AudioFlow,
+        endpoint_id: Option<&str>,
+        muted: bool,
+    ) -> Result<()> {
+        audio::set_audio_endpoint_mute(flow, endpoint_id, muted)
+    }
+
+    fn toggle_audio_endpoint_mute(
+        &self,
+        flow: AudioFlow,
+        endpoint_id: Option<&str>,
+    ) -> Result<(String, bool)> {
+        audio::toggle_audio_endpoint_mute(flow, endpoint_id)
     }
 
     fn list_network_adapters(&self) -> Result<Vec<NetworkAdapterInfo>> {

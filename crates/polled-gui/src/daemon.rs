@@ -212,6 +212,9 @@ mod win32_daemon {
                             self.profile_runtime
                                 .send(ProfileRuntimeCmd::CycleWootingProfile);
                         }
+                        HotkeyAction::ToggleMicMute => {
+                            self.profile_runtime.send(ProfileRuntimeCmd::ToggleMicMute);
+                        }
                     },
                     WorkerMsg::ReadFromMouseFinished {
                         device_name,
@@ -330,6 +333,9 @@ mod win32_daemon {
                     TrayAction::SwitchAudioOutput(audio_id) => {
                         self.profile_runtime
                             .send(ProfileRuntimeCmd::SwitchAudioOutput(audio_id));
+                    }
+                    TrayAction::ToggleMicMute => {
+                        self.profile_runtime.send(ProfileRuntimeCmd::ToggleMicMute);
                     }
                     TrayAction::ToggleProfileLock => {
                         let next = !self.profile_locked;
@@ -616,6 +622,7 @@ mod win32_daemon {
             store,
             settings.auto_switch_on_startup,
             settings.alerts.clone(),
+            settings.audio_cycle_device_ids.clone(),
             worker_tx.clone(),
             Arc::clone(&wake),
         );

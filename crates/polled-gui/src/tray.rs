@@ -25,6 +25,7 @@ const ID_MOUSE_REFRESH: &str = "mouse_refresh";
 const ID_WOOTING_PREFIX: &str = "wooting::";
 const ID_WOOTING_REFRESH: &str = "wooting_refresh";
 const ID_AUDIO_PREFIX: &str = "audio::";
+const ID_MIC_MUTE: &str = "mic_mute";
 const ID_QUIT: &str = "quit";
 
 /// High-level action emitted by the native Windows system tray icon or its context menu.
@@ -39,6 +40,7 @@ pub enum TrayAction {
     SwitchKeyboardProfile(u8),
     RefreshKeyboards,
     SwitchAudioOutput(String),
+    ToggleMicMute,
     ToggleProfileLock,
     ToggleAutoSwitch,
     Quit,
@@ -98,6 +100,7 @@ pub fn parse_menu_action(id_str: &str) -> Option<TrayAction> {
         ID_SCAN => Some(TrayAction::ScanNow),
         ID_MOUSE_REFRESH => Some(TrayAction::RefreshMouseAndBattery),
         ID_WOOTING_REFRESH => Some(TrayAction::RefreshKeyboards),
+        ID_MIC_MUTE => Some(TrayAction::ToggleMicMute),
         ID_LOCK_PROFILE => Some(TrayAction::ToggleProfileLock),
         ID_AUTO_SWITCH => Some(TrayAction::ToggleAutoSwitch),
         ID_QUIT => Some(TrayAction::Quit),
@@ -185,6 +188,7 @@ pub struct TrayController {
     audio_submenu: Submenu,
     audio_menu_items: Vec<MenuItem>,
     last_audio_key: Vec<(String, String, bool)>,
+    mic_mute_item: CheckMenuItem,
     auto_switch_item: CheckMenuItem,
     lock_profile_item: CheckMenuItem,
     /// Cached rendered icon state: `None` = unset, `Some(None)` = default crosshair,
@@ -210,6 +214,8 @@ impl TrayController {
         let mouse_submenu = Submenu::new("Mouse Quick Controls", true);
         let wooting_submenu = Submenu::new("Keyboard", true);
         let audio_submenu = Submenu::new("Audio Output", true);
+        let mic_mute_item =
+            CheckMenuItem::with_id(ID_MIC_MUTE, "Mute Microphone", true, false, None);
         let lock_profile_item =
             CheckMenuItem::with_id(ID_LOCK_PROFILE, "Lock Current Profile", true, false, None);
         let auto_switch_item = CheckMenuItem::with_id(
@@ -230,6 +236,7 @@ impl TrayController {
         let _ = menu.append(&mouse_submenu);
         let _ = menu.append(&wooting_submenu);
         let _ = menu.append(&audio_submenu);
+        let _ = menu.append(&mic_mute_item);
         let _ = menu.append(&lock_profile_item);
         let _ = menu.append(&auto_switch_item);
         let _ = menu.append(&sep_bottom);
@@ -290,6 +297,7 @@ impl TrayController {
             audio_submenu,
             audio_menu_items: Vec::new(),
             last_audio_key: Vec::new(),
+            mic_mute_item,
             auto_switch_item,
             lock_profile_item,
             last_icon_key: Some(None),
@@ -347,6 +355,7 @@ impl TrayController {
         self.update_status(
             snap.auto_switch_enabled,
             snap.profile_locked,
+            snap.mic_muted == Some(true),
             &snap.active_profile_id,
             &snap.active_profile_name,
             &snap.available_profiles,
@@ -366,6 +375,7 @@ impl TrayController {
         &mut self,
         auto_switch_enabled: bool,
         profile_locked: bool,
+        mic_muted: bool,
         active_profile_id: &str,
         active_profile_name: &str,
         available_profiles: &[(String, String)],
@@ -378,11 +388,13 @@ impl TrayController {
     ) {
         self.auto_switch_item.set_checked(auto_switch_enabled);
         self.lock_profile_item.set_checked(profile_locked);
+        self.mic_mute_item.set_checked(mic_muted);
 
         let lock_tag = if profile_locked { " [LOCKED]" } else { "" };
+        let mic_tag = if mic_muted { " [MIC MUTED]" } else { "" };
         let header_text = match battery_summary.filter(|s| !s.is_empty()) {
-            Some(batt) => format!("{active_profile_name}{lock_tag} · {batt}"),
-            None => format!("Profile: {active_profile_name}{lock_tag}"),
+            Some(batt) => format!("{active_profile_name}{lock_tag}{mic_tag} · {batt}"),
+            None => format!("Profile: {active_profile_name}{lock_tag}{mic_tag}"),
         };
         self.status_item.set_text(header_text);
 
@@ -635,6 +647,9 @@ impl TrayController {
                 format!("{active_profile_name} (Auto OFF)")
             };
             parts.push(profile_part);
+            if mic_muted {
+                parts.push("MIC MUTED".to_string());
+            }
 
             let mut tooltip = parts.join(" · ");
             // Windows NOTIFYICONDATAW.szTip is capped at 127 UTF-16 code units.

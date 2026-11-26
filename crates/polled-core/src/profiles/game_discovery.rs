@@ -4,9 +4,10 @@
 
 //! Read-only Smart Game Picker discovery:
 //! - Active user applications (filtered free of Windows system noise)
-//! - Installed Steam games (`libraryfolders.vdf` + `appmanifest_*.acf`)
-//! - Installed Riot Games (`VALORANT`, `League of Legends`)
+//! - Installed Steam games (`libraryfolders.vdf` + `appmanifest_*.acf` + competitive AppID fast-path)
+//! - Installed Riot Games (`RiotClientInstalls.json` + `Metadata\*\*.product_settings.yaml`)
 //! - Installed Epic Games (`EpicGamesLauncher\Data\Manifests\*.item`)
+//! - Installed Battle.net, Ubisoft Connect, and EA App titles (read-only Uninstall/Launcher keys)
 //!
 //! 100% local, zero admin required, zero network calls.
 
@@ -26,6 +27,9 @@ pub enum GameSource {
     Steam,
     Riot,
     Epic,
+    BattleNet,
+    Ubisoft,
+    EaApp,
 }
 
 impl GameSource {
@@ -35,6 +39,9 @@ impl GameSource {
             GameSource::Steam => "Steam",
             GameSource::Riot => "Riot",
             GameSource::Epic => "Epic",
+            GameSource::BattleNet => "Battle.net",
+            GameSource::Ubisoft => "Ubisoft",
+            GameSource::EaApp => "EA App",
         }
     }
 }
@@ -129,6 +136,40 @@ const IGNORED_INSTALL_EXE_SUBSTRINGS: &[&str] = &[
     "python",
 ];
 
+/// Verified primary `.exe` basenames for popular competitive Steam titles whose install folders
+/// often contain launcher stubs, anti-cheat bootstrappers, or multiple subdirectories.
+pub fn known_steam_appid_exe(appid: &str) -> Option<&'static str> {
+    match appid.trim() {
+        "10" => Some("hl.exe"),
+        "440" => Some("tf_win64.exe"),
+        "550" => Some("left4dead2.exe"),
+        "570" => Some("dota2.exe"),
+        "730" => Some("cs2.exe"),
+        "221100" => Some("dayz_x64.exe"),
+        "252490" => Some("rustclient.exe"),
+        "252950" => Some("rocketleague.exe"),
+        "271590" => Some("gta5.exe"),
+        "359550" => Some("rainbowsix.exe"),
+        "553850" => Some("helldivers2.exe"),
+        "578080" => Some("tslgame.exe"),
+        "594650" => Some("huntgame.exe"),
+        "714010" => Some("aimlab_tb.exe"),
+        "824270" => Some("fpsaimtrainer-win64-shipping.exe"),
+        "1085660" => Some("destiny2.exe"),
+        "1172470" => Some("r5apex.exe"),
+        "1422450" => Some("project8.exe"),
+        "1517290" => Some("bf2042.exe"),
+        "1938090" => Some("cod.exe"),
+        "2073850" => Some("discovery.exe"),
+        "2357570" => Some("overwatch.exe"),
+        "2507950" => Some("deltaforceclient-win64-shipping.exe"),
+        "2767030" => Some("marvel-win64-shipping.exe"),
+        "2943650" => Some("fragpunk-win64-shipping.exe"),
+        "3240220" => Some("gta5_enhanced.exe"),
+        _ => None,
+    }
+}
+
 /// Discovers currently running user processes (filtered free of Windows OS background services).
 pub fn discover_running_apps() -> Vec<DiscoveredGame> {
     let mut sys = System::new_with_specifics(
@@ -168,7 +209,8 @@ pub fn discover_running_apps() -> Vec<DiscoveredGame> {
         .collect()
 }
 
-/// Discovers installed games across Steam, Riot Games, and Epic Games Launcher (read-only).
+/// Discovers installed games across Steam, Riot Games, Epic Games, Battle.net, Ubisoft Connect,
+/// and EA App (100% local & read-only).
 pub fn discover_installed_games() -> Vec<DiscoveredGame> {
     let mut results = Vec::new();
     let mut seen_exes: BTreeSet<String> = BTreeSet::new();
@@ -177,6 +219,9 @@ pub fn discover_installed_games() -> Vec<DiscoveredGame> {
         .into_iter()
         .chain(discover_riot_games())
         .chain(discover_epic_games())
+        .chain(discover_battlenet_games())
+        .chain(discover_ubisoft_games())
+        .chain(discover_ea_games())
     {
         if seen_exes.insert(game.exe_name.clone()) {
             results.push(game);
@@ -227,6 +272,7 @@ fn discover_steam_games() -> Vec<DiscoveredGame> {
         r"C:\Program Files\Steam",
         r"D:\Steam",
         r"D:\SteamLibrary",
+        r"E:\SteamLibrary",
     ] {
         let p = PathBuf::from(fallback);
         if p.is_dir() && !roots.iter().any(|r| r.eq_ignore_ascii_case(&p)) {
@@ -266,7 +312,7 @@ fn discover_steam_games() -> Vec<DiscoveredGame> {
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
-            let Some((name, installdir)) = parse_steam_acf(&text) else {
+            let Some((appid, name, installdir)) = parse_steam_acf_full(&text) else {
                 continue;
             };
             let lower_name = name.to_ascii_lowercase();
@@ -278,7 +324,15 @@ fn discover_steam_games() -> Vec<DiscoveredGame> {
                 continue;
             }
             let game_dir = steamapps.join("common").join(installdir);
-            if let Some(exe_name) = find_primary_game_exe(&game_dir) {
+            if !game_dir.is_dir() {
+                continue;
+            }
+            let exe_name = appid
+                .as_deref()
+                .and_then(known_steam_appid_exe)
+                .map(str::to_string)
+                .or_else(|| find_primary_game_exe(&game_dir));
+            if let Some(exe_name) = exe_name {
                 games.push(DiscoveredGame {
                     display_name: name,
                     exe_name,
@@ -293,7 +347,11 @@ fn discover_steam_games() -> Vec<DiscoveredGame> {
 
 fn discover_riot_games() -> Vec<DiscoveredGame> {
     let mut games = Vec::new();
-    let mut riot_roots: Vec<PathBuf> = vec![PathBuf::from(r"C:\Riot Games")];
+    let mut riot_roots: Vec<PathBuf> = vec![
+        PathBuf::from(r"C:\Riot Games"),
+        PathBuf::from(r"D:\Riot Games"),
+    ];
+    let mut direct_product_paths: Vec<PathBuf> = Vec::new();
 
     let installs_json = PathBuf::from(r"C:\ProgramData\Riot Games\RiotClientInstalls.json");
     if let Ok(raw) = fs::read_to_string(&installs_json) {
@@ -306,6 +364,41 @@ fn discover_riot_games() -> Vec<DiscoveredGame> {
                             if p.is_dir() && !riot_roots.iter().any(|r| r.eq_ignore_ascii_case(&p))
                             {
                                 riot_roots.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also inspect Riot product metadata YAML manifests (catches games installed on custom drives).
+    let metadata_root = PathBuf::from(r"C:\ProgramData\Riot Games\Metadata");
+    if let Ok(entries) = fs::read_dir(&metadata_root) {
+        for entry in entries.flatten() {
+            let sub = entry.path();
+            if !sub.is_dir() {
+                continue;
+            }
+            if let Ok(files) = fs::read_dir(&sub) {
+                for file in files.flatten() {
+                    let fpath = file.path();
+                    if fpath.extension().and_then(|s| s.to_str()) == Some("yaml") {
+                        if let Ok(yaml) = fs::read_to_string(&fpath) {
+                            if let Some(install_path) = parse_riot_product_install_path(&yaml) {
+                                if install_path.is_dir() {
+                                    direct_product_paths.push(install_path.clone());
+                                    if let Some(parent) = install_path.parent() {
+                                        let p = parent.to_path_buf();
+                                        if p.is_dir()
+                                            && !riot_roots
+                                                .iter()
+                                                .any(|r| r.eq_ignore_ascii_case(&p))
+                                        {
+                                            riot_roots.push(p);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -332,8 +425,50 @@ fn discover_riot_games() -> Vec<DiscoveredGame> {
                 source: GameSource::Riot,
             });
         }
+        let twoxko_exe = root.join(r"2XKO\live\Lion\Binaries\Win64\Lion-Win64-Shipping.exe");
+        if twoxko_exe.is_file() {
+            games.push(DiscoveredGame {
+                display_name: "2XKO".to_string(),
+                exe_name: "lion-win64-shipping.exe".to_string(),
+                source: GameSource::Riot,
+            });
+        }
     }
+
+    for dir in direct_product_paths {
+        let val_direct = dir.join(r"ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe");
+        if val_direct.is_file() {
+            games.push(DiscoveredGame {
+                display_name: "VALORANT".to_string(),
+                exe_name: "valorant-win64-shipping.exe".to_string(),
+                source: GameSource::Riot,
+            });
+        }
+        let lol_direct = dir.join(r"Game\League of Legends.exe");
+        if lol_direct.is_file() {
+            games.push(DiscoveredGame {
+                display_name: "League of Legends".to_string(),
+                exe_name: "league of legends.exe".to_string(),
+                source: GameSource::Riot,
+            });
+        }
+    }
+
     games
+}
+
+/// Extracts `product_install_full_path` from Riot Client's `*.product_settings.yaml`.
+pub fn parse_riot_product_install_path(yaml: &str) -> Option<PathBuf> {
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("product_install_full_path:") {
+            let cleaned = rest.trim().trim_matches('"').trim_matches('\'').trim();
+            if !cleaned.is_empty() {
+                return Some(PathBuf::from(cleaned.replace('/', "\\")));
+            }
+        }
+    }
+    None
 }
 
 fn discover_epic_games() -> Vec<DiscoveredGame> {
@@ -357,6 +492,178 @@ fn discover_epic_games() -> Vec<DiscoveredGame> {
     games
 }
 
+/// Maps well-known Battle.net uninstall display names to their real shipping `.exe` basename.
+pub fn known_battlenet_exe(display_name: &str) -> Option<&'static str> {
+    let lower = display_name.to_ascii_lowercase();
+    if lower.contains("overwatch") {
+        Some("overwatch.exe")
+    } else if lower.contains("call of duty") {
+        Some("cod.exe")
+    } else if lower.contains("world of warcraft") {
+        Some("wow.exe")
+    } else if lower.contains("diablo iv") {
+        Some("diablo iv.exe")
+    } else if lower.contains("hearthstone") {
+        Some("hearthstone.exe")
+    } else if lower.contains("starcraft ii") {
+        Some("sc2_x64.exe")
+    } else if lower.contains("heroes of the storm") {
+        Some("heroesofthestorm_x64.exe")
+    } else {
+        None
+    }
+}
+
+fn discover_battlenet_games() -> Vec<DiscoveredGame> {
+    let mut games = Vec::new();
+
+    #[cfg(windows)]
+    {
+        use crate::win::{registry, RegHive};
+
+        const UNINSTALL_KEY: &str =
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
+        if let Ok(subkeys) = registry::list_subkeys(RegHive::Hklm, UNINSTALL_KEY) {
+            for sub in subkeys {
+                let full_key = format!(r"{UNINSTALL_KEY}\{sub}");
+                let publisher = registry::get_string(RegHive::Hklm, &full_key, "Publisher")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let lower_pub = publisher.to_ascii_lowercase();
+                if !lower_pub.contains("blizzard") && !lower_pub.contains("activision") {
+                    continue;
+                }
+                let Some(display_name) =
+                    registry::get_string(RegHive::Hklm, &full_key, "DisplayName")
+                        .ok()
+                        .flatten()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                if display_name.eq_ignore_ascii_case("Battle.net") {
+                    continue;
+                }
+                let install_dir = registry::get_string(RegHive::Hklm, &full_key, "InstallLocation")
+                    .ok()
+                    .flatten()
+                    .map(|s| PathBuf::from(s.trim().trim_matches('"')));
+                let exe_name = known_battlenet_exe(&display_name)
+                    .map(str::to_string)
+                    .or_else(|| install_dir.as_deref().and_then(find_primary_game_exe));
+                if let Some(exe_name) = exe_name {
+                    games.push(DiscoveredGame {
+                        display_name,
+                        exe_name,
+                        source: GameSource::BattleNet,
+                    });
+                }
+            }
+        }
+    }
+
+    games
+}
+
+fn discover_ubisoft_games() -> Vec<DiscoveredGame> {
+    let mut games = Vec::new();
+
+    #[cfg(windows)]
+    {
+        use crate::win::{registry, RegHive};
+
+        const UBISOFT_KEY: &str = r"SOFTWARE\WOW6432Node\Ubisoft\Launcher\Installs";
+        if let Ok(subkeys) = registry::list_subkeys(RegHive::Hklm, UBISOFT_KEY) {
+            for sub in subkeys {
+                let full_key = format!(r"{UBISOFT_KEY}\{sub}");
+                let Some(dir_str) = registry::get_string(RegHive::Hklm, &full_key, "InstallDir")
+                    .ok()
+                    .flatten()
+                    .map(|s| s.trim().replace('/', "\\"))
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let dir = PathBuf::from(dir_str);
+                if !dir.is_dir() {
+                    continue;
+                }
+                let folder_name = dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Ubisoft Game")
+                    .to_string();
+                let exe_name = if folder_name.to_ascii_lowercase().contains("rainbow six") {
+                    Some("rainbowsix.exe".to_string())
+                } else {
+                    find_primary_game_exe(&dir)
+                };
+                if let Some(exe_name) = exe_name {
+                    games.push(DiscoveredGame {
+                        display_name: folder_name,
+                        exe_name,
+                        source: GameSource::Ubisoft,
+                    });
+                }
+            }
+        }
+    }
+
+    games
+}
+
+fn discover_ea_games() -> Vec<DiscoveredGame> {
+    let mut games = Vec::new();
+
+    #[cfg(windows)]
+    {
+        use crate::win::{registry, RegHive};
+
+        for root_key in [r"SOFTWARE\Respawn", r"SOFTWARE\EA Games"] {
+            if let Ok(subkeys) = registry::list_subkeys(RegHive::Hklm, root_key) {
+                for sub in subkeys {
+                    let full_key = format!(r"{root_key}\{sub}");
+                    let Some(dir_str) =
+                        registry::get_string(RegHive::Hklm, &full_key, "Install Dir")
+                            .ok()
+                            .flatten()
+                            .map(|s| s.trim().replace('/', "\\"))
+                            .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    let dir = PathBuf::from(dir_str);
+                    if !dir.is_dir() {
+                        continue;
+                    }
+                    let lower_sub = sub.to_ascii_lowercase();
+                    let (display_name, known_exe) = if lower_sub.contains("apex") {
+                        ("Apex Legends".to_string(), Some("r5apex.exe"))
+                    } else if lower_sub.contains("battlefield 2042") {
+                        ("Battlefield 2042".to_string(), Some("bf2042.exe"))
+                    } else {
+                        (sub.clone(), None)
+                    };
+                    let exe_name = known_exe
+                        .map(str::to_string)
+                        .or_else(|| find_primary_game_exe(&dir));
+                    if let Some(exe_name) = exe_name {
+                        games.push(DiscoveredGame {
+                            display_name,
+                            exe_name,
+                            source: GameSource::EaApp,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    games
+}
+
 /// Parses `"path" "..."` entries out of Steam's `libraryfolders.vdf`.
 pub fn parse_steam_library_folders(vdf: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -373,18 +680,27 @@ pub fn parse_steam_library_folders(vdf: &str) -> Vec<PathBuf> {
 
 /// Parses `"name"` and `"installdir"` from a Steam `appmanifest_*.acf` file.
 pub fn parse_steam_acf(acf: &str) -> Option<(String, String)> {
+    let (_, name, installdir) = parse_steam_acf_full(acf)?;
+    Some((name, installdir))
+}
+
+/// Parses optional `"appid"`, `"name"`, and `"installdir"` from a Steam `appmanifest_*.acf` file.
+pub fn parse_steam_acf_full(acf: &str) -> Option<(Option<String>, String, String)> {
+    let mut appid = None;
     let mut name = None;
     let mut installdir = None;
     for line in acf.lines() {
         if let Some((key, val)) = parse_vdf_kv_line(line) {
-            if key.eq_ignore_ascii_case("name") {
+            if key.eq_ignore_ascii_case("appid") {
+                appid = Some(val);
+            } else if key.eq_ignore_ascii_case("name") {
                 name = Some(val);
             } else if key.eq_ignore_ascii_case("installdir") {
                 installdir = Some(val);
             }
         }
     }
-    Some((name?, installdir?))
+    Some((appid, name?, installdir?))
 }
 
 /// Parses an Epic Games Launcher `.item` manifest JSON into a `DiscoveredGame`.
@@ -575,9 +891,15 @@ mod tests {
     "installdir"    "Counter-Strike Global Offensive"
 }
 "#;
-        let (name, dir) = parse_steam_acf(acf).unwrap();
+        let (appid, name, dir) = parse_steam_acf_full(acf).unwrap();
+        assert_eq!(appid.as_deref(), Some("730"));
         assert_eq!(name, "Counter-Strike 2");
         assert_eq!(dir, "Counter-Strike Global Offensive");
+        assert_eq!(known_steam_appid_exe("730"), Some("cs2.exe"));
+        assert_eq!(
+            known_steam_appid_exe("2767030"),
+            Some("marvel-win64-shipping.exe")
+        );
 
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("game").join("bin").join("win64");
@@ -592,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_epic_item_manifest_json() {
+    fn parses_epic_riot_yaml_and_battlenet_mappings() {
         let raw = r#"{
             "DisplayName": "Rocket League",
             "LaunchExecutable": "Binaries/Win64/RocketLeague.exe",
@@ -602,5 +924,15 @@ mod tests {
         assert_eq!(game.display_name, "Rocket League");
         assert_eq!(game.exe_name, "rocketleague.exe");
         assert_eq!(game.source, GameSource::Epic);
+
+        let riot_yaml = "product_install_full_path: \"D:/Riot Games/VALORANT/live\"\n";
+        assert_eq!(
+            parse_riot_product_install_path(riot_yaml),
+            Some(PathBuf::from(r"D:\Riot Games\VALORANT\live"))
+        );
+
+        assert_eq!(known_battlenet_exe("Overwatch"), Some("overwatch.exe"));
+        assert_eq!(known_battlenet_exe("Call of Duty"), Some("cod.exe"));
+        assert_eq!(known_battlenet_exe("World of Warcraft"), Some("wow.exe"));
     }
 }

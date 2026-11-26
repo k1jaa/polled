@@ -63,7 +63,8 @@ pub use paths::AppPaths;
 pub use profiles::{
     discover_installed_games, discover_running_apps, export_profile_json, import_profile_json,
     match_profile, normalize_exe_name, DiscoveredGame, FocusDebouncer, FocusEvent,
-    ForegroundWatcher, GameProfile, GameSource, PowerPlanPreset, ProfileCardExport, ProfileStore,
+    ForegroundWatcher, GameProfile, GameSource, KeyboardProfileSettings, PowerPlanPreset,
+    ProfileCardExport, ProfileStore,
 };
 pub use settings::{
     format_autostart_command, is_autostart_enabled, set_autostart_enabled, AppSettings,

@@ -115,6 +115,8 @@ pub struct HotkeyConfig {
     pub cycle_audio_output: Option<HotkeyBinding>,
     #[serde(default = "default_hotkey_wooting")]
     pub cycle_wooting_profile: Option<HotkeyBinding>,
+    #[serde(default = "default_hotkey_mic_mute")]
+    pub toggle_mic_mute: Option<HotkeyBinding>,
 }
 
 fn default_hotkey_cycle() -> Option<HotkeyBinding> {
@@ -137,6 +139,10 @@ fn default_hotkey_wooting() -> Option<HotkeyBinding> {
     Some(HotkeyBinding::new(true, true, false, "K"))
 }
 
+fn default_hotkey_mic_mute() -> Option<HotkeyBinding> {
+    Some(HotkeyBinding::new(true, true, false, "M"))
+}
+
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
@@ -146,6 +152,7 @@ impl Default for HotkeyConfig {
             toggle_input_lab: default_hotkey_lab(),
             cycle_audio_output: default_hotkey_audio(),
             cycle_wooting_profile: default_hotkey_wooting(),
+            toggle_mic_mute: default_hotkey_mic_mute(),
         }
     }
 }
@@ -219,6 +226,10 @@ pub struct AppSettings {
     pub hotkeys: HotkeyConfig,
     #[serde(default)]
     pub alerts: TrayAlertConfig,
+    /// Optional pinned playback endpoint IDs for `Cycle Audio Output` (e.g. Headphones <-> Speakers,
+    /// skipping unused HDMI monitor audio outputs). Empty = cycle all active playback devices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_cycle_device_ids: Vec<String>,
 }
 
 fn default_schema_version() -> u32 {
@@ -233,6 +244,7 @@ impl Default for AppSettings {
             auto_switch_on_startup: false,
             hotkeys: HotkeyConfig::default(),
             alerts: TrayAlertConfig::default(),
+            audio_cycle_device_ids: Vec::new(),
         }
     }
 }
@@ -323,6 +335,7 @@ mod tests {
                 toggle_input_lab: None,
                 cycle_audio_output: Some(HotkeyBinding::new(true, true, false, "A")),
                 cycle_wooting_profile: Some(HotkeyBinding::new(true, true, false, "K")),
+                toggle_mic_mute: Some(HotkeyBinding::new(true, true, false, "M")),
             },
             alerts: TrayAlertConfig {
                 battery_tray_icon: true,
@@ -332,6 +345,10 @@ mod tests {
                 osd_pill_enabled: true,
                 low_battery_polling_guard: true,
             },
+            audio_cycle_device_ids: vec![
+                "{0.0.0.00000000}.{headset-guid}".to_string(),
+                "{0.0.0.00000000}.{speakers-guid}".to_string(),
+            ],
         };
         custom.save_atomic(&path).unwrap();
         assert_eq!(AppSettings::load_or_default(&path), custom);

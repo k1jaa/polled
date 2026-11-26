@@ -95,6 +95,9 @@ pub struct ProfileRuntimeSnapshot {
     pub audio_outputs: Vec<(String, String, bool)>,
     /// Active microphone endpoints as `(id, friendly_name, is_default)`.
     pub audio_inputs: Vec<(String, String, bool)>,
+    /// Current mute state of the default Windows microphone (`Some(true)` = muted).
+    #[serde(default)]
+    pub mic_muted: Option<bool>,
     /// Active Mic Gain Lock target (`0..=100%`) when the current profile enforces mic gain.
     pub mic_lock_active: Option<u8>,
     /// Attached monitors and their supported `(width, height, refresh_hz)` modes.
@@ -112,6 +115,8 @@ pub enum ProfileRuntimeCmd {
     CycleNextProfile,
     SwitchAudioOutput(String),
     CycleAudioOutput,
+    UpdateAudioCycleDevices(Vec<String>),
+    ToggleMicMute,
     RefreshAudioDevices,
     RefreshDisplays,
     TestDisplayMode {
@@ -200,6 +205,7 @@ impl ProfileRuntimeHandle {
         initial_store: ProfileStore,
         initial_auto_switch: bool,
         initial_alerts: TrayAlertConfig,
+        initial_audio_cycle_ids: Vec<String>,
         ui_tx: Sender<WorkerMsg>,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
@@ -213,6 +219,7 @@ impl ProfileRuntimeHandle {
                     initial_store,
                     initial_auto_switch,
                     initial_alerts,
+                    initial_audio_cycle_ids,
                     cmd_rx,
                     ui_tx,
                     wake,
@@ -339,6 +346,8 @@ struct RuntimeState {
     last_battery_poll: Instant,
     audio_outputs: Vec<(String, String, bool)>,
     audio_inputs: Vec<(String, String, bool)>,
+    audio_cycle_device_ids: Vec<String>,
+    mic_muted: Option<bool>,
     last_audio_refresh: Instant,
     /// `(optional_endpoint_id, target_volume_pct)` when Mic Gain Lock is active.
     mic_lock_target: Option<(Option<String>, u8)>,
@@ -436,6 +445,7 @@ impl RuntimeState {
             available_profiles,
             audio_outputs: self.audio_outputs.clone(),
             audio_inputs: self.audio_inputs.clone(),
+            mic_muted: self.mic_muted,
             mic_lock_active: self.mic_lock_target.as_ref().map(|(_, pct)| *pct),
             displays: self.displays.clone(),
             active_display_override: self.active_display_override.clone(),
@@ -875,16 +885,24 @@ impl RuntimeState {
             .into_iter()
             .map(|e| (e.id, e.name, e.is_default))
             .collect();
-        let next_inputs: Vec<(String, String, bool)> = env
+        let raw_inputs = env
             .list_audio_endpoints(AudioFlow::Capture)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let next_mic_muted = raw_inputs
+            .iter()
+            .find(|e| e.is_default)
+            .and_then(|e| e.muted);
+        let next_inputs: Vec<(String, String, bool)> = raw_inputs
             .into_iter()
             .map(|e| (e.id, e.name, e.is_default))
             .collect();
         self.last_audio_refresh = Instant::now();
-        let changed = next_outputs != self.audio_outputs || next_inputs != self.audio_inputs;
+        let changed = next_outputs != self.audio_outputs
+            || next_inputs != self.audio_inputs
+            || next_mic_muted != self.mic_muted;
         self.audio_outputs = next_outputs;
         self.audio_inputs = next_inputs;
+        self.mic_muted = next_mic_muted;
         changed
     }
 
@@ -1440,46 +1458,216 @@ impl RuntimeState {
             }
         }
 
-        // --- Keyboard Onboard Profile Switching (Wooting RAM-only, Wuque, Keychron HE, Arbiter PRO) ---
-        if let Some(slot) = profile.wooting_profile {
+        // --- Keyboard Onboard Profile Switching + Optional Per-Game Tuning Presets ---
+        let has_kb_preset = profile
+            .keyboard_preset
+            .as_ref()
+            .is_some_and(|kp| !kp.is_empty());
+        if profile.wooting_profile.is_some() || has_kb_preset {
             match detect_all_keyboards() {
                 Ok(boards) if !boards.is_empty() => {
                     let mut updated_infos = Vec::with_capacity(boards.len());
                     for kb in boards {
-                        let before = kb.read_status();
-                        if !before.capabilities.supports_profile_switch {
-                            updated_infos.push(before);
-                            continue;
-                        }
                         let kb_name = kb.name().to_string();
-                        match kb.switch_profile(slot) {
-                            Ok(true) => {
-                                let full = kb.read_status();
-                                let mode_note = if full.capabilities.profile_switch_volatile {
-                                    "volatile RAM"
-                                } else {
-                                    "onboard slot"
-                                };
-                                self.push_log(
-                                    Severity::Ok,
-                                    format!(
-                                        "[{kb_name}] Switched to {} ({reason}, {mode_note}).",
-                                        full.profile_display_name(slot)
-                                    ),
-                                );
-                                updated_infos.push(full);
-                            }
-                            Ok(false) => {
-                                updated_infos.push(kb.read_status());
-                            }
-                            Err(err) => {
-                                self.push_log(
-                                    Severity::Warn,
-                                    format!("[{kb_name}] Keyboard profile switch failed: {err}"),
-                                );
-                                updated_infos.push(kb.read_status());
+                        let mut cur = kb.read_status();
+
+                        // 1. Switch onboard profile slot first (if requested & supported).
+                        if let Some(slot) = profile.wooting_profile {
+                            if cur.capabilities.supports_profile_switch {
+                                match kb.switch_profile(slot) {
+                                    Ok(true) => {
+                                        cur = kb.read_status();
+                                        let mode_note = if cur.capabilities.profile_switch_volatile
+                                        {
+                                            "volatile RAM"
+                                        } else {
+                                            "onboard slot"
+                                        };
+                                        self.push_log(
+                                            Severity::Ok,
+                                            format!(
+                                                "[{kb_name}] Switched to {} ({reason}, {mode_note}).",
+                                                cur.profile_display_name(slot)
+                                            ),
+                                        );
+                                    }
+                                    Ok(false) => {}
+                                    Err(err) => {
+                                        self.push_log(
+                                            Severity::Warn,
+                                            format!(
+                                                "[{kb_name}] Keyboard profile switch failed: {err}"
+                                            ),
+                                        );
+                                    }
+                                }
                             }
                         }
+
+                        // 2. Apply optional per-game keyboard tuning overrides (diffed vs live state).
+                        if let Some(preset) =
+                            profile.keyboard_preset.as_ref().filter(|kp| !kp.is_empty())
+                        {
+                            let mut any_preset_write = false;
+
+                            if let Some(hz) = preset.polling_rate_hz {
+                                let allowed = cur.capabilities.supports_polling_rate_write
+                                    && (cur.capabilities.supported_polling_rates_hz.is_empty()
+                                        || cur
+                                            .capabilities
+                                            .supported_polling_rates_hz
+                                            .contains(&hz));
+                                if allowed && cur.polling_rate_hz != Some(hz) {
+                                    match kb.set_polling_rate(hz) {
+                                        Ok(confirmed) => {
+                                            any_preset_write = true;
+                                            self.push_log(
+                                                Severity::Ok,
+                                                format!(
+                                                    "[{kb_name}] Polling rate -> {confirmed} Hz ({reason})."
+                                                ),
+                                            );
+                                        }
+                                        Err(err) => {
+                                            self.push_log(
+                                                Severity::Warn,
+                                                format!(
+                                                    "[{kb_name}] Polling rate {hz} Hz failed: {err}"
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            let req_act = preset.actuation_mm();
+                            let req_rt_on = preset.rapid_trigger_enabled;
+                            let req_rt_mm = preset.rapid_trigger_mm();
+                            if (req_act.is_some() || req_rt_mm.is_some())
+                                && cur.capabilities.supports_base_actuation_write
+                            {
+                                let target_act = req_act.or(cur.actuation_mm).unwrap_or(2.0);
+                                let act_diff = req_act.is_some_and(|want| {
+                                    cur.actuation_mm.is_none_or(|c| (c - want).abs() >= 0.005)
+                                });
+                                let rt_en_diff = req_rt_on
+                                    .is_some_and(|want| cur.rapid_trigger_enabled != Some(want));
+                                let rt_mm_diff = req_rt_mm.is_some_and(|want| {
+                                    cur.rapid_trigger_mm
+                                        .is_none_or(|c| (c - want).abs() >= 0.005)
+                                });
+                                if act_diff || rt_en_diff || rt_mm_diff {
+                                    match kb.set_base_actuation(target_act, req_rt_on, req_rt_mm) {
+                                        Ok(()) => {
+                                            any_preset_write = true;
+                                            self.push_log(
+                                                Severity::Ok,
+                                                format!(
+                                                    "[{kb_name}] Applied keyboard preset ({}) ({reason}).",
+                                                    preset.summary_string()
+                                                ),
+                                            );
+                                        }
+                                        Err(err) => {
+                                            self.push_log(
+                                                Severity::Warn,
+                                                format!(
+                                                    "[{kb_name}] Actuation/RT preset failed: {err}"
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if let Some(rt_on) = req_rt_on {
+                                if cur.capabilities.supports_rapid_trigger_toggle
+                                    && cur.rapid_trigger_enabled != Some(rt_on)
+                                {
+                                    match kb.set_rapid_trigger_enabled(rt_on) {
+                                        Ok(confirmed) => {
+                                            any_preset_write = true;
+                                            self.push_log(
+                                                Severity::Ok,
+                                                format!(
+                                                    "[{kb_name}] Rapid Trigger -> {} ({reason}).",
+                                                    if confirmed { "ON" } else { "OFF" }
+                                                ),
+                                            );
+                                        }
+                                        Err(err) => {
+                                            self.push_log(
+                                                Severity::Warn,
+                                                format!("[{kb_name}] Rapid Trigger toggle failed: {err}"),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(socd) = preset.socd_enabled {
+                                if cur.capabilities.supports_socd_toggle
+                                    && cur.socd_enabled != Some(socd)
+                                {
+                                    match kb.set_socd(socd) {
+                                        Ok(confirmed) => {
+                                            any_preset_write = true;
+                                            self.push_log(
+                                                Severity::Ok,
+                                                format!(
+                                                    "[{kb_name}] SOCD -> {} ({reason}).",
+                                                    if confirmed { "ON" } else { "OFF" }
+                                                ),
+                                            );
+                                        }
+                                        Err(err) => {
+                                            self.push_log(
+                                                Severity::Warn,
+                                                format!("[{kb_name}] SOCD toggle failed: {err}"),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            if cur.capabilities.supports_debounce_tuning
+                                && (preset.debounce_typing_mode.is_some()
+                                    || preset.debounce_ms.is_some())
+                            {
+                                let cur_typing = cur
+                                    .debounce_mode
+                                    .as_deref()
+                                    .is_some_and(|m| m.eq_ignore_ascii_case("typing"));
+                                let want_typing = preset.debounce_typing_mode.unwrap_or(cur_typing);
+                                let want_ms = preset.debounce_ms.or(cur.debounce_ms).unwrap_or(10);
+                                if cur_typing != want_typing || cur.debounce_ms != Some(want_ms) {
+                                    match kb.set_debounce_mode(want_typing, want_ms) {
+                                        Ok(()) => {
+                                            any_preset_write = true;
+                                            self.push_log(
+                                                Severity::Ok,
+                                                format!(
+                                                    "[{kb_name}] Debounce -> {} · {want_ms} ms ({reason}).",
+                                                    if want_typing { "Typing" } else { "Gaming" }
+                                                ),
+                                            );
+                                        }
+                                        Err(err) => {
+                                            self.push_log(
+                                                Severity::Warn,
+                                                format!(
+                                                    "[{kb_name}] Debounce preset failed: {err}"
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            if any_preset_write {
+                                cur = kb.read_status();
+                            }
+                        }
+
+                        updated_infos.push(cur);
                     }
                     self.keyboards = updated_infos;
                 }
@@ -1813,6 +2001,7 @@ fn run_runtime_loop(
     initial_store: ProfileStore,
     initial_auto_switch: bool,
     initial_alerts: TrayAlertConfig,
+    initial_audio_cycle_ids: Vec<String>,
     cmd_rx: Receiver<ProfileRuntimeCmd>,
     ui_tx: Sender<WorkerMsg>,
     wake: Arc<dyn Fn() + Send + Sync>,
@@ -1840,6 +2029,8 @@ fn run_runtime_loop(
         last_battery_poll: Instant::now(),
         audio_outputs: Vec::new(),
         audio_inputs: Vec::new(),
+        audio_cycle_device_ids: initial_audio_cycle_ids,
+        mic_muted: None,
         last_audio_refresh: Instant::now(),
         mic_lock_target: None,
         last_mic_lock_check: Instant::now(),
@@ -2579,20 +2770,58 @@ fn run_runtime_loop(
             }
             Ok(ProfileRuntimeCmd::CycleAudioOutput) => {
                 state.refresh_audio_devices();
-                if state.audio_outputs.len() >= 2 {
-                    let cur_idx = state
-                        .audio_outputs
-                        .iter()
-                        .position(|(_, _, is_def)| *is_def)
-                        .unwrap_or(0);
-                    let next_idx = (cur_idx + 1) % state.audio_outputs.len();
-                    let next_id = state.audio_outputs[next_idx].0.clone();
+                if let Some((next_id, next_name)) =
+                    select_next_audio_output(&state.audio_outputs, &state.audio_cycle_device_ids)
+                {
+                    let next_id = next_id.to_string();
+                    let next_name = next_name.to_string();
                     state.switch_audio_output(&next_id, "hotkey cycle");
+                    if state.alerts.osd_pill_enabled {
+                        let _ = ui_tx.send(WorkerMsg::ShowOsdPill {
+                            title: "Polled · Audio Output".to_string(),
+                            subtitle: next_name,
+                        });
+                    }
+                } else if !state.audio_cycle_device_ids.is_empty() {
+                    state.push_log(
+                        Severity::Info,
+                        "Audio output cycle skipped: fewer than 2 pinned playback devices are currently active.",
+                    );
                 } else {
                     state.push_log(
                         Severity::Info,
                         "Audio output cycle skipped: fewer than 2 active playback devices.",
                     );
+                }
+                state.emit(&ui_tx, &wake);
+            }
+            Ok(ProfileRuntimeCmd::UpdateAudioCycleDevices(ids)) => {
+                state.audio_cycle_device_ids = ids;
+                state.emit(&ui_tx, &wake);
+            }
+            Ok(ProfileRuntimeCmd::ToggleMicMute) => {
+                let env = WindowsEnv;
+                match env.toggle_audio_endpoint_mute(AudioFlow::Capture, None) {
+                    Ok((mic_name, now_muted)) => {
+                        state.mic_muted = Some(now_muted);
+                        let state_lbl = if now_muted { "MUTED" } else { "LIVE" };
+                        state.push_log(
+                            Severity::Ok,
+                            format!("Microphone -> {state_lbl} ({mic_name})."),
+                        );
+                        if state.alerts.osd_pill_enabled {
+                            let _ = ui_tx.send(WorkerMsg::ShowOsdPill {
+                                title: "Polled · Microphone".to_string(),
+                                subtitle: format!("{state_lbl} · {mic_name}"),
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        state.push_log(
+                            Severity::Warn,
+                            format!("Could not toggle microphone mute: {err}"),
+                        );
+                    }
                 }
                 state.emit(&ui_tx, &wake);
             }
@@ -2673,5 +2902,103 @@ fn run_runtime_loop(
                 }
             }
         }
+    }
+}
+
+/// Selects the next playback endpoint for `CycleAudioOutput`, honoring optional user-pinned
+/// endpoint IDs (`Headphones <-> Speakers`, skipping unpinned HDMI/monitor speakers).
+pub(crate) fn select_next_audio_output<'a>(
+    outputs: &'a [(String, String, bool)],
+    pinned_ids: &[String],
+) -> Option<(&'a str, &'a str)> {
+    let eligible: Vec<&(String, String, bool)> = if pinned_ids.is_empty() {
+        outputs.iter().collect()
+    } else {
+        outputs
+            .iter()
+            .filter(|(id, _, _)| pinned_ids.iter().any(|p| p.eq_ignore_ascii_case(id)))
+            .collect()
+    };
+
+    if eligible.len() < 2 {
+        return None;
+    }
+
+    let next_idx = match eligible.iter().position(|(_, _, is_def)| *is_def) {
+        Some(cur) => (cur + 1) % eligible.len(),
+        None => 0,
+    };
+    let chosen = eligible[next_idx];
+    Some((chosen.0.as_str(), chosen.1.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_cycle_honors_pinned_devices_and_skips_hdmi_outputs() {
+        let outputs = vec![
+            (
+                "id_headset".to_string(),
+                "Headphones (DAC)".to_string(),
+                true,
+            ),
+            (
+                "id_hdmi1".to_string(),
+                "ASUS XG27AQDMG (NVIDIA)".to_string(),
+                false,
+            ),
+            (
+                "id_speakers".to_string(),
+                "Desktop Speakers".to_string(),
+                false,
+            ),
+            (
+                "id_hdmi2".to_string(),
+                "BenQ Monitor Audio".to_string(),
+                false,
+            ),
+        ];
+
+        // Unpinned cycles all 4 in order.
+        assert_eq!(
+            select_next_audio_output(&outputs, &[]),
+            Some(("id_hdmi1", "ASUS XG27AQDMG (NVIDIA)"))
+        );
+
+        // Pinned strictly toggles Headphones <-> Speakers, skipping both HDMI monitors.
+        let pins = vec!["id_headset".to_string(), "id_speakers".to_string()];
+        assert_eq!(
+            select_next_audio_output(&outputs, &pins),
+            Some(("id_speakers", "Desktop Speakers"))
+        );
+
+        // If user is currently on an unpinned HDMI monitor, cycle snaps straight to first pin.
+        let on_hdmi = vec![
+            (
+                "id_headset".to_string(),
+                "Headphones (DAC)".to_string(),
+                false,
+            ),
+            (
+                "id_hdmi1".to_string(),
+                "ASUS XG27AQDMG (NVIDIA)".to_string(),
+                true,
+            ),
+            (
+                "id_speakers".to_string(),
+                "Desktop Speakers".to_string(),
+                false,
+            ),
+        ];
+        assert_eq!(
+            select_next_audio_output(&on_hdmi, &pins),
+            Some(("id_headset", "Headphones (DAC)"))
+        );
+
+        // Fewer than 2 active pinned devices returns None cleanly.
+        let one_pin = vec!["id_headset".to_string(), "id_unplugged".to_string()];
+        assert_eq!(select_next_audio_output(&outputs, &one_pin), None);
     }
 }

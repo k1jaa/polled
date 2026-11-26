@@ -640,7 +640,101 @@ impl SystemEnv for MockEnv {
         Ok(())
     }
 
+    fn get_audio_endpoint_mute(&self, flow: AudioFlow, endpoint_id: Option<&str>) -> Result<bool> {
+        let s = self.state.lock().unwrap();
+        let found = s.audio_endpoints.iter().find(|e| {
+            e.flow == flow
+                && match endpoint_id {
+                    Some(id) => e.id == id,
+                    None => e.is_default,
+                }
+        });
+        Ok(found.and_then(|e| e.muted).unwrap_or(false))
+    }
+
+    fn set_audio_endpoint_mute(
+        &self,
+        flow: AudioFlow,
+        endpoint_id: Option<&str>,
+        muted: bool,
+    ) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(ep) = s.audio_endpoints.iter_mut().find(|e| {
+            e.flow == flow
+                && match endpoint_id {
+                    Some(id) => e.id == id,
+                    None => e.is_default,
+                }
+        }) {
+            ep.muted = Some(muted);
+        }
+        Ok(())
+    }
+
+    fn toggle_audio_endpoint_mute(
+        &self,
+        flow: AudioFlow,
+        endpoint_id: Option<&str>,
+    ) -> Result<(String, bool)> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(ep) = s.audio_endpoints.iter_mut().find(|e| {
+            e.flow == flow
+                && match endpoint_id {
+                    Some(id) => e.id == id,
+                    None => e.is_default,
+                }
+        }) {
+            let next = !ep.muted.unwrap_or(false);
+            ep.muted = Some(next);
+            return Ok((ep.name.clone(), next));
+        }
+        Ok(("Default Audio Device".to_string(), true))
+    }
+
     fn list_network_adapters(&self) -> Result<Vec<NetworkAdapterInfo>> {
         Ok(self.state.lock().unwrap().network_adapters.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_env_toggles_default_microphone_mute_state() {
+        let env = MockEnv::new();
+        env.set_audio_endpoints(vec![AudioEndpointInfo {
+            id: "mic_1".to_string(),
+            guid: "{1111}".to_string(),
+            name: "Shure MV7".to_string(),
+            flow: AudioFlow::Capture,
+            is_default: true,
+            volume_percent: Some(85),
+            muted: Some(false),
+            sample_rate_hz: Some(48_000),
+            channels: Some(1),
+            bits_per_sample: Some(24),
+            default_period_ms: Some(10.0),
+            min_period_ms: Some(2.67),
+            enhancements_enabled: Some(false),
+            is_bluetooth_hands_free: false,
+        }]);
+
+        assert!(!env
+            .get_audio_endpoint_mute(AudioFlow::Capture, None)
+            .unwrap());
+        let (name, muted) = env
+            .toggle_audio_endpoint_mute(AudioFlow::Capture, None)
+            .unwrap();
+        assert_eq!(name, "Shure MV7");
+        assert!(muted);
+        assert!(env
+            .get_audio_endpoint_mute(AudioFlow::Capture, None)
+            .unwrap());
+
+        let (_, muted2) = env
+            .toggle_audio_endpoint_mute(AudioFlow::Capture, None)
+            .unwrap();
+        assert!(!muted2);
     }
 }

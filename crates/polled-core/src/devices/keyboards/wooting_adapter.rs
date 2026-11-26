@@ -132,4 +132,13 @@ impl KeyboardDevice for WootingKeyboardAdapter {
         })?;
         Ok(())
     }
+
+    fn set_rapid_trigger_enabled(&self, enabled: bool) -> Result<bool> {
+        self.inner.write_analog_defaults(&WootingAnalogBasePatch {
+            actuation_mm: None,
+            rapid_trigger_enabled: Some(enabled),
+            rapid_trigger_sensitivity_mm: None,
+        })?;
+        Ok(enabled)
+    }
 }

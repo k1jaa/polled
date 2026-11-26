@@ -77,6 +77,102 @@ impl PowerPlanPreset {
     }
 }
 
+/// Optional per-game keyboard tuning overrides applied beyond onboard profile slot switching
+/// (supported selectively per connected board's [`KeyboardCapabilities`], diffed to avoid
+/// redundant HID writes).
+///
+/// Millimeter values are stored as exact integer hundredths (`0.01 mm` units, e.g. `40` = `0.40 mm`)
+/// so `GameProfile` preserves exact equality and deterministic JSON serialization.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyboardProfileSettings {
+    /// Target USB polling rate in Hz (e.g. `1000`, `4000`, `8000`) on boards that support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polling_rate_hz: Option<u16>,
+    /// Target base actuation depth in hundredths of a millimeter (`10..=400`, i.e. `0.10..=4.00 mm`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actuation_hundredths_mm: Option<u16>,
+    /// Enable or disable Rapid Trigger on supported Hall-Effect / analog keyboards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rapid_trigger_enabled: Option<bool>,
+    /// Target Rapid Trigger sensitivity in hundredths of a millimeter (`10..=250`, i.e. `0.10..=2.50 mm`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rapid_trigger_hundredths_mm: Option<u16>,
+    /// Enable or disable SOCD / Snap Tap / Rapid Tap / Key Priority on supported boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socd_enabled: Option<bool>,
+    /// Optional debounce mode (`false` = Gaming, `true` = Typing) on Geonworks Venom 8K boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_typing_mode: Option<bool>,
+    /// Optional debounce time in milliseconds (`5..=40 ms`) on Geonworks Venom 8K boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_ms: Option<u8>,
+}
+
+impl KeyboardProfileSettings {
+    pub fn is_empty(&self) -> bool {
+        self.polling_rate_hz.is_none()
+            && self.actuation_hundredths_mm.is_none()
+            && self.rapid_trigger_enabled.is_none()
+            && self.rapid_trigger_hundredths_mm.is_none()
+            && self.socd_enabled.is_none()
+            && self.debounce_typing_mode.is_none()
+            && self.debounce_ms.is_none()
+    }
+
+    pub fn actuation_mm(&self) -> Option<f32> {
+        self.actuation_hundredths_mm
+            .map(|h| f32::from(h.clamp(10, 400)) / 100.0)
+    }
+
+    pub fn rapid_trigger_mm(&self) -> Option<f32> {
+        self.rapid_trigger_hundredths_mm
+            .map(|h| f32::from(h.clamp(10, 250)) / 100.0)
+    }
+
+    pub fn sanitized(mut self) -> Option<Self> {
+        self.polling_rate_hz = self
+            .polling_rate_hz
+            .filter(|hz| matches!(*hz, 125 | 250 | 500 | 1000 | 2000 | 4000 | 8000));
+        self.actuation_hundredths_mm = self.actuation_hundredths_mm.map(|h| h.clamp(10, 400));
+        self.rapid_trigger_hundredths_mm =
+            self.rapid_trigger_hundredths_mm.map(|h| h.clamp(10, 250));
+        self.debounce_ms = self.debounce_ms.map(|ms| ms.clamp(5, 40));
+        if self.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+
+    pub fn summary_string(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(hz) = self.polling_rate_hz {
+            parts.push(format!("{hz} Hz"));
+        }
+        if let Some(mm) = self.actuation_mm() {
+            parts.push(format!("{mm:.2}mm"));
+        }
+        match (self.rapid_trigger_enabled, self.rapid_trigger_mm()) {
+            (Some(true), Some(rt)) => parts.push(format!("RT {rt:.2}mm")),
+            (Some(true), None) => parts.push("RT ON".to_string()),
+            (Some(false), _) => parts.push("RT OFF".to_string()),
+            (None, Some(rt)) => parts.push(format!("RT {rt:.2}mm")),
+            (None, None) => {}
+        }
+        if let Some(socd) = self.socd_enabled {
+            parts.push(format!("SOCD {}", if socd { "ON" } else { "OFF" }));
+        }
+        if let Some(ms) = self.debounce_ms {
+            let mode = match self.debounce_typing_mode {
+                Some(true) => "Typing",
+                _ => "Gaming",
+            };
+            parts.push(format!("{mode} {ms}ms"));
+        }
+        parts.join(" · ")
+    }
+}
+
 /// Single peripheral profile targeting either specific game executables or the default desktop.
 ///
 /// Kept flat, clean, and versioned so shareable "settings cards" can be built directly on top.
@@ -134,9 +230,13 @@ pub struct GameProfile {
     /// Optional temporary display refresh rate override in Hz (e.g. `240`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_refresh_hz: Option<u32>,
-    /// Optional Wooting keyboard onboard profile slot (`0..=7`, displayed as Profile 1–8; zero flash wear).
+    /// Optional Wooting / multi-brand keyboard onboard profile slot (`0..=7`, displayed as Profile 1–8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wooting_profile: Option<u8>,
+    /// Optional per-game keyboard tuning overrides (polling rate, actuation, Rapid Trigger, SOCD,
+    /// debounce) applied to boards that support each control beyond slot switching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard_preset: Option<KeyboardProfileSettings>,
     /// Optional: ensures Windows Graphics Settings (`HKCU\...\UserGpuPreferences`) pins this
     /// game's `.exe` to High Performance GPU (`GpuPreference=2;`) when focused (zero admin).
     #[serde(default)]
@@ -191,6 +291,7 @@ impl GameProfile {
             display_height: None,
             display_refresh_hz: None,
             wooting_profile: None,
+            keyboard_preset: None,
             force_high_perf_gpu: false,
             quiet_notifications: false,
             duck_audio_apps: Vec::new(),
@@ -285,6 +386,9 @@ impl GameProfile {
         self.wooting_profile = self
             .wooting_profile
             .map(|idx| idx.min(crate::devices::WOOTING_MAX_PROFILE_INDEX));
+        self.keyboard_preset = self
+            .keyboard_preset
+            .and_then(KeyboardProfileSettings::sanitized);
         self.duck_audio_apps = self
             .duck_audio_apps
             .into_iter()
@@ -456,6 +560,15 @@ mod tests {
             display_height: Some(960),
             display_refresh_hz: Some(240),
             wooting_profile: Some(1),
+            keyboard_preset: Some(KeyboardProfileSettings {
+                polling_rate_hz: Some(4000),
+                actuation_hundredths_mm: Some(40),
+                rapid_trigger_enabled: Some(true),
+                rapid_trigger_hundredths_mm: Some(15),
+                socd_enabled: Some(false),
+                debounce_typing_mode: None,
+                debounce_ms: None,
+            }),
             force_high_perf_gpu: true,
             quiet_notifications: true,
             duck_audio_apps: vec!["spotify.exe".to_string()],
@@ -475,6 +588,15 @@ mod tests {
         assert_eq!(loaded.profiles[1].mouse.dpi_stage, Some(2));
         assert_eq!(loaded.profiles[1].mouse.lock_dpi_stages, Some(true));
         assert_eq!(loaded.profiles[1].wooting_profile, Some(1));
+        let kp = loaded.profiles[1].keyboard_preset.as_ref().unwrap();
+        assert_eq!(kp.polling_rate_hz, Some(4000));
+        assert_eq!(kp.actuation_mm(), Some(0.4));
+        assert_eq!(kp.rapid_trigger_enabled, Some(true));
+        assert_eq!(kp.rapid_trigger_mm(), Some(0.15));
+        assert_eq!(kp.socd_enabled, Some(false));
+        assert!(kp.summary_string().contains("4000 Hz"));
+        assert!(kp.summary_string().contains("0.40mm"));
+        assert!(kp.summary_string().contains("RT 0.15mm"));
         assert_eq!(
             loaded.profiles[1].windows_power_plan,
             Some(PowerPlanPreset::HighPerformance)
@@ -522,6 +644,7 @@ mod tests {
             display_height: None,
             display_refresh_hz: None,
             wooting_profile: None,
+            keyboard_preset: None,
             force_high_perf_gpu: false,
             quiet_notifications: false,
             duck_audio_apps: Vec::new(),
@@ -535,5 +658,28 @@ mod tests {
         assert_eq!(imported.id, "valorant");
         assert_eq!(imported.executables, vec!["valorant-win64-shipping.exe"]);
         assert_eq!(imported.mouse.polling_rate_hz, Some(4000));
+    }
+
+    #[test]
+    fn keyboard_preset_sanitizes_bounds_and_empty_collapses_to_none() {
+        let empty = KeyboardProfileSettings::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.sanitized(), None);
+
+        let clamped = KeyboardProfileSettings {
+            polling_rate_hz: Some(9999),      // invalid -> cleared
+            actuation_hundredths_mm: Some(5), // below 0.10mm -> clamped to 10
+            rapid_trigger_enabled: Some(true),
+            rapid_trigger_hundredths_mm: Some(500), // above 2.50mm -> clamped to 250
+            socd_enabled: None,
+            debounce_typing_mode: Some(false),
+            debounce_ms: Some(1), // below 5ms -> clamped to 5
+        }
+        .sanitized()
+        .unwrap();
+        assert_eq!(clamped.polling_rate_hz, None);
+        assert_eq!(clamped.actuation_hundredths_mm, Some(10));
+        assert_eq!(clamped.rapid_trigger_hundredths_mm, Some(250));
+        assert_eq!(clamped.debounce_ms, Some(5));
     }
 }

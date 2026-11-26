@@ -487,6 +487,7 @@ impl PolledApp {
             profiles_ui.store.clone(),
             settings.auto_switch_on_startup,
             settings.alerts.clone(),
+            settings.audio_cycle_device_ids.clone(),
             tx.clone(),
             Arc::clone(&wake),
         );
@@ -991,6 +992,9 @@ impl PolledApp {
                         self.profile_runtime
                             .send(ProfileRuntimeCmd::SwitchAudioOutput(audio_id));
                     }
+                    TrayAction::ToggleMicMute => {
+                        self.profile_runtime.send(ProfileRuntimeCmd::ToggleMicMute);
+                    }
                     TrayAction::ToggleProfileLock => {
                         let next = !self.profile_locked_state.load(Ordering::SeqCst);
                         self.profile_locked_state.store(next, Ordering::SeqCst);
@@ -1039,6 +1043,9 @@ impl PolledApp {
                     HotkeyAction::CycleWootingProfile => {
                         self.profile_runtime
                             .send(ProfileRuntimeCmd::CycleWootingProfile);
+                    }
+                    HotkeyAction::ToggleMicMute => {
+                        self.profile_runtime.send(ProfileRuntimeCmd::ToggleMicMute);
                     }
                 },
                 WorkerMsg::ScanFinished {
@@ -2453,6 +2460,12 @@ impl eframe::App for PolledApp {
                         .inner_margin(Margin::same(16)),
                 )
                 .show(ctx, |ui| {
+                    let modal_scroll_h = (ctx.screen_rect().height() - 160.0).clamp(260.0, 520.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_modal_scroll")
+                        .max_height(modal_scroll_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
                     ui.label(
                         RichText::new("TRAY ICON & NOTIFICATIONS")
                             .size(10.5)
@@ -2574,8 +2587,121 @@ impl eframe::App for PolledApp {
                                     "K",
                                 );
                                 ui.end_row();
+                                render_hotkey_binding_row(
+                                    ui,
+                                    "Toggle Mic Mute",
+                                    "hk_mic_mute",
+                                    &mut self.settings.hotkeys.toggle_mic_mute,
+                                    "M",
+                                );
+                                ui.end_row();
                             });
                     });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.label(
+                        RichText::new("AUDIO OUTPUT CYCLE FILTER (HEADPHONES <-> SPEAKERS)")
+                            .size(10.5)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Pin 2+ playback devices below so Cycle Audio Output skips unused HDMI/monitor speakers. Leave all unchecked to cycle every active device.",
+                            )
+                            .size(11.5)
+                            .color(p.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(6.0);
+                    let active_outputs: Vec<(String, String, bool)> = self
+                        .profiles_ui
+                        .runtime_snapshot
+                        .as_ref()
+                        .map(|s| s.audio_outputs.clone())
+                        .unwrap_or_default();
+                    if active_outputs.is_empty() {
+                        ui.label(
+                            RichText::new("No active playback devices detected yet.")
+                                .size(11.5)
+                                .color(p.text_muted),
+                        );
+                    } else {
+                        for (dev_id, dev_name, is_def) in &active_outputs {
+                            let mut pinned = self
+                                .settings
+                                .audio_cycle_device_ids
+                                .iter()
+                                .any(|id| id.eq_ignore_ascii_case(dev_id));
+                            let lbl = if *is_def {
+                                format!("{dev_name} (default)")
+                            } else {
+                                dev_name.clone()
+                            };
+                            if ui.checkbox(&mut pinned, lbl).changed() {
+                                if pinned {
+                                    if !self
+                                        .settings
+                                        .audio_cycle_device_ids
+                                        .iter()
+                                        .any(|id| id.eq_ignore_ascii_case(dev_id))
+                                    {
+                                        self.settings.audio_cycle_device_ids.push(dev_id.clone());
+                                    }
+                                } else {
+                                    self.settings
+                                        .audio_cycle_device_ids
+                                        .retain(|id| !id.eq_ignore_ascii_case(dev_id));
+                                }
+                            }
+                        }
+                        let active_pinned = active_outputs
+                            .iter()
+                            .filter(|(id, _, _)| {
+                                self.settings
+                                    .audio_cycle_device_ids
+                                    .iter()
+                                    .any(|pin| pin.eq_ignore_ascii_case(id))
+                            })
+                            .count();
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if self.settings.audio_cycle_device_ids.is_empty() {
+                                ui.label(
+                                    RichText::new("Cycling all active playback devices.")
+                                        .size(11.0)
+                                        .color(p.text_muted),
+                                );
+                            } else if active_pinned < 2 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Pin at least 2 active devices ({active_pinned} active pinned)."
+                                    ))
+                                    .size(11.0)
+                                    .color(p.warn),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Cycling {active_pinned} pinned devices (unpinned HDMI/monitors skipped)."
+                                    ))
+                                    .size(11.0)
+                                    .color(p.ok),
+                                );
+                            }
+                            if !self.settings.audio_cycle_device_ids.is_empty()
+                                && ui.add(secondary_button("Clear Pins", p)).clicked()
+                            {
+                                self.settings.audio_cycle_device_ids.clear();
+                            }
+                        });
+                    }
 
                     ui.add_space(10.0);
                     ui.separator();
@@ -2715,7 +2841,8 @@ impl eframe::App for PolledApp {
                         }
                     }
 
-                    ui.add_space(12.0);
+                    });
+                    ui.add_space(10.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(primary_button("Save & Apply", p)).clicked() {
                             save_hk = true;
@@ -2752,6 +2879,10 @@ impl eframe::App for PolledApp {
                 self.profile_runtime
                     .send(ProfileRuntimeCmd::UpdateAlertConfig(
                         self.settings.alerts.clone(),
+                    ));
+                self.profile_runtime
+                    .send(ProfileRuntimeCmd::UpdateAudioCycleDevices(
+                        self.settings.audio_cycle_device_ids.clone(),
                     ));
                 self.sync_tray_from_snapshot();
                 self.status_message =
@@ -2915,6 +3046,10 @@ impl eframe::App for PolledApp {
                         self.profile_runtime
                             .send(ProfileRuntimeCmd::UpdateAlertConfig(
                                 self.settings.alerts.clone(),
+                            ));
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::UpdateAudioCycleDevices(
+                                self.settings.audio_cycle_device_ids.clone(),
                             ));
                         self.profiles_ui.reload_store(restored.profiles.clone());
                         self.profile_runtime
