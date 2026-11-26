@@ -16,7 +16,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.14.0] - 2026-11-26
 
 ### Added
 - **1-Click Installed Game Discovery Across 6 Launchers (`profiles/game_discovery.rs`, `profiles_ui.rs`):**
@@ -42,6 +42,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Replaced the 50 ms tray polling loop with native event-driven `TrayIconEvent::set_event_handler` / `MenuEvent::set_event_handler` callbacks and replaced the 250 ms single-instance wait loop with kernel-blocking `WaitForMultipleObjects(..., INFINITE)` for true 0% idle CPU.
   - Added clean `WM_QUERYENDSESSION` / `WM_ENDSESSION` handling and deterministic runtime thread join on quit so temporary display overrides, ducked app mixer volumes, and quiet notifications always restore cleanly.
   - Tightened release profile (`opt-level = "s"`, `lto = true`, `strip = true`, `panic = "abort"`), shrinking `polled-gui.exe` from `9.19 MB` to `5.53 MB` and `polled.exe` from `2.96 MB` to `1.47 MB`.
+
+### Fixed
+- **Profile List & Editor Card Header Layouts (`profiles_ui.rs`):**
+  - Split the narrow Profiles sidebar header into two clean rows (`Profiles` + `Import`, then `+ Game` + `+ Blank`) and added responsive wrapping to the Profile Editor action bar (`Save`, `Apply Now`, `Export`, `Duplicate`, `Delete`) so header buttons never overlap or clip titles at any window width.
 
 ---
 
