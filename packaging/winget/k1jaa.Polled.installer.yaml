@@ -18,7 +18,7 @@ UpgradeBehavior: install
 ReleaseDate: 2026-11-26
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/k1jaa/polled/releases/download/v0.13.0/polled-v0.13.0-windows-x86_64.zip
+    InstallerUrl: https://github.com/k1jaa/polled/releases/download/v0.13.0/polled-v0.13.0-windows-x64.zip
     InstallerSha256: REPLACE_WITH_SHA256_FROM_RELEASE_ZIP
 ManifestType: installer
 ManifestVersion: 1.9.0

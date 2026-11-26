@@ -16,7 +16,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.13.0] - 2026-11-26
 
 ### Added
 - **Multi-Brand Keyboard Architecture & 9 New Open-Source Keyboard Backends (`devices/keyboards/*`, `keyboard_ui.rs`, `profile_runtime.rs`, `profiles_ui.rs`, `tray.rs`, `diagnostics/export.rs`, `polled-cli`):**
@@ -31,12 +31,6 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     - **Kochi Hummingbird 68** (`1ca2:0901`, `0xFFA0:0x0001`): verified `KOCHI68` identity + Windows/macOS mode toggle.
     - **Geonworks Venom 8K** (`0483:5204/5205/5206/5207/520b` — VENOM-60MX/80MX/WISH45-8K): `baram-qmk-8k` `0xB0` firmware, matrix, USB SOF heartbeat & error counters, plus VIA channel 13 Gaming/Typing debounce (`5–40 ms`).
     - **Universal QMK / VIA** (`0xFF60:0x61`, unclaimed boards): read-only VIA protocol version, layer count, firmware/keycodes rev, board uptime, macro slots & buffer size.
-
----
-
-## [0.13.0] - 2026-11-26
-
-### Added
 - **Dedicated `Keyboard` Tab & `Profiles → Keyboard` Sub-Tab (`keyboard_ui.rs`, `app.rs`, `profiles_ui.rs`):**
   - Promoted Wooting keyboard management into its own top-level **Keyboard** workspace in the left rail (with live `P#` / `LIVE` badge and `RIG STATUS` summary) plus a dedicated **Keyboard** sub-tab inside the Profile Editor showing real firmware profile names instead of generic `Profile 1–4`.
 - **Deep Open-Source-Verified Wooting ARM & Standard HID Protocol (`devices/wooting.rs`, `profile_runtime.rs`, `polled-cli`):**
