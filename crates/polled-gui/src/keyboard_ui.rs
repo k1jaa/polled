@@ -45,6 +45,11 @@ enum GenericConfirmAction {
 use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::theme::{Palette, ThemeMode};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardNavAction {
+    OpenChatterTester,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PerKeyConfirmAction {
     SetMm(f32),
@@ -435,7 +440,8 @@ impl KeyboardUiState {
         mode: ThemeMode,
         snap: Option<&ProfileRuntimeSnapshot>,
         runtime: &ProfileRuntimeHandle,
-    ) {
+    ) -> Option<KeyboardNavAction> {
+        let mut nav_action = None;
         let boards: &[KeyboardStatus] = snap.map(|s| s.keyboards.as_slice()).unwrap_or(&[]);
         if !boards.is_empty() && self.selected_index >= boards.len() {
             self.selected_index = 0;
@@ -480,6 +486,15 @@ impl KeyboardUiState {
                     .clicked()
                 {
                     report_clicked = true;
+                }
+                if ui
+                    .add(secondary_btn("Chatter & Polling Test", p))
+                    .on_hover_text(
+                        "Open Bench -> Aim & Switches to test key chatter / double-typing and USB scan rate",
+                    )
+                    .clicked()
+                {
+                    nav_action = Some(KeyboardNavAction::OpenChatterTester);
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.label(RichText::new("Keyboard").size(20.0).strong().color(p.text));
@@ -680,6 +695,7 @@ impl KeyboardUiState {
         if close_report {
             self.report_modal = None;
         }
+        nav_action
     }
 
     fn render_empty_state(

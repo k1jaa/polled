@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::WorkerMsg;
 use crate::hotplug::UsbHotplugWatcher;
-use crate::notifications::{notify_low_battery, notify_profile_switched};
+use crate::notifications::{notify_battery_full, notify_low_battery, notify_profile_switched};
 
 const MAX_LOG_ENTRIES: usize = 50;
 const HOTPLUG_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -65,6 +65,24 @@ pub struct ConnectedDeviceStatus {
     pub caps: DeviceCapabilities,
     pub settings: Option<MouseSettings>,
     pub battery: Option<BatteryStatus>,
+    /// Estimated wireless runtime remaining in hours (computed after >= 2% observed drain over >= 5 min).
+    #[serde(default)]
+    pub battery_hours_left: Option<f32>,
+}
+
+/// Formats an estimated remaining battery runtime into a compact user-facing label.
+pub fn format_battery_hours_left(hours: f32) -> String {
+    if !hours.is_finite() || hours <= 0.0 {
+        return String::new();
+    }
+    if hours < 1.0 {
+        let mins = (hours * 60.0).round().max(1.0) as u32;
+        format!("~{mins}m left")
+    } else if hours < 10.0 {
+        format!("~{hours:.1}h left")
+    } else {
+        format!("~{:.0}h left", hours.round())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +302,77 @@ impl Drop for ProfileRuntimeHandle {
     }
 }
 
+/// Per-device wireless battery charge-completion & discharge-rate tracker.
+///
+/// Kept in `RuntimeState` keyed by device ID so plugging/unplugging a USB charging cable
+/// (which rebuilds HID controllers) preserves full-charge arming and discharge anchors.
+#[derive(Debug, Default)]
+struct BatteryTracker {
+    discharge_anchor: Option<(Instant, u8)>,
+    estimated_hours_left: Option<f32>,
+    /// Only armed once we observe `charging && percent < 100` so launching Polled while
+    /// a mouse is already parked at 100% never fires a false "fully charged" toast.
+    armed_for_full_charge: bool,
+    full_charge_notified: bool,
+}
+
+impl BatteryTracker {
+    /// Updates charge-completion and discharge-rate tracking; returns `true` only on the
+    /// one-shot transition from actively charging (< 100%) to 100% full.
+    fn observe(&mut self, status: BatteryStatus, now: Instant) -> bool {
+        let mut just_reached_full = false;
+        let pct = status.percent.min(100);
+
+        if status.charging {
+            self.discharge_anchor = None;
+            self.estimated_hours_left = None;
+            if pct < 100 {
+                self.armed_for_full_charge = true;
+                self.full_charge_notified = false;
+            } else if self.armed_for_full_charge && !self.full_charge_notified {
+                self.full_charge_notified = true;
+                self.armed_for_full_charge = false;
+                just_reached_full = true;
+            }
+        } else {
+            if pct >= 100 && self.armed_for_full_charge && !self.full_charge_notified {
+                self.full_charge_notified = true;
+                self.armed_for_full_charge = false;
+                just_reached_full = true;
+            } else if pct <= 95 {
+                self.full_charge_notified = false;
+            }
+
+            match self.discharge_anchor {
+                None => {
+                    self.discharge_anchor = Some((now, pct));
+                }
+                Some((anchor_at, anchor_pct)) => {
+                    if pct > anchor_pct {
+                        // Battery jumped up (e.g. unplugged after quick top-up or ADC bounce); re-anchor.
+                        self.discharge_anchor = Some((now, pct));
+                        self.estimated_hours_left = None;
+                    } else {
+                        let drop_pct = anchor_pct.saturating_sub(pct);
+                        let elapsed_secs = now.saturating_duration_since(anchor_at).as_secs_f64();
+                        // Require >= 2% drop over >= 5 minutes to avoid noisy 1% ADC jitter.
+                        if drop_pct >= 2 && elapsed_secs >= 300.0 {
+                            let elapsed_hours = elapsed_secs / 3600.0;
+                            let drain_pct_per_hr = f64::from(drop_pct) / elapsed_hours;
+                            if drain_pct_per_hr > 0.01 {
+                                let rem = (f64::from(pct) / drain_pct_per_hr).clamp(0.1, 500.0);
+                                self.estimated_hours_left = Some(rem as f32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        just_reached_full
+    }
+}
+
 struct ManagedController {
     controller: SafeDeviceController,
     last_settings: Option<MouseSettings>,
@@ -313,27 +402,30 @@ impl ManagedController {
         }
     }
 
-    fn refresh_battery(&mut self, alerts: &TrayAlertConfig) -> bool {
+    fn refresh_battery(&mut self, alerts: &TrayAlertConfig) -> (bool, Option<(String, u8)>) {
         let next = self.controller.read_battery();
         let warn_pct = alerts.clamped_threshold();
         let reset_pct = alerts.reset_threshold();
+        let mut just_low = None;
         if let Some(batt) = next {
             if batt.charging || batt.percent >= reset_pct {
                 self.low_battery_notified = false;
-            } else if alerts.low_battery_toast
-                && batt.percent <= warn_pct
-                && !self.low_battery_notified
-            {
-                notify_low_battery(&self.controller.info().name, batt.percent);
+            } else if batt.percent <= warn_pct && !self.low_battery_notified {
+                let name = self.controller.info().name;
+                if alerts.low_battery_toast {
+                    notify_low_battery(&name, batt.percent);
+                }
                 self.low_battery_notified = true;
+                just_low = Some((name, batt.percent));
             }
         }
-        if next != self.last_battery {
+        let changed = if next != self.last_battery {
             self.last_battery = next;
             true
         } else {
             false
-        }
+        };
+        (changed, just_low)
     }
 }
 
@@ -382,6 +474,8 @@ struct RuntimeState {
     saved_ducked_apps: Vec<SavedAppAudioVolume>,
     /// Device IDs currently stepped down to 1000 Hz by the opt-in low-battery polling guard.
     battery_guard_active: HashSet<String>,
+    /// Per-device wireless battery charge-completion & drain-rate trackers.
+    battery_trackers: HashMap<String, BatteryTracker>,
     log: Vec<ProfileLogEntry>,
 }
 
@@ -404,11 +498,19 @@ impl RuntimeState {
         let active_devices: Vec<ConnectedDeviceStatus> = self
             .controllers
             .iter()
-            .map(|m| ConnectedDeviceStatus {
-                info: m.controller.info(),
-                caps: m.controller.capabilities(),
-                settings: m.last_settings.clone(),
-                battery: m.last_battery,
+            .map(|m| {
+                let info = m.controller.info();
+                let battery_hours_left = self
+                    .battery_trackers
+                    .get(&info.id)
+                    .and_then(|t| t.estimated_hours_left);
+                ConnectedDeviceStatus {
+                    info,
+                    caps: m.controller.capabilities(),
+                    settings: m.last_settings.clone(),
+                    battery: m.last_battery,
+                    battery_hours_left,
+                }
             })
             .collect();
 
@@ -567,6 +669,7 @@ impl RuntimeState {
         self.selection = effective_selection;
         self.controllers = next_controllers;
         self.last_battery_poll = Instant::now();
+        let _ = self.record_battery_observations(Instant::now());
 
         let summary: Vec<String> = self
             .controllers
@@ -590,6 +693,44 @@ impl RuntimeState {
         );
     }
 
+    fn record_battery_observations(&mut self, now: Instant) -> Option<(String, String)> {
+        let mut osd: Option<(String, String)> = None;
+        let mut full_logs: Vec<String> = Vec::new();
+        for managed in &self.controllers {
+            let info = managed.controller.info();
+            if info.support_tier == SupportTier::Simulator {
+                continue;
+            }
+            let Some(batt) = managed.last_battery else {
+                continue;
+            };
+            let just_reached_full = self
+                .battery_trackers
+                .entry(info.id)
+                .or_default()
+                .observe(batt, now);
+            if just_reached_full {
+                if self.alerts.full_battery_toast {
+                    notify_battery_full(&info.name);
+                }
+                full_logs.push(format!(
+                    "[{}] Wireless mouse reached 100% charge — ready to unplug.",
+                    info.name
+                ));
+                if self.alerts.osd_pill_enabled {
+                    osd = Some((
+                        "Polled · Fully Charged".to_string(),
+                        format!("{} · 100%", info.name),
+                    ));
+                }
+            }
+        }
+        for msg in full_logs {
+            self.push_log(Severity::Ok, msg);
+        }
+        osd
+    }
+
     fn poll_batteries(&mut self) -> (bool, Option<(String, String)>) {
         let now = Instant::now();
         if now.saturating_duration_since(self.last_battery_poll) < BATTERY_POLL_INTERVAL {
@@ -598,13 +739,27 @@ impl RuntimeState {
         self.last_battery_poll = now;
         let alerts = self.alerts.clone();
         let mut any_changed = false;
+        let mut low_osd: Option<(String, String)> = None;
         for managed in &mut self.controllers {
-            if managed.refresh_battery(&alerts) {
+            let (changed, just_low) = managed.refresh_battery(&alerts);
+            if changed {
                 any_changed = true;
             }
+            if let Some((dev_name, pct)) = just_low {
+                if alerts.osd_pill_enabled {
+                    low_osd = Some((
+                        "Polled · Low Battery".to_string(),
+                        format!("{dev_name} · {pct}%"),
+                    ));
+                }
+            }
         }
-        let (guard_changed, osd) = self.evaluate_battery_polling_guard();
-        (any_changed || guard_changed, osd)
+        let full_osd = self.record_battery_observations(now);
+        let (guard_changed, guard_osd) = self.evaluate_battery_polling_guard();
+        (
+            any_changed || guard_changed,
+            guard_osd.or(full_osd).or(low_osd),
+        )
     }
 
     fn evaluate_battery_polling_guard(&mut self) -> (bool, Option<(String, String)>) {
@@ -736,7 +891,7 @@ impl RuntimeState {
             if let Ok(settings) = managed.controller.read_settings() {
                 managed.last_settings = Some(settings);
             }
-            managed.refresh_battery(&alerts);
+            let _ = managed.refresh_battery(&alerts);
             let name = managed.controller.info().name;
             let batt = managed
                 .last_battery
@@ -750,6 +905,7 @@ impl RuntimeState {
             details.push(format!("{name} ({s}{batt})"));
         }
         self.last_battery_poll = Instant::now();
+        let _ = self.record_battery_observations(self.last_battery_poll);
         if !details.is_empty() {
             self.push_log(
                 Severity::Info,
@@ -794,9 +950,10 @@ impl RuntimeState {
                     ));
                 }
             }
-            managed.refresh_battery(&alerts);
+            let _ = managed.refresh_battery(&alerts);
         }
         self.last_battery_poll = Instant::now();
+        let _ = self.record_battery_observations(self.last_battery_poll);
         for (sev, msg) in logs {
             self.push_log(sev, msg);
         }
@@ -2061,6 +2218,7 @@ fn run_runtime_loop(
         original_toast_enabled: None,
         saved_ducked_apps: Vec::new(),
         battery_guard_active: HashSet::new(),
+        battery_trackers: HashMap::new(),
         log: Vec::new(),
     };
 
@@ -3100,5 +3258,83 @@ mod tests {
             None,
         );
         assert_eq!(debouncing, Duration::from_millis(450));
+    }
+
+    #[test]
+    fn battery_tracker_arms_full_charge_and_estimates_remaining_hours() {
+        let t0 = Instant::now();
+        let mut tracker = BatteryTracker::default();
+
+        // Launching already at 100% (even charging) must NOT fire a false full-charge toast.
+        let full0 = tracker.observe(
+            BatteryStatus {
+                percent: 100,
+                charging: true,
+                voltage_mv: None,
+            },
+            t0,
+        );
+        assert!(!full0);
+        assert!(tracker.estimated_hours_left.is_none());
+
+        // Observing charging below 100% arms full-charge detection; hitting 100% triggers once.
+        let full1 = tracker.observe(
+            BatteryStatus {
+                percent: 94,
+                charging: true,
+                voltage_mv: None,
+            },
+            t0 + Duration::from_secs(60),
+        );
+        assert!(!full1);
+
+        let full2 = tracker.observe(
+            BatteryStatus {
+                percent: 100,
+                charging: true,
+                voltage_mv: None,
+            },
+            t0 + Duration::from_secs(600),
+        );
+        assert!(full2);
+
+        // Staying at 100% does NOT re-fire.
+        let full3 = tracker.observe(
+            BatteryStatus {
+                percent: 100,
+                charging: true,
+                voltage_mv: None,
+            },
+            t0 + Duration::from_secs(660),
+        );
+        assert!(!full3);
+
+        // Discharging 4% over 1 hour from 80% -> 76% estimates ~19h remaining.
+        let d0 = t0 + Duration::from_secs(1000);
+        let _ = tracker.observe(
+            BatteryStatus {
+                percent: 80,
+                charging: false,
+                voltage_mv: None,
+            },
+            d0,
+        );
+        assert!(tracker.estimated_hours_left.is_none());
+
+        let _ = tracker.observe(
+            BatteryStatus {
+                percent: 76,
+                charging: false,
+                voltage_mv: None,
+            },
+            d0 + Duration::from_secs(3600),
+        );
+        let hrs = tracker
+            .estimated_hours_left
+            .expect("should estimate runtime");
+        assert!((hrs - 19.0).abs() < 0.2, "expected ~19h, got {hrs}");
+        assert_eq!(format_battery_hours_left(hrs), "~19h left");
+        assert_eq!(format_battery_hours_left(3.4), "~3.4h left");
+        assert_eq!(format_battery_hours_left(0.5), "~30m left");
     }
 }

@@ -166,6 +166,9 @@ pub struct TrayAlertConfig {
     /// Send a Windows toast notification when a wireless mouse drops to or below `low_battery_threshold_pct`.
     #[serde(default = "default_true")]
     pub low_battery_toast: bool,
+    /// Send a Windows toast notification when a charging wireless mouse reaches 100%.
+    #[serde(default = "default_true")]
+    pub full_battery_toast: bool,
     /// Percentage threshold (`5..=50`) at which low-battery alerts trigger.
     #[serde(default = "default_low_battery_threshold")]
     pub low_battery_threshold_pct: u8,
@@ -194,6 +197,7 @@ impl Default for TrayAlertConfig {
         Self {
             battery_tray_icon: true,
             low_battery_toast: true,
+            full_battery_toast: true,
             low_battery_threshold_pct: default_low_battery_threshold(),
             profile_switch_toast: false,
             osd_pill_enabled: false,
@@ -340,6 +344,7 @@ mod tests {
             alerts: TrayAlertConfig {
                 battery_tray_icon: true,
                 low_battery_toast: true,
+                full_battery_toast: false,
                 low_battery_threshold_pct: 20,
                 profile_switch_toast: true,
                 osd_pill_enabled: true,

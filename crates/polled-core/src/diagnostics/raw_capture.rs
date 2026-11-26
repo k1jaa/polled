@@ -25,6 +25,7 @@ use std::time::Duration;
 use crate::diagnostics::analyzer::{
     ClickBounceAnalyzer, DiagnosticsSnapshot, DpiCalibrator, KeyboardPollingAnalyzer,
     MouseButtonKind, PollingAnalyzer, PollingTarget, ScrollEncoderAnalyzer, SystemLoadStats,
+    KEY_CHATTER_THRESHOLD_MS,
 };
 
 const TARGET_AUTO_SENTINEL: u32 = 0;
@@ -63,6 +64,7 @@ pub struct RawInputCaptureSession {
     dpi_measuring: Arc<AtomicBool>,
     dpi_reset_requested: Arc<AtomicBool>,
     target_hz_atomic: Arc<AtomicU32>,
+    key_chatter_threshold_tenths: Arc<AtomicU32>,
     last_left_down_qpc_ns: Arc<AtomicU64>,
     msg_hwnd: Arc<AtomicIsize>,
     wake_signal: Arc<(Mutex<u64>, Condvar)>,
@@ -94,6 +96,8 @@ impl RawInputCaptureSession {
         let dpi_measuring = Arc::new(AtomicBool::new(false));
         let dpi_reset_requested = Arc::new(AtomicBool::new(false));
         let target_hz_atomic = Arc::new(AtomicU32::new(initial_target_raw));
+        let key_chatter_threshold_tenths =
+            Arc::new(AtomicU32::new((KEY_CHATTER_THRESHOLD_MS * 10.0) as u32));
         let last_left_down_qpc_ns = Arc::new(AtomicU64::new(0));
         let msg_hwnd = Arc::new(AtomicIsize::new(0));
         let event_queue = Arc::new(Mutex::new(Vec::<RawEvent>::with_capacity(
@@ -147,6 +151,7 @@ impl RawInputCaptureSession {
         let dpi_meas_ana = Arc::clone(&dpi_measuring);
         let dpi_reset_ana = Arc::clone(&dpi_reset_requested);
         let target_ana = Arc::clone(&target_hz_atomic);
+        let chatter_thr_ana = Arc::clone(&key_chatter_threshold_tenths);
         let queue_ana = Arc::clone(&event_queue);
         let wake_ana = Arc::clone(&wake_signal);
         let update_ana = Arc::clone(&on_update);
@@ -162,6 +167,7 @@ impl RawInputCaptureSession {
                     dpi_meas_ana,
                     dpi_reset_ana,
                     target_ana,
+                    chatter_thr_ana,
                     queue_ana,
                     wake_ana,
                     update_ana,
@@ -177,6 +183,7 @@ impl RawInputCaptureSession {
             dpi_measuring,
             dpi_reset_requested,
             target_hz_atomic,
+            key_chatter_threshold_tenths,
             last_left_down_qpc_ns,
             msg_hwnd,
             wake_signal,
@@ -201,6 +208,13 @@ impl RawInputCaptureSession {
             PollingTarget::FixedHz(hz) => hz,
         };
         self.target_hz_atomic.store(raw, Ordering::SeqCst);
+        notify_condvar(&self.wake_signal);
+    }
+
+    pub fn set_key_chatter_threshold_ms(&self, ms: f64) {
+        let tenths = (ms.clamp(5.0, 100.0) * 10.0).round() as u32;
+        self.key_chatter_threshold_tenths
+            .store(tenths, Ordering::SeqCst);
         notify_condvar(&self.wake_signal);
     }
 
@@ -473,6 +487,7 @@ fn run_analyzer_loop(
     dpi_measuring: Arc<AtomicBool>,
     dpi_reset_requested: Arc<AtomicBool>,
     target_hz_atomic: Arc<AtomicU32>,
+    key_chatter_threshold_tenths: Arc<AtomicU32>,
     event_queue: Arc<Mutex<Vec<RawEvent>>>,
     wake_signal: Arc<(Mutex<u64>, Condvar)>,
     on_update: Arc<dyn Fn() + Send + Sync>,
@@ -523,6 +538,10 @@ fn run_analyzer_loop(
         if target_raw != last_target_raw {
             polling.set_target(decode_target(target_raw));
             last_target_raw = target_raw;
+        }
+        let chatter_ms = f64::from(key_chatter_threshold_tenths.load(Ordering::SeqCst)) / 10.0;
+        if (chatter_ms - keyboard.chatter_threshold_ms()).abs() > 0.01 {
+            keyboard.set_chatter_threshold_ms(chatter_ms);
         }
 
         for ev in &local_batch {

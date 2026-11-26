@@ -1252,7 +1252,10 @@ impl eframe::App for PolledApp {
             })
             .map(|d| {
                 let batt = d.battery.map(|b| b.compact_label());
-                (d.info.name.clone(), batt)
+                let eta = d
+                    .battery_hours_left
+                    .map(crate::profile_runtime::format_battery_hours_left);
+                (d.info.name.clone(), batt, eta)
             });
         let nav_profile_name = self.profiles_ui.runtime_snapshot.as_ref().map(|s| {
             (
@@ -1432,15 +1435,20 @@ impl eframe::App for PolledApp {
                             .color(p.text_muted),
                     );
                     ui.add_space(6.0);
-                    if let Some((mouse_name, batt)) = &nav_mouse_line {
+                    if let Some((mouse_name, batt, eta)) = &nav_mouse_line {
                         ui.horizontal(|ui| {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if let Some(b) = batt {
-                                        ui.label(
+                                        let resp = ui.label(
                                             RichText::new(b).size(11.0).monospace().color(p.text),
                                         );
+                                        if let Some(eta_lbl) = eta {
+                                            resp.on_hover_text(format!(
+                                                "{mouse_name}: {b} ({eta_lbl})"
+                                            ));
+                                        }
                                     }
                                     ui.with_layout(
                                         egui::Layout::left_to_right(egui::Align::Center),
@@ -1550,14 +1558,19 @@ impl eframe::App for PolledApp {
                     return;
                 }
                 if self.active_view == ActiveView::Keyboard {
-                    self.keyboard_ui.render(
-                        ctx,
-                        ui,
-                        p,
-                        mode,
-                        self.profiles_ui.runtime_snapshot.as_ref(),
-                        &self.profile_runtime,
-                    );
+                    if let Some(crate::keyboard_ui::KeyboardNavAction::OpenChatterTester) =
+                        self.keyboard_ui.render(
+                            ctx,
+                            ui,
+                            p,
+                            mode,
+                            self.profiles_ui.runtime_snapshot.as_ref(),
+                            &self.profile_runtime,
+                        )
+                    {
+                        self.active_view = ActiveView::InputLab;
+                        self.input_lab_ui.open_keyboard_chatter_tester(ctx);
+                    }
                     return;
                 }
                 if self.active_view == ActiveView::InputLab {
@@ -1626,7 +1639,7 @@ impl eframe::App for PolledApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.menu_button(
-                            RichText::new("More ▾").size(12.5).color(p.text_muted),
+                            RichText::new("More...").size(12.5).color(p.text_muted),
                             |ui| {
                                 ui.set_min_width(180.0);
                                 if ui
@@ -2498,6 +2511,10 @@ impl eframe::App for PolledApp {
                         );
                     });
                     ui.checkbox(
+                        &mut self.settings.alerts.full_battery_toast,
+                        "Notify when charging wireless mouse reaches 100%",
+                    );
+                    ui.checkbox(
                         &mut self.settings.alerts.low_battery_polling_guard,
                         "Battery polling guard (step 2K/4K/8K mice -> 1000 Hz at threshold, restore on charge)",
                     );
@@ -3324,12 +3341,18 @@ fn render_check_row(
             // Compact 1-line summary header (click title area to expand/collapse)
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let chev = if expanded { "▾" } else { "▸" };
+                    let chev = if expanded { "-" } else { "+" };
                     if ui
                         .add(
-                            egui::Button::new(RichText::new(chev).size(12.0).color(p.text_muted))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE),
+                            egui::Button::new(
+                                RichText::new(chev)
+                                    .size(13.0)
+                                    .monospace()
+                                    .strong()
+                                    .color(p.text_muted),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE),
                         )
                         .clicked()
                     {

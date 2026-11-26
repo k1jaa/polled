@@ -121,6 +121,7 @@ const IGNORED_INSTALL_EXE_SUBSTRINGS: &[&str] = &[
     "easyanticheat",
     "battleye",
     "beservice",
+    "bootstrapper",
     "redist",
     "prereq",
     "ue4prereq",
@@ -703,6 +704,45 @@ pub fn parse_steam_acf_full(acf: &str) -> Option<(Option<String>, String, String
     Some((appid, name?, installdir?))
 }
 
+/// Maps popular Epic Games Launcher titles whose `.item` manifest points to a launcher/bootstrapper
+/// stub (e.g. `FortniteBootstrapper.exe`) to their real foreground shipping `.exe`.
+pub fn known_epic_exe(display_name: &str, app_name: Option<&str>) -> Option<&'static str> {
+    if let Some(app) = app_name {
+        let app_lower = app.trim().to_ascii_lowercase();
+        match app_lower.as_str() {
+            "fortnite" => return Some("fortniteclient-win64-shipping.exe"),
+            "sugar" => return Some("rocketleague.exe"),
+            "0a2d9f6403244d12969e11da6713137b" => return Some("fallguys_client_game.exe"),
+            _ => {}
+        }
+    }
+    let lower = display_name.trim().to_ascii_lowercase();
+    if lower == "fortnite" || lower.starts_with("fortnite ") {
+        Some("fortniteclient-win64-shipping.exe")
+    } else if lower == "rocket league" || lower.starts_with("rocket league ") {
+        Some("rocketleague.exe")
+    } else if lower.contains("fall guys") {
+        Some("fallguys_client_game.exe")
+    } else if lower == "valorant" {
+        Some("valorant-win64-shipping.exe")
+    } else if lower.contains("marvel rivals") {
+        Some("marvel-win64-shipping.exe")
+    } else if lower.contains("apex legends") {
+        Some("r5apex.exe")
+    } else {
+        None
+    }
+}
+
+fn is_stub_launcher_exe(exe_name: &str) -> bool {
+    let lower = exe_name.to_ascii_lowercase();
+    lower.contains("launcher")
+        || lower.contains("bootstrapper")
+        || lower.contains("anticheat")
+        || lower.contains("eac")
+        || lower.contains("battleye")
+}
+
 /// Parses an Epic Games Launcher `.item` manifest JSON into a `DiscoveredGame`.
 pub fn parse_epic_item_json(raw: &str) -> Option<DiscoveredGame> {
     let val: serde_json::Value = serde_json::from_str(raw).ok()?;
@@ -712,9 +752,14 @@ pub fn parse_epic_item_json(raw: &str) -> Option<DiscoveredGame> {
         return None;
     }
 
-    // Prefer Unreal Win64-Shipping game binary if installed directory is readable and launch exe is a launcher stub.
-    let mut exe_name = normalize_exe_name(launch_exe);
-    if exe_name.contains("launcher") {
+    let app_name = val.get("AppName").and_then(|v| v.as_str());
+
+    // Prefer curated Epic shipping executables first, then scan InstallLocation for Unreal
+    // `*-Win64-Shipping.exe` binaries whenever LaunchExecutable is a launcher/bootstrapper stub.
+    let mut exe_name = known_epic_exe(&display_name, app_name)
+        .map(str::to_string)
+        .unwrap_or_else(|| normalize_exe_name(launch_exe));
+    if is_stub_launcher_exe(&exe_name) {
         if let Some(loc) = val.get("InstallLocation").and_then(|v| v.as_str()) {
             if let Some(primary) = find_primary_game_exe(Path::new(loc)) {
                 exe_name = primary;
@@ -924,6 +969,35 @@ mod tests {
         assert_eq!(game.display_name, "Rocket League");
         assert_eq!(game.exe_name, "rocketleague.exe");
         assert_eq!(game.source, GameSource::Epic);
+
+        // Fortnite manifest pointing to FortniteBootstrapper.exe must resolve to real shipping binary.
+        let fn_raw = r#"{
+            "AppName": "Fortnite",
+            "DisplayName": "Fortnite",
+            "LaunchExecutable": "FortniteGame/Binaries/Win64/FortniteBootstrapper.exe",
+            "InstallLocation": "Z:\\NonExistent"
+        }"#;
+        let fn_game = parse_epic_item_json(fn_raw).unwrap();
+        assert_eq!(fn_game.exe_name, "fortniteclient-win64-shipping.exe");
+
+        // Unknown Unreal Epic title whose LaunchExecutable is a bootstrapper stub scans InstallLocation.
+        let ue_dir = TempDir::new().unwrap();
+        let ue_bin = ue_dir
+            .path()
+            .join("ArenaGame")
+            .join("Binaries")
+            .join("Win64");
+        fs::create_dir_all(&ue_bin).unwrap();
+        fs::write(ue_bin.join("ArenaBootstrapper.exe"), [0u8; 4096]).unwrap();
+        fs::write(ue_bin.join("ArenaClient-Win64-Shipping.exe"), [0u8; 2048]).unwrap();
+        let custom_epic = serde_json::json!({
+            "DisplayName": "Arena Shooter",
+            "LaunchExecutable": "ArenaGame/Binaries/Win64/ArenaBootstrapper.exe",
+            "InstallLocation": ue_dir.path().to_string_lossy().to_string(),
+        })
+        .to_string();
+        let custom_game = parse_epic_item_json(&custom_epic).unwrap();
+        assert_eq!(custom_game.exe_name, "arenaclient-win64-shipping.exe");
 
         let riot_yaml = "product_install_full_path: \"D:/Riot Games/VALORANT/live\"\n";
         assert_eq!(

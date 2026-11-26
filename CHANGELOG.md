@@ -16,6 +16,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.14.1] - 2026-11-27
+
+### Added
+- **Upgraded Raw-Input Keyboard Chatter / Double-Typing & Polling Tester (`diagnostics/analyzer.rs`, `diagnostics/raw_capture.rs`, `input_lab_ui.rs`, `keyboard_ui.rs`, `app.rs`):**
+  - Added selectable chatter threshold presets (`15 ms · HE/RT`, `25 ms · Std`, `40 ms · Strict`), inline `Start Test` / `Stop` control, live anonymous same-key `release -> press` bounce bar strip with threshold line, sub-4 ms micro-hold glitch detection, and single-switch vs. multi-switch chatter diagnosis (zero keystrokes or characters ever stored).
+  - Added a direct **Chatter & Polling Test** button in the **Keyboard** tab header that jumps straight into **Bench → Aim & Switches** and arms capture in one click.
+- **Wireless Mouse Full-Charge (100%) Alert & Remaining Runtime Estimate (`settings.rs`, `notifications.rs`, `profile_runtime.rs`, `tray.rs`, `profiles_ui.rs`, `app.rs`):**
+  - Added a per-device `BatteryTracker` (persisted across USB cable plug/unplug hot-plug transitions) that arms only when charging below 100% and sends a one-shot Windows notification (`full_battery_toast`, toggleable in **Settings**) + OSD pill when your wireless mouse reaches 100% charge.
+  - Added an observed discharge-rate runtime estimate (`~Xh left` / `~Xm left`, computed after >= 2% drain over >= 5 minutes to ignore 1% ADC wobble) surfaced in the Profiles status bar, RIG STATUS hover tooltip, Mouse Quick Controls submenu, and system tray tooltip.
+
+### Fixed
+- **Missing Unicode Glyph Boxes (`app.rs`, `profiles_ui.rs`, `input_lab_ui.rs`):**
+  - Replaced missing `▾`/`▴`/`▸` triangle glyphs that rendered as `□` boxes in egui's bundled font (`cm/360`, `Log`, `More...`, `Export...`, and Health check expand toggles) with clean ASCII labels.
+- **Epic Games / Unreal Engine Bootstrapper Discovery (`profiles/game_discovery.rs`):**
+  - Added curated Epic shipping-binary mappings (`Fortnite` → `fortniteclient-win64-shipping.exe`, `Rocket League`, `Fall Guys`, etc.) and ignored `*bootstrapper*` launcher stubs so Unreal Engine Epic titles resolve to the real foreground game executable instead of `fortnitebootstrapper.exe`.
+
+---
+
 ## [0.14.0] - 2026-11-26
 
 ### Added

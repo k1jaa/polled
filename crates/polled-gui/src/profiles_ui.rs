@@ -1754,7 +1754,14 @@ impl ProfilesUiState {
                         .unwrap_or_else(|| "asleep".to_string());
                     let batt = dev
                         .battery
-                        .map(|b| format!(" · {}", b.compact_label()))
+                        .map(|b| match dev.battery_hours_left {
+                            Some(hrs) => format!(
+                                " · {} ({})",
+                                b.compact_label(),
+                                crate::profile_runtime::format_battery_hours_left(hrs)
+                            ),
+                            None => format!(" · {}", b.compact_label()),
+                        })
                         .unwrap_or_default();
                     status_chunks.push(format!("{} ({summary}{batt})", dev.info.name));
                 }
@@ -2517,9 +2524,9 @@ impl ProfilesUiState {
                                             .suffix(" DPI"),
                                     );
                                     let calc_lbl = if self.sens_helper_open {
-                                        "cm/360 ▴"
+                                        "Hide cm/360"
                                     } else {
-                                        "cm/360 ▾"
+                                        "cm/360"
                                     };
                                     if ui
                                         .add(secondary_btn(calc_lbl, p))
@@ -3606,9 +3613,9 @@ impl ProfilesUiState {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let toggle_lbl = if self.activity_log_open {
-                        "Hide ▴".to_string()
+                        "Hide Log".to_string()
                     } else {
-                        format!("Log ({}) ▾", log_entries.len())
+                        format!("Log ({})", log_entries.len())
                     };
                     if ui.add(secondary_btn(&toggle_lbl, p)).clicked() {
                         self.activity_log_open = !self.activity_log_open;

@@ -417,6 +417,10 @@ pub struct TimerJitterBenchmark {
 ///
 /// Key characters and virtual key codes are NEVER recorded or exported — only anonymous
 /// high-resolution QPC timing intervals between non-repeat key transitions.
+fn default_key_chatter_threshold_ms() -> f64 {
+    KEY_CHATTER_THRESHOLD_MS
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KeyboardPollingStats {
     pub total_events: u64,
@@ -428,6 +432,16 @@ pub struct KeyboardPollingStats {
     pub min_release_to_press_ms: Option<f64>,
     pub estimated_scan_hz: Option<u32>,
     pub chatter_faults: u64,
+    #[serde(default = "default_key_chatter_threshold_ms")]
+    pub chatter_threshold_ms: f64,
+    #[serde(default)]
+    pub distinct_keys_tested: u32,
+    #[serde(default)]
+    pub distinct_chattering_keys: u32,
+    #[serde(default)]
+    pub micro_hold_glitches: u64,
+    #[serde(default)]
+    pub recent_bounces_ms: Vec<f64>,
     pub recent_intervals_ms: Vec<f64>,
     pub health_summary: String,
 }
@@ -691,20 +705,54 @@ pub fn build_diagnostic_advice(
     }
 
     // 5. Keyboard chatter faults.
-    if snap.keyboard.chatter_faults > 0 {
+    if snap.keyboard.chatter_faults > 0 || snap.keyboard.micro_hold_glitches >= 2 {
+        let thr = if snap.keyboard.chatter_threshold_ms > 0.0 {
+            snap.keyboard.chatter_threshold_ms
+        } else {
+            KEY_CHATTER_THRESHOLD_MS
+        };
+        let detail = if snap.keyboard.chatter_faults > 0
+            && snap.keyboard.distinct_chattering_keys == 1
+        {
+            format!(
+                "A single switch registered {} release -> press rebounds faster than {thr:.0} ms. Clean or swap that switch (or raise debounce / Rapid Trigger release deadzone).",
+                snap.keyboard.chatter_faults
+            )
+        } else if snap.keyboard.chatter_faults > 0 {
+            format!(
+                "{} switches registered release -> press rebounds faster than {thr:.0} ms. Increase keyboard debounce / Rapid Trigger release deadzone in firmware, or inspect worn switches.",
+                snap.keyboard.distinct_chattering_keys.max(1)
+            )
+        } else {
+            format!(
+                "Detected {} phantom sub-4 ms key holds. Inspect switch contact stability or increase release deadzone.",
+                snap.keyboard.micro_hold_glitches
+            )
+        };
         advice.push(DiagnosticAdvice {
-            severity: Severity::Bad,
+            severity: if snap.keyboard.chatter_faults > 0 {
+                Severity::Bad
+            } else {
+                Severity::Warn
+            },
             category: "Keyboard".to_string(),
-            title: format!(
-                "Fix keyboard switch chatter ({} fault{})",
-                snap.keyboard.chatter_faults,
-                if snap.keyboard.chatter_faults == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            ),
-            detail: "A key registered a release -> press rebound faster than 25 ms. Increase keyboard debounce / Rapid Trigger release deadzone in your keyboard firmware, or clean/swap the chattering switch.".to_string(),
+            title: if snap.keyboard.chatter_faults > 0 {
+                format!(
+                    "Fix keyboard switch chatter ({} fault{})",
+                    snap.keyboard.chatter_faults,
+                    if snap.keyboard.chatter_faults == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )
+            } else {
+                format!(
+                    "Inspect keyboard switch micro-glitches ({})",
+                    snap.keyboard.micro_hold_glitches
+                )
+            },
+            detail,
             action_target: None,
         });
     }
@@ -1589,9 +1637,12 @@ impl ClickBounceAnalyzer {
 #[derive(Debug)]
 pub struct KeyboardPollingAnalyzer {
     held: [bool; 256],
+    key_seen: [bool; 256],
+    key_chattered: [bool; 256],
     last_down_ns: [Option<u64>; 256],
     last_up_ns: [Option<u64>; 256],
     last_event_ns: Option<u64>,
+    chatter_threshold_ms: f64,
     total_events: u64,
     key_down_count: u64,
     key_up_count: u64,
@@ -1599,6 +1650,8 @@ pub struct KeyboardPollingAnalyzer {
     min_hold_ms: Option<f64>,
     min_release_to_press_ms: Option<f64>,
     chatter_faults: u64,
+    micro_hold_glitches: u64,
+    recent_bounces_ms: VecDeque<f64>,
     recent_intervals_ms: VecDeque<f64>,
 }
 
@@ -1612,9 +1665,12 @@ impl KeyboardPollingAnalyzer {
     pub fn new() -> Self {
         Self {
             held: [false; 256],
+            key_seen: [false; 256],
+            key_chattered: [false; 256],
             last_down_ns: [None; 256],
             last_up_ns: [None; 256],
             last_event_ns: None,
+            chatter_threshold_ms: KEY_CHATTER_THRESHOLD_MS,
             total_events: 0,
             key_down_count: 0,
             key_up_count: 0,
@@ -1622,12 +1678,26 @@ impl KeyboardPollingAnalyzer {
             min_hold_ms: None,
             min_release_to_press_ms: None,
             chatter_faults: 0,
+            micro_hold_glitches: 0,
+            recent_bounces_ms: VecDeque::with_capacity(32),
             recent_intervals_ms: VecDeque::with_capacity(64),
         }
     }
 
+    pub fn set_chatter_threshold_ms(&mut self, ms: f64) {
+        if ms.is_finite() {
+            self.chatter_threshold_ms = ms.clamp(5.0, 100.0);
+        }
+    }
+
+    pub fn chatter_threshold_ms(&self) -> f64 {
+        self.chatter_threshold_ms
+    }
+
     pub fn reset(&mut self) {
+        let thr = self.chatter_threshold_ms;
         *self = Self::new();
+        self.chatter_threshold_ms = thr;
     }
 
     pub fn record_key(&mut self, slot: u8, pressed: bool, timestamp_ns: u64) {
@@ -1638,6 +1708,7 @@ impl KeyboardPollingAnalyzer {
                 return;
             }
             self.held[idx] = true;
+            self.key_seen[idx] = true;
             self.key_down_count += 1;
             if let Some(up_ns) = self.last_up_ns[idx] {
                 if timestamp_ns >= up_ns {
@@ -1647,8 +1718,15 @@ impl KeyboardPollingAnalyzer {
                             self.min_release_to_press_ms
                                 .map_or(gap_ms, |m| m.min(gap_ms)),
                         );
-                        if gap_ms < KEY_CHATTER_THRESHOLD_MS {
+                        if gap_ms <= 1_000.0 {
+                            if self.recent_bounces_ms.len() >= 32 {
+                                self.recent_bounces_ms.pop_front();
+                            }
+                            self.recent_bounces_ms.push_back(gap_ms);
+                        }
+                        if gap_ms < self.chatter_threshold_ms {
                             self.chatter_faults += 1;
+                            self.key_chattered[idx] = true;
                         }
                     }
                 }
@@ -1663,6 +1741,9 @@ impl KeyboardPollingAnalyzer {
                     if hold_ms >= 0.05 {
                         self.min_hold_ms =
                             Some(self.min_hold_ms.map_or(hold_ms, |m| m.min(hold_ms)));
+                        if hold_ms < 4.0 {
+                            self.micro_hold_glitches += 1;
+                        }
                     }
                 }
             }
@@ -1701,18 +1782,38 @@ impl KeyboardPollingAnalyzer {
             .filter(|&ms| ms <= 20.0)
             .map(|ms| snap_nominal_hz(ms * 1000.0));
 
+        let distinct_keys_tested = self.key_seen.iter().filter(|&&v| v).count() as u32;
+        let distinct_chattering_keys = self.key_chattered.iter().filter(|&&v| v).count() as u32;
+
         let health_summary = if self.total_events == 0 {
-            "Tap or roll adjacent keys while capturing to measure keyboard scan rate & chatter (zero keystrokes stored)."
+            "Tap a key repeatedly to test double-typing chatter, or roll adjacent keys (A+D) to measure USB scan rate (zero keystrokes stored)."
                 .to_string()
         } else if self.chatter_faults > 0 {
+            if distinct_chattering_keys == 1 {
+                format!(
+                    "1 switch chattered ({}x < {:.0} ms release->press) — likely a worn/dusty switch (clean or swap, or raise debounce).",
+                    self.chatter_faults, self.chatter_threshold_ms
+                )
+            } else {
+                format!(
+                    "{} switches chattered ({}x < {:.0} ms release->press) — raise firmware debounce or Rapid Trigger release deadzone.",
+                    distinct_chattering_keys, self.chatter_faults, self.chatter_threshold_ms
+                )
+            }
+        } else if self.micro_hold_glitches > 0 {
             format!(
-                "Detected {} possible key chatter fault(s) (< {:.0} ms release->press).",
-                self.chatter_faults, KEY_CHATTER_THRESHOLD_MS
+                "Detected {} sub-4 ms micro-hold glitch(es) across {} key(s) — check switch contact stability.",
+                self.micro_hold_glitches, distinct_keys_tested
             )
         } else if let (Some(hz), Some(min_ms)) = (estimated_scan_hz, self.min_interval_ms) {
             format!(
-                "Finest transition {:.2} ms (~{} Hz scan ceiling) with 0 chatter faults.",
-                min_ms, hz
+                "Finest transition {:.2} ms (~{} Hz scan ceiling) across {} key(s) with 0 chatter faults (< {:.0} ms).",
+                min_ms, hz, distinct_keys_tested, self.chatter_threshold_ms
+            )
+        } else if self.key_down_count >= 12 {
+            format!(
+                "Clean switches across {} presses ({} key(s)) with 0 chatter faults. Roll adjacent keys fast (A+D) to resolve scan Hz.",
+                self.key_down_count, distinct_keys_tested
             )
         } else {
             "Roll adjacent keys rapidly (e.g. A+D) to resolve keyboard scan-rate quantum."
@@ -1729,6 +1830,11 @@ impl KeyboardPollingAnalyzer {
             min_release_to_press_ms: self.min_release_to_press_ms,
             estimated_scan_hz,
             chatter_faults: self.chatter_faults,
+            chatter_threshold_ms: self.chatter_threshold_ms,
+            distinct_keys_tested,
+            distinct_chattering_keys,
+            micro_hold_glitches: self.micro_hold_glitches,
+            recent_bounces_ms: self.recent_bounces_ms.iter().copied().collect(),
             recent_intervals_ms: self.recent_intervals_ms.iter().copied().collect(),
             health_summary,
         }
@@ -2255,7 +2361,31 @@ mod tests {
         assert_eq!(snap.key_down_count, 3);
         assert_eq!(snap.key_up_count, 1);
         assert_eq!(snap.chatter_faults, 1);
+        assert_eq!(snap.distinct_keys_tested, 2);
+        assert_eq!(snap.distinct_chattering_keys, 1);
         assert_eq!(snap.estimated_scan_hz, Some(4000));
+        assert!(snap.health_summary.contains("1 switch chattered"));
+
+        // Second switch chattering triggers multi-switch diagnosis; custom threshold is respected.
+        kb.set_chatter_threshold_ms(15.0);
+        assert!((kb.chatter_threshold_ms() - 15.0).abs() < 0.01);
+        t_ns += 50_000_000;
+        kb.record_key(68, false, t_ns);
+        t_ns += 20_000_000; // 20 ms >= 15 ms -> NOT chatter under 15 ms HE/RT threshold
+        kb.record_key(68, true, t_ns);
+        assert_eq!(kb.snapshot().chatter_faults, 1);
+
+        t_ns += 2_000_000; // 2 ms hold -> micro-hold glitch (< 4 ms)
+        kb.record_key(68, false, t_ns);
+        t_ns += 8_000_000; // 8 ms < 15 ms -> chatter on second key
+        kb.record_key(68, true, t_ns);
+
+        let snap2 = kb.snapshot();
+        assert_eq!(snap2.chatter_faults, 2);
+        assert_eq!(snap2.distinct_chattering_keys, 2);
+        assert_eq!(snap2.micro_hold_glitches, 1);
+        assert!(snap2.health_summary.contains("2 switches chattered"));
+        assert!(!snap2.recent_bounces_ms.is_empty());
     }
 
     #[test]

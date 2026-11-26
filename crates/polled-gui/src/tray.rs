@@ -11,7 +11,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::icon::{tray_battery_icon_image, tray_icon_image};
-use crate::profile_runtime::ProfileRuntimeSnapshot;
+use crate::profile_runtime::{format_battery_hours_left, ProfileRuntimeSnapshot};
 
 const ID_STATUS: &str = "status_info";
 const ID_OPEN: &str = "open";
@@ -69,6 +69,8 @@ pub struct TrayMouseState {
     pub dpi_max: u16,
     pub polling_rates_hz: Vec<u16>,
     pub battery: Option<BatteryStatus>,
+    /// Rounded remaining battery runtime in 5-minute steps (keeps `Eq` stable without menu churn).
+    pub battery_mins_left: Option<u32>,
 }
 
 /// Parses a `tray_icon::menu::MenuEvent` ID string into a typed `TrayAction`.
@@ -346,6 +348,9 @@ impl TrayController {
                 dpi_max: d.caps.dpi_max,
                 polling_rates_hz: d.caps.polling_rates_hz.clone(),
                 battery: d.battery,
+                battery_mins_left: d
+                    .battery_hours_left
+                    .map(|h| (((h * 60.0).round() as u32) / 5) * 5),
             });
         let primary_wooting = snap.keyboards.first().map(|kb| TrayWootingState {
             device_id: kb.id.clone(),
@@ -479,7 +484,15 @@ impl TrayController {
                     header_parts.push(format!("{hz} Hz"));
                 }
                 if let Some(batt) = mouse.battery {
-                    header_parts.push(batt.compact_label());
+                    let lbl = match mouse.battery_mins_left.filter(|&m| m > 0) {
+                        Some(mins) => format!(
+                            "{} ({})",
+                            batt.compact_label(),
+                            format_battery_hours_left(mins as f32 / 60.0)
+                        ),
+                        None => batt.compact_label(),
+                    };
+                    header_parts.push(lbl);
                 }
                 let header =
                     MenuItem::with_id("mouse_header", header_parts.join(" · "), false, None);
@@ -651,7 +664,15 @@ impl TrayController {
             if let Some(mouse) = primary_mouse.filter(|m| !m.is_simulator) {
                 parts.push(mouse.name.clone());
                 if let Some(batt) = mouse.battery {
-                    parts.push(batt.compact_label());
+                    let lbl = match mouse.battery_mins_left.filter(|&m| m > 0) {
+                        Some(mins) => format!(
+                            "{} ({})",
+                            batt.compact_label(),
+                            format_battery_hours_left(mins as f32 / 60.0)
+                        ),
+                        None => batt.compact_label(),
+                    };
+                    parts.push(lbl);
                 }
                 if let Some(hz) = mouse.current_polling_hz {
                     parts.push(format!("{hz} Hz"));

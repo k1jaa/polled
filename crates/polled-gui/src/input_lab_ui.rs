@@ -153,6 +153,7 @@ pub struct InputLabUiState {
     capture_ends_at: Option<Instant>,
     capture_total_secs: f32,
     target: PollingTarget,
+    key_chatter_threshold_ms: f64,
     chart_mode: ChartViewMode,
     saturated_only: bool,
     configured_dpi: u32,
@@ -213,6 +214,7 @@ impl InputLabUiState {
             capture_ends_at: None,
             capture_total_secs: 10.0,
             target: PollingTarget::Auto,
+            key_chatter_threshold_ms: KEY_CHATTER_THRESHOLD_MS,
             chart_mode: ChartViewMode::Split,
             saturated_only: false,
             configured_dpi: 1600,
@@ -274,6 +276,14 @@ impl InputLabUiState {
         self.start_live_session(ctx);
     }
 
+    /// Switches directly to Bench -> Aim & Switches and starts raw capture for keyboard chatter & scan testing.
+    pub fn open_keyboard_chatter_tester(&mut self, ctx: &egui::Context) {
+        self.active_tab = BenchSubTab::AimSwitches;
+        if !self.is_capturing() {
+            self.start_capture(ctx);
+        }
+    }
+
     /// Starts capture according to the selected `CaptureMode` (3s countdown + timed run, or immediate manual).
     fn begin_configured_capture(&mut self, ctx: &egui::Context) {
         if let (Some(prep), Some(dur)) = (
@@ -301,6 +311,7 @@ impl InputLabUiState {
         let session = RawInputCaptureSession::start(self.target, move || {
             ctx_bg.request_repaint();
         });
+        session.set_key_chatter_threshold_ms(self.key_chatter_threshold_ms);
         if self.dpi_measuring {
             session.set_dpi_measuring(true);
         }
@@ -872,7 +883,7 @@ impl InputLabUiState {
                         if scroll_w < 720.0 {
                             self.render_click_bounce_card(ui, p, mode, scroll_w);
                             ui.add_space(12.0);
-                            self.render_keyboard_scan_card(ui, p, mode, scroll_w);
+                            self.render_keyboard_scan_card(ctx, ui, p, mode, scroll_w);
                         } else {
                             let gap = 12.0;
                             let half_w = ((scroll_w - gap) * 0.5).max(260.0);
@@ -889,7 +900,7 @@ impl InputLabUiState {
                                     Vec2::new(half_w, 0.0),
                                     egui::Layout::top_down(egui::Align::LEFT),
                                     |ui| {
-                                        self.render_keyboard_scan_card(ui, p, mode, half_w);
+                                        self.render_keyboard_scan_card(ctx, ui, p, mode, half_w);
                                     },
                                 );
                             });
@@ -1302,7 +1313,7 @@ impl InputLabUiState {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button(
-                    RichText::new("Export ▾").size(12.5).color(p.text_muted),
+                    RichText::new("Export...").size(12.5).color(p.text_muted),
                     |ui| {
                         ui.set_min_width(210.0);
                         if ui
@@ -2507,42 +2518,71 @@ impl InputLabUiState {
     }
 
     fn render_keyboard_scan_card(
-        &self,
+        &mut self,
+        ctx: &egui::Context,
         ui: &mut egui::Ui,
         p: Palette,
         mode: ThemeMode,
         card_w: f32,
     ) {
         let inner_w = (card_w - 24.0).max(120.0);
-        let kb = &self.last_snapshot.keyboard;
+        let kb = self.last_snapshot.keyboard.clone();
+        let capturing = self.is_live_capturing();
+        let mut toggle_capture = false;
+        let mut next_threshold = self.key_chatter_threshold_ms;
 
         card_frame(ui, p, card_w, |ui| {
+            let (badge_lbl, badge_col) = if kb.chatter_faults > 0 {
+                ("CHATTER", p.bad)
+            } else if kb.micro_hold_glitches > 0 {
+                ("GLITCH", p.warn)
+            } else if let Some(hz) = kb.estimated_scan_hz {
+                (
+                    if hz >= 1000 { "HIGH-RATE" } else { "MEASURED" },
+                    if hz >= 1000 { p.ok } else { p.info },
+                )
+            } else if capturing {
+                ("LISTENING", p.ok)
+            } else {
+                ("PRIVACY SAFE", p.text_muted)
+            };
+
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Keyboard Scan-Rate & Chatter Tester")
-                        .size(14.0)
-                        .strong()
-                        .color(p.text),
-                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (lbl, col) = if kb.chatter_faults > 0 {
-                        ("CHATTER", p.bad)
-                    } else if let Some(hz) = kb.estimated_scan_hz {
-                        (
-                            if hz >= 1000 { "HIGH-RATE" } else { "MEASURED" },
-                            if hz >= 1000 { p.ok } else { p.info },
-                        )
+                    let btn_lbl = if capturing { "Stop" } else { "Start Test" };
+                    let btn = if capturing {
+                        secondary_btn(btn_lbl, p)
                     } else {
-                        ("PRIVACY SAFE", p.text_muted)
+                        primary_btn(btn_lbl, p)
                     };
-                    ui.label(RichText::new(lbl).size(11.0).strong().color(col));
+                    if ui.add(btn).clicked() {
+                        toggle_capture = true;
+                    }
+                    ui.label(
+                        RichText::new(badge_lbl)
+                            .size(10.5)
+                            .strong()
+                            .monospace()
+                            .color(badge_col),
+                    );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("Keyboard Chatter & Polling Tester")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(p.text),
+                            )
+                            .truncate(),
+                        );
+                    });
                 });
             });
             ui.add_space(4.0);
             ui.add(
                 egui::Label::new(
                     RichText::new(
-                        "Roll two adjacent keys rapidly (e.g. A+D) while capturing to reveal your keyboard's USB scan-rate quantum (up to 8,000 Hz) and detect key chatter (< 25 ms). Anonymous QPC timing only — zero characters or key names are ever recorded.",
+                        "Tap any key repeatedly to detect mechanical double-typing chatter, or roll adjacent keys (A+D) to measure USB scan rate (up to 8,000 Hz). Anonymous QPC timing only — zero characters or key names are ever stored.",
                     )
                     .size(11.5)
                     .color(p.text_muted),
@@ -2551,6 +2591,45 @@ impl InputLabUiState {
             );
             ui.add_space(6.0);
 
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Chatter limit:")
+                        .size(11.5)
+                        .color(p.text_muted),
+                );
+                for (ms, lbl) in [
+                    (15.0, "15 ms (HE/RT)"),
+                    (25.0, "25 ms (Std)"),
+                    (40.0, "40 ms (Strict)"),
+                ] {
+                    let selected = (next_threshold - ms).abs() < 0.5;
+                    let btn = if selected {
+                        primary_btn(lbl, p)
+                    } else {
+                        secondary_btn(lbl, p)
+                    };
+                    if ui.add(btn).clicked() {
+                        next_threshold = ms;
+                    }
+                }
+            });
+            ui.add_space(6.0);
+
+            let thr_lbl = format!("CHATTER (<{:.0}ms)", self.key_chatter_threshold_ms);
+            let chatter_val = if kb.chatter_faults > 0 && kb.distinct_chattering_keys > 0 {
+                format!(
+                    "{} ({} key{})",
+                    kb.chatter_faults,
+                    kb.distinct_chattering_keys,
+                    if kb.distinct_chattering_keys == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )
+            } else {
+                kb.chatter_faults.to_string()
+            };
             let pills = vec![
                 (
                     "SCAN CEILING".to_string(),
@@ -2565,9 +2644,9 @@ impl InputLabUiState {
                         .unwrap_or_else(|| "—".to_string()),
                 ),
                 (
-                    "MEDIAN".to_string(),
-                    kb.median_interval_ms
-                        .map(|v| format!("{v:.2} ms"))
+                    "FASTEST RE-PRESS".to_string(),
+                    kb.min_release_to_press_ms
+                        .map(|v| format!("{v:.1} ms"))
                         .unwrap_or_else(|| "—".to_string()),
                 ),
                 (
@@ -2576,16 +2655,53 @@ impl InputLabUiState {
                         .map(|v| format!("{v:.1} ms"))
                         .unwrap_or_else(|| "—".to_string()),
                 ),
-                ("CHATTER (<25ms)".to_string(), kb.chatter_faults.to_string()),
-                ("EVENTS".to_string(), kb.total_events.to_string()),
+                (
+                    "KEYS TESTED".to_string(),
+                    kb.distinct_keys_tested.to_string(),
+                ),
+                (thr_lbl, chatter_val),
             ];
             render_status_pill_rows(ui, p, inner_w, &pills);
+
+            // Live anonymous bounce / transition interval bar strip.
+            if !kb.recent_bounces_ms.is_empty() || !kb.recent_intervals_ms.is_empty() {
+                ui.add_space(8.0);
+                let (samples, strip_caption) = if !kb.recent_bounces_ms.is_empty() {
+                    (
+                        kb.recent_bounces_ms.as_slice(),
+                        format!(
+                            "Recent same-key release -> press gaps (red = chatter < {:.0} ms)",
+                            self.key_chatter_threshold_ms
+                        ),
+                    )
+                } else {
+                    (
+                        kb.recent_intervals_ms.as_slice(),
+                        "Recent key-to-key transition intervals (ms)".to_string(),
+                    )
+                };
+                paint_keyboard_bounce_strip(
+                    ui,
+                    p,
+                    inner_w,
+                    58.0,
+                    samples,
+                    self.key_chatter_threshold_ms,
+                    !kb.recent_bounces_ms.is_empty(),
+                );
+                ui.add_space(2.0);
+                ui.label(RichText::new(strip_caption).size(10.5).color(p.text_muted));
+            }
 
             if kb.total_events > 0 {
                 ui.add_space(6.0);
                 let sev = if kb.chatter_faults > 0 {
                     Severity::Bad
-                } else if kb.estimated_scan_hz.is_some_and(|hz| hz >= 1000) {
+                } else if kb.micro_hold_glitches > 0 {
+                    Severity::Warn
+                } else if kb.estimated_scan_hz.is_some_and(|hz| hz >= 1000)
+                    || kb.key_down_count >= 12
+                {
                     Severity::Ok
                 } else {
                     Severity::Info
@@ -2595,8 +2711,8 @@ impl InputLabUiState {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(format!(
-                        "Chatter threshold: < {:.0} ms same-key release -> press.",
-                        KEY_CHATTER_THRESHOLD_MS
+                        "Press Start Test, then rapidly tap any suspect switch (chatter < {:.0} ms) or roll A+D for scan Hz.",
+                        self.key_chatter_threshold_ms
                     ))
                     .size(11.0)
                     .monospace()
@@ -2604,6 +2720,20 @@ impl InputLabUiState {
                 );
             }
         });
+
+        if (next_threshold - self.key_chatter_threshold_ms).abs() > 0.01 {
+            self.key_chatter_threshold_ms = next_threshold;
+            if let Some(session) = &self.session {
+                session.set_key_chatter_threshold_ms(next_threshold);
+            }
+        }
+        if toggle_capture {
+            if capturing {
+                self.stop_capture();
+            } else {
+                self.start_capture(ctx);
+            }
+        }
     }
 
     fn render_usb_topology_card(
@@ -5663,6 +5793,80 @@ fn render_timed_progress_bar(
                 }
             }
         });
+}
+
+fn paint_keyboard_bounce_strip(
+    ui: &mut egui::Ui,
+    p: Palette,
+    width: f32,
+    height: f32,
+    samples_ms: &[f64],
+    chatter_threshold_ms: f64,
+    highlight_chatter: bool,
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect(
+        rect,
+        CornerRadius::same(6),
+        p.bg,
+        Stroke::new(1.0_f32, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    let plot = rect.shrink2(Vec2::new(8.0, 6.0));
+    if samples_ms.is_empty() || plot.width() < 16.0 || plot.height() < 12.0 {
+        return;
+    }
+
+    let max_sample = samples_ms
+        .iter()
+        .copied()
+        .fold(chatter_threshold_ms * 2.5, f64::max)
+        .clamp(40.0, 250.0);
+
+    // Subtle reference line at chatter threshold when plotting release->press gaps.
+    if highlight_chatter {
+        let frac = (chatter_threshold_ms / max_sample).clamp(0.05, 0.95) as f32;
+        let y = plot.bottom() - frac * plot.height();
+        painter.line_segment(
+            [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+            Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(p.bad.r(), p.bad.g(), p.bad.b(), 120),
+            ),
+        );
+    }
+
+    let slice = if samples_ms.len() > 32 {
+        &samples_ms[samples_ms.len() - 32..]
+    } else {
+        samples_ms
+    };
+    let slot_w = plot.width() / 32.0;
+    let bar_w = (slot_w - 2.0).max(2.0);
+    let offset = 32usize.saturating_sub(slice.len());
+
+    for (i, &ms) in slice.iter().enumerate() {
+        let frac = (ms / max_sample).clamp(0.08, 1.0) as f32;
+        let bh = (frac * plot.height()).max(3.0);
+        let x = plot.left() + ((offset + i) as f32) * slot_w + 1.0;
+        let bar_rect = Rect::from_min_max(
+            Pos2::new(x, plot.bottom() - bh),
+            Pos2::new(x + bar_w, plot.bottom()),
+        );
+        let col = if highlight_chatter && ms < chatter_threshold_ms {
+            p.bad
+        } else if !highlight_chatter && ms <= 1.2 {
+            p.ok
+        } else {
+            p.text_muted
+        };
+        painter.rect_filled(bar_rect, CornerRadius::same(2), col);
+    }
 }
 
 fn semantic_banner(

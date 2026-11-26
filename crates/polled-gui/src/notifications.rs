@@ -56,6 +56,13 @@ pub fn notify_low_battery(device_name: &str, percent: u8) {
     let _ = Notification::new().summary(&title).body(&body).show();
 }
 
+/// Sends a one-shot Windows notification when a charging wireless mouse reaches 100%.
+pub fn notify_battery_full(device_name: &str) {
+    let title = "Polled: Mouse fully charged (100%)";
+    let body = format!("{device_name} reached 100% battery. Ready to unplug from cable or dock.");
+    let _ = Notification::new().summary(title).body(&body).show();
+}
+
 /// Sends an optional Windows toast notification when Polled activates a game or desktop profile.
 pub fn notify_profile_switched(profile_name: &str, details: &str) {
     let title = format!("Polled: {profile_name}");
