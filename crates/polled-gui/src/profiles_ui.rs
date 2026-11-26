@@ -1851,68 +1851,29 @@ impl ProfilesUiState {
         runtime: &ProfileRuntimeHandle,
     ) {
         let inner_w = (card_w - 24.0).max(120.0);
+        let stack_header = inner_w < 285.0;
         card_frame(ui, p, card_w, |ui| {
             ui.set_min_height(inner_col_h);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Profiles").strong().color(p.text));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(secondary_btn("Import", p)).clicked() {
-                        self.import_modal_open = true;
-                        self.import_text.clear();
-                    }
-                    if ui
-                        .add(secondary_btn("+ Blank", p))
-                        .on_hover_text("Create a blank custom profile")
-                        .clicked()
-                    {
-                        let next_num = self.store.profiles.len();
-                        let new_prof = GameProfile {
-                            id: format!("game_{next_num}"),
-                            name: format!("Game Profile {next_num}"),
-                            is_desktop_default: false,
-                            executables: vec!["game.exe".to_string()],
-                            mouse: MouseSettings {
-                                dpi: Some(800),
-                                dpi_y: None,
-                                polling_rate_hz: Some(4000),
-                                lod: Some(LiftOffDistance::Mm10),
-                                debounce_ms: Some(1),
-                                motion_sync: None,
-                                angle_snapping: None,
-                                ripple_control: None,
-                                sleep_timeout_secs: None,
-                                dpi_stage: None,
-                                lock_dpi_stages: None,
-                                glass_mode: None,
-                            },
-                            device_overrides: BTreeMap::new(),
-                            windows_pointer_speed: None,
-                            windows_power_plan: None,
-                            audio_output_device_id: None,
-                            audio_output_device_name: None,
-                            audio_output_volume: None,
-                            audio_input_device_id: None,
-                            audio_input_device_name: None,
-                            audio_input_volume: None,
-                            lock_mic_volume: false,
-                            display_device_name: None,
-                            display_width: None,
-                            display_height: None,
-                            display_refresh_hz: None,
-                            wooting_profile: None,
-                            keyboard_preset: None,
-                            force_high_perf_gpu: false,
-                            quiet_notifications: false,
-                            duck_audio_apps: Vec::new(),
-                            duck_audio_volume_pct: 15,
-                            author: None,
-                            notes: None,
-                        };
-                        let new_id = new_prof.id.clone();
-                        self.store.upsert_profile(new_prof);
-                        self.select_profile(&new_id);
-                        runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
-                    }
+            let mut open_import = false;
+            let mut add_blank = false;
+            let mut open_game_picker = false;
+
+            if stack_header {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(secondary_btn("Import", p)).clicked() {
+                            open_import = true;
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new("Profiles").strong().color(p.text))
+                                    .truncate(),
+                            );
+                        });
+                    });
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .add(primary_btn("+ Game", p))
                         .on_hover_text(
@@ -1920,26 +1881,123 @@ impl ProfilesUiState {
                         )
                         .clicked()
                     {
-                        self.game_picker_mode = GamePickerMode::CreateProfile;
-                        self.game_picker_tab = GamePickerTab::Installed;
-                        self.game_picker_source_filter = None;
-                        self.game_picker_search.clear();
-                        self.game_picker_open = true;
-                        self.discovered_running = discover_running_apps();
-                        if self.discovered_installed.is_empty() {
-                            self.discovered_installed = discover_installed_games();
-                        }
+                        open_game_picker = true;
+                    }
+                    if ui
+                        .add(secondary_btn("+ Blank", p))
+                        .on_hover_text("Create a blank custom profile")
+                        .clicked()
+                    {
+                        add_blank = true;
                     }
                 });
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(secondary_btn("Import", p)).clicked() {
+                            open_import = true;
+                        }
+                        if ui
+                            .add(secondary_btn("+ Blank", p))
+                            .on_hover_text("Create a blank custom profile")
+                            .clicked()
+                        {
+                            add_blank = true;
+                        }
+                        if ui
+                            .add(primary_btn("+ Game", p))
+                            .on_hover_text(
+                                "1-click create a profile from an installed Steam, Riot, Epic, Battle.net, Ubisoft, or EA game",
+                            )
+                            .clicked()
+                        {
+                            open_game_picker = true;
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new("Profiles").strong().color(p.text),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    });
+                });
+            }
+
+            if open_import {
+                self.import_modal_open = true;
+                self.import_text.clear();
+            }
+            if add_blank {
+                let next_num = self.store.profiles.len();
+                let new_prof = GameProfile {
+                    id: format!("game_{next_num}"),
+                    name: format!("Game Profile {next_num}"),
+                    is_desktop_default: false,
+                    executables: vec!["game.exe".to_string()],
+                    mouse: MouseSettings {
+                        dpi: Some(800),
+                        dpi_y: None,
+                        polling_rate_hz: Some(4000),
+                        lod: Some(LiftOffDistance::Mm10),
+                        debounce_ms: Some(1),
+                        motion_sync: None,
+                        angle_snapping: None,
+                        ripple_control: None,
+                        sleep_timeout_secs: None,
+                        dpi_stage: None,
+                        lock_dpi_stages: None,
+                        glass_mode: None,
+                    },
+                    device_overrides: BTreeMap::new(),
+                    windows_pointer_speed: None,
+                    windows_power_plan: None,
+                    audio_output_device_id: None,
+                    audio_output_device_name: None,
+                    audio_output_volume: None,
+                    audio_input_device_id: None,
+                    audio_input_device_name: None,
+                    audio_input_volume: None,
+                    lock_mic_volume: false,
+                    display_device_name: None,
+                    display_width: None,
+                    display_height: None,
+                    display_refresh_hz: None,
+                    wooting_profile: None,
+                    keyboard_preset: None,
+                    force_high_perf_gpu: false,
+                    quiet_notifications: false,
+                    duck_audio_apps: Vec::new(),
+                    duck_audio_volume_pct: 15,
+                    author: None,
+                    notes: None,
+                };
+                let new_id = new_prof.id.clone();
+                self.store.upsert_profile(new_prof);
+                self.select_profile(&new_id);
+                runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
+            }
+            if open_game_picker {
+                self.game_picker_mode = GamePickerMode::CreateProfile;
+                self.game_picker_tab = GamePickerTab::Installed;
+                self.game_picker_source_filter = None;
+                self.game_picker_search.clear();
+                self.game_picker_open = true;
+                self.discovered_running = discover_running_apps();
+                if self.discovered_installed.is_empty() {
+                    self.discovered_installed = discover_installed_games();
+                }
+            }
             ui.add_space(8.0);
 
             let active_id = snap.map(|s| s.active_profile_id.as_str()).unwrap_or("");
             let mut clicked_id = None;
+            let list_header_reserve = if stack_header { 66.0 } else { 34.0 };
 
             egui::ScrollArea::vertical()
                 .id_salt("profile_list_scroll")
-                .max_height((inner_col_h - 34.0).max(110.0))
+                .max_height((inner_col_h - list_header_reserve).max(110.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let item_outer_w = (inner_w - 8.0).max(120.0);
@@ -2038,20 +2096,35 @@ impl ProfilesUiState {
         runtime: &ProfileRuntimeHandle,
     ) {
         let inner_w = (card_w - 24.0).max(200.0);
+        let stack_header = inner_w < 540.0;
         card_frame(ui, p, card_w, |ui| {
             ui.set_min_height(inner_col_h);
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !self.editor.is_desktop_default
-                        && ui.add(secondary_btn("Delete", p)).clicked()
-                    {
-                        let del_id = self.editor.id.clone();
-                        if self.store.remove_profile(&del_id) {
-                            self.select_profile("desktop");
-                            runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
-                            self.notice =
-                                Some((Severity::Info, format!("Deleted profile '{del_id}'.")));
-                        }
+            let title_text = if self.editor.is_desktop_default {
+                "Desktop Default Profile"
+            } else {
+                "Edit Game Profile"
+            };
+            let mut delete_clicked = false;
+            let mut duplicate_clicked = false;
+            let mut export_clicked = false;
+            let mut apply_clicked = false;
+            let mut save_clicked = false;
+
+            if stack_header {
+                ui.add(
+                    egui::Label::new(RichText::new(title_text).size(15.0).strong().color(p.text))
+                        .truncate(),
+                );
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(primary_btn("Save", p)).clicked() {
+                        save_clicked = true;
+                    }
+                    if ui.add(secondary_btn("Apply Now", p)).clicked() {
+                        apply_clicked = true;
+                    }
+                    if ui.add(secondary_btn("Export", p)).clicked() {
+                        export_clicked = true;
                     }
                     if ui
                         .add(secondary_btn("Duplicate", p))
@@ -2060,84 +2133,122 @@ impl ProfilesUiState {
                         )
                         .clicked()
                     {
-                        let mut cloned = self.editor.to_profile();
-                        let base_id = if cloned.id == "desktop" {
-                            "game".to_string()
-                        } else {
-                            format!("{}_copy", cloned.id)
-                        };
-                        let mut new_id = base_id.clone();
-                        let mut n = 2usize;
-                        while self.store.profiles.iter().any(|pr| pr.id == new_id) {
-                            new_id = format!("{base_id}_{n}");
-                            n += 1;
+                        duplicate_clicked = true;
+                    }
+                    if !self.editor.is_desktop_default
+                        && ui.add(secondary_btn("Delete", p)).clicked()
+                    {
+                        delete_clicked = true;
+                    }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.editor.is_desktop_default
+                            && ui.add(secondary_btn("Delete", p)).clicked()
+                        {
+                            delete_clicked = true;
                         }
-                        cloned.id = new_id.clone();
-                        cloned.name = format!("{} (Copy)", cloned.name);
-                        cloned.is_desktop_default = false;
-                        cloned.executables.clear();
-                        let cloned_name = cloned.name.clone();
-                        self.store.upsert_profile(cloned);
-                        self.select_profile(&new_id);
-                        self.editor_tab = ProfileEditorTab::General;
-                        runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
-                        self.notice = Some((
-                            Severity::Ok,
-                            format!(
-                                "Duplicated into '{cloned_name}' — pick a game executable in General and click Save."
-                            ),
-                        ));
-                    }
-                    if ui.add(secondary_btn("Export", p)).clicked() {
-                        let profile = self.editor.to_profile();
-                        match export_profile_json(&profile) {
-                            Ok(json) => self.export_modal_json = Some(json),
-                            Err(err) => self.notice = Some((Severity::Bad, err.to_string())),
-                        }
-                    }
-                    if ui.add(secondary_btn("Apply Now", p)).clicked() {
-                        let profile = self.editor.to_profile();
-                        let id = profile.id.clone();
-                        self.store.upsert_profile(profile);
-                        runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
-                        let unverified = self.unacknowledged_unverified_devices(snap);
-                        if !unverified.is_empty() {
-                            self.pending_unverified_action =
-                                Some(PendingUnverifiedWrite::ApplyProfileNow {
-                                    profile_id: id,
-                                    devices: unverified,
-                                });
-                        } else {
-                            runtime.send(ProfileRuntimeCmd::ApplyProfileNow(id));
-                        }
-                    }
-                    if ui.add(primary_btn("Save", p)).clicked() {
-                        let profile = self.editor.to_profile();
-                        let name = profile.name.clone();
-                        let id = profile.id.clone();
-                        self.store.upsert_profile(profile);
-                        self.select_profile(&id);
-                        runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
-                        self.notice = Some((Severity::Ok, format!("Saved profile '{name}'.")));
-                    }
-
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(if self.editor.is_desktop_default {
-                                    "Desktop Default Profile"
-                                } else {
-                                    "Edit Game Profile"
-                                })
-                                .size(15.0)
-                                .strong()
-                                .color(p.text),
+                        if ui
+                            .add(secondary_btn("Duplicate", p))
+                            .on_hover_text(
+                                "Clone this profile's mouse, keyboard, audio, and display settings into a new game profile",
                             )
-                            .truncate(),
-                        );
+                            .clicked()
+                        {
+                            duplicate_clicked = true;
+                        }
+                        if ui.add(secondary_btn("Export", p)).clicked() {
+                            export_clicked = true;
+                        }
+                        if ui.add(secondary_btn("Apply Now", p)).clicked() {
+                            apply_clicked = true;
+                        }
+                        if ui.add(primary_btn("Save", p)).clicked() {
+                            save_clicked = true;
+                        }
+
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(title_text).size(15.0).strong().color(p.text),
+                                )
+                                .truncate(),
+                            );
+                        });
                     });
                 });
-            });
+            }
+
+            if delete_clicked {
+                let del_id = self.editor.id.clone();
+                if self.store.remove_profile(&del_id) {
+                    self.select_profile("desktop");
+                    runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
+                    self.notice = Some((Severity::Info, format!("Deleted profile '{del_id}'.")));
+                }
+            }
+            if duplicate_clicked {
+                let mut cloned = self.editor.to_profile();
+                let base_id = if cloned.id == "desktop" {
+                    "game".to_string()
+                } else {
+                    format!("{}_copy", cloned.id)
+                };
+                let mut new_id = base_id.clone();
+                let mut n = 2usize;
+                while self.store.profiles.iter().any(|pr| pr.id == new_id) {
+                    new_id = format!("{base_id}_{n}");
+                    n += 1;
+                }
+                cloned.id = new_id.clone();
+                cloned.name = format!("{} (Copy)", cloned.name);
+                cloned.is_desktop_default = false;
+                cloned.executables.clear();
+                let cloned_name = cloned.name.clone();
+                self.store.upsert_profile(cloned);
+                self.select_profile(&new_id);
+                self.editor_tab = ProfileEditorTab::General;
+                runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
+                self.notice = Some((
+                    Severity::Ok,
+                    format!(
+                        "Duplicated into '{cloned_name}' — pick a game executable in General and click Save."
+                    ),
+                ));
+            }
+            if export_clicked {
+                let profile = self.editor.to_profile();
+                match export_profile_json(&profile) {
+                    Ok(json) => self.export_modal_json = Some(json),
+                    Err(err) => self.notice = Some((Severity::Bad, err.to_string())),
+                }
+            }
+            if apply_clicked {
+                let profile = self.editor.to_profile();
+                let id = profile.id.clone();
+                self.store.upsert_profile(profile);
+                runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
+                let unverified = self.unacknowledged_unverified_devices(snap);
+                if !unverified.is_empty() {
+                    self.pending_unverified_action =
+                        Some(PendingUnverifiedWrite::ApplyProfileNow {
+                            profile_id: id,
+                            devices: unverified,
+                        });
+                } else {
+                    runtime.send(ProfileRuntimeCmd::ApplyProfileNow(id));
+                }
+            }
+            if save_clicked {
+                let profile = self.editor.to_profile();
+                let name = profile.name.clone();
+                let id = profile.id.clone();
+                self.store.upsert_profile(profile);
+                self.select_profile(&id);
+                runtime.send(ProfileRuntimeCmd::UpdateStore(self.store.clone()));
+                self.notice = Some((Severity::Ok, format!("Saved profile '{name}'.")));
+            }
 
             ui.add_space(8.0);
 
@@ -2242,9 +2353,10 @@ impl ProfilesUiState {
             let mut refresh_displays = false;
             let mut test_display_clicked = false;
 
+            let editor_header_reserve = if stack_header { 100.0 } else { 68.0 };
             egui::ScrollArea::vertical()
                 .id_salt("profile_editor_scroll")
-                .max_height((inner_col_h - 68.0).max(120.0))
+                .max_height((inner_col_h - editor_header_reserve).max(120.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let field_w = (inner_w - 175.0).clamp(140.0, 420.0);
