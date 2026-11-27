@@ -2,6 +2,7 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+pub mod asus_rog;
 pub mod compx;
 pub mod compx64;
 pub mod controller;
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{PolledError, Result};
 
+pub use asus_rog::{AsusRogDevice, AsusRogProtocolDriver};
 pub use compx::{CompxDevice, CompxProtocolDriver};
 pub use compx64::{Compx64Device, Compx64ProtocolDriver};
 pub use controller::{ApplyOutcome, SafeDeviceController};
@@ -760,6 +762,7 @@ pub fn detect_hardware_devices() -> Result<Vec<Box<dyn MouseDevice>>> {
         Box::new(MchoseProtocolDriver),
         Box::new(IncottProtocolDriver),
         Box::new(KeychronProtocolDriver),
+        Box::new(AsusRogProtocolDriver),
     ];
     let mut devices = Vec::new();
     for driver in &drivers {

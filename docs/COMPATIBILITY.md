@@ -42,6 +42,7 @@
 | **MCHOSE V2 / Ultra** (A7 V2 Pro / Pro+ / Ultra / Ultra+, A7 Ultra, L7 Pro / Pro+) | `3837:*`, `5253:1020/1011` | Implemented from docs *(unverified)* | Onboard flash | DPI `50–30000/42000` (50 step), Polling `125–8000 Hz`, LOD `0.7/1.0/2.0 mm`, Debounce `0–20 ms`, Motion Sync / Angle Snap / Ripple, Live Battery % |
 | **Incott** (G23 / G23 V2 / G24 / Ghero / Zero 29 / Zero 39) | `093a:522c`, `622c` | Implemented from docs *(unverified)* | Onboard flash | DPI `50–32000/45000` (50 step), Polling `125–8000 Hz` (wireless) / `1000 Hz` (wired), LOD `0.7/1.0/2.0 mm`, Debounce `0–30 ms`, Motion Sync / Angle Snap / Ripple |
 | **Keychron Launcher 8K** (M1–M8, G3–G10, LM7 wired + Link / Ultra-Link / TurboLink receivers) | `3434:*` (`0xFFC1`) | Implemented from docs *(unverified)* | Onboard flash | DPI up to `26000/30000` (50 step), Polling `125–8000 Hz`, LOD `0.7/1.0/2.0 mm`, Debounce `0–20 ms`, Motion Sync / Angle Snap / Ripple, Live Battery % |
+| **ASUS ROG / TUF 64B & ROG Omni Receiver** (Harpe II Ace 8K, Harpe Ace Aim Lab / Extreme / Mini / Core, Keris II Ace / Origin / AimPoint / Wireless, Gladius III AimPoint / III / II, Chakram X, Spatha X, Strix Impact III / Wireless, TUF M3 / M4 / M5 / TX Mini) | `0b05:*` (`0xFF01`, + Omni `0b05:1ace` `0xFF02`/`0xFF01`, Harpe II `1ad0`) | Implemented from docs *(unverified)* | Onboard flash *(commit `50 03`)* | DPI `50/100–36000/42000` (50/100 step, preserves stage RGB), DPI Stage / Lock, Polling `125–1000 Hz` (`2000–8000 Hz` on native 8K & ROG Polling Rate Booster), LOD `1.0/2.0 mm`, Debounce `12–32 ms`, Angle Snap, Motion Sync *(Harpe II Ace)*, Sleep `1–10 min`, Live Battery % |
 
 ---
 
@@ -68,7 +69,7 @@
 > - `Pulsar X3 LHD CrazyLight Medium` (`3710:5406`, `cid=0x57, mid=0x68`) is explicitly skipped during detection until its register layout is verified.
 > - `WLMouse Beast X 4K` (`36a7:a887`) uses a different protocol from CompX 64B and is explicitly excluded.
 > - `Scyrox V8S` / 3955 flash-6912 PIDs (`3554:f515`, `3554:f517`), `MCHOSE MagDock` (`3837:1012`), `MCHOSE A7 V3` (`3837:4026–4038`), and `Keychron 8K Nordic` (`3434:d077`, `2801`, `d05b`, `d078`) are explicitly excluded so incompatible frames are never sent to them.
-> - `Glorious Model O 2 / I 2` is not included because its PixArt `0x03` HID interface is write-only and cannot satisfy Polled's mandatory read-back verification invariant.
+> - `Glorious Model O 2 / I 2` and `SteelSeries` mice (`1038:*`, Rival / Aerox / Prime) are not included because their public HID configuration protocols are write-only for DPI/polling and cannot satisfy Polled's mandatory read-back verification invariant.
 > - All vendor DFU / firmware-update bootloader PIDs are ignored; Polled never flashes mouse firmware or triggers factory resets.
 
 ---
@@ -76,7 +77,7 @@
 ## 3. Known Hardware & Software Compatibility Issues
 
 ### Vendor Peripheral Suites Conflicting Over HID Handles
-- **Affected:** Pulsar Fusion / Bibimbap, LAMZU Aurora, Logitech G HUB / Onboard Memory Manager, Razer Synapse, Endgame Gear configuration tool, Finalmouse XPANEL, VAXEE Control Center, Ninjutso NinjaForce, WLMouse Hub, MCHOSE M-HUB, Incott / Keychron Launcher, VGN / ATK V-HUB, G-Wolves web tool, Corsair iCUE, SteelSeries GG.
+- **Affected:** Pulsar Fusion / Bibimbap, LAMZU Aurora, Logitech G HUB / Onboard Memory Manager, Razer Synapse, ASUS Armoury Crate / GearLink, Endgame Gear configuration tool, Finalmouse XPANEL, VAXEE Control Center, Ninjutso NinjaForce, WLMouse Hub, MCHOSE M-HUB, Incott / Keychron Launcher, VGN / ATK V-HUB, G-Wolves web tool, Corsair iCUE, SteelSeries GG.
 - **Symptom:** Profile reads time out, read-back verification fails, or mouse settings revert seconds after Polled switches them.
 - **Workaround:** Fully quit vendor suites from the system tray (or close web configurator tabs like XPANEL / NinjaForce / LAMZU Aurora / Keychron Launcher) when using Polled's **Auto-Switch**. Polled's Health Check flags active heavy vendor suites automatically.
 

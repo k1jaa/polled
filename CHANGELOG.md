@@ -18,6 +18,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **ASUS ROG / TUF Mouse & ROG Omni Receiver Backend (`devices/asus_rog.rs`):**
+  - Added read-back-verified support (`SupportTier::ImplementedFromDocs`, confirm-gated, zero destructive/pairing/reboot opcodes) for **ASUS ROG & TUF** mice (`VID 0x0B05`) across 36 direct USB / dedicated dongle PIDs plus the **ROG Omni Multi-Device Receiver (`0x0B05:0x1ACE`)** with automatic **8K Polling Rate Booster** detection (`7D 20 02`), implemented from `OpenMouse-Project/mouse-protocol` (AGPL-3.0), `seerge/g-helper` (GPL-3.0), and `libratbag` (MIT).
+  - Covers **ROG Harpe II Ace (8K + Motion Sync)**, **Harpe Ace Aim Lab / Extreme / Mini / Core**, **Keris II Ace / Origin / Wireless AimPoint / Wireless**, **Gladius III AimPoint / III / II**, **Chakram X (8K wired)**, **Spatha X**, **Strix Impact III / Wireless**, and **TUF M3 / M4 Air / M4 Wireless / M5 / TX Mini** — with DPI stages (preserving stage indicator RGB), DPI stage lock, polling rate (up to 8,000 Hz), LOD, debounce, angle snapping, sleep timeout, and live wireless battery %.
+- **Changelog-Powered GitHub Release Notes & WinGet Publishing Automation (`.github/workflows/release.yml`, `scripts/release-checklist.ps1`, `packaging/winget/README.md`):**
+  - Updated `release.yml` to extract each version's exact `CHANGELOG.md` section plus SHA-256 checksum into GitHub Release notes, added an opt-in `publish-winget` (`vedantmgoyal9/winget-releaser@v2`) job gated on `vars.WINGET_AUTO_PUBLISH == 'true'`, aligned `release-checklist.ps1` with the `polled-v*-windows-x64.zip` release layout, and added step-by-step WinGet submission docs.
+
 ---
 
 ## [0.14.3] - 2026-11-27
