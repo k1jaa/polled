@@ -16,6 +16,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Pulsar Fusion 2 / Sonix 64-Byte Mouse & 8K Dongle Backend (`devices/pulsar_fusion.rs`):**
+  - Added read-back-verified support (`SupportTier::ImplementedFromDocs`, confirm-gated, zero destructive opcodes) for the **Pulsar 8K Wireless Dongle (`3710:5403`)**, **Pulsar 1K Wireless Dongle (`3710:5402`)**, **Pulsar Feinmann F01 8K (`3710:5404`)**, **Pulsar X3 / X3 LHD (`3710:3409`/`3410`)**, **Xlite v4 (`3710:3401`)**, **X2A v3 (`3710:3404`)**, and wired Sonix models (`3710:1401–1404`), implemented from `packerlschupfer/pulsar-mouse-linux` (MIT) and `OpenMouse-Project/mouse-protocol` (AGPL-3.0).
+  - Supports DPI (up to 32,000 in 10 DPI steps with independent X/Y DPI & DPI stage lock), 125–8000 Hz polling rate on 8K dongles, auto-detected tenths-mm vs. legacy LOD (`0.7 / 1.0 / 2.0 mm`), 0–15 ms debounce, Motion Sync / Angle Snapping / Ripple Control, sleep timeout (`30–900 s`), live battery % & charging state, paired-mouse auto-identification via `01/84/04` (including the 8K dongle header-quirk handler), fast sleep detection (`0x05`), and moving-mouse stale-buffer recovery.
+
+---
+
 ## [0.14.1] - 2026-11-27
 
 ### Added

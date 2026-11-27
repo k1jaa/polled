@@ -14,6 +14,7 @@ pub mod keyboards;
 pub mod keychron;
 pub mod mchose;
 pub mod ninjutso;
+pub mod pulsar_fusion;
 pub mod razer;
 pub mod vaxee;
 pub mod wooting;
@@ -40,6 +41,7 @@ pub use keyboards::{
 pub use keychron::{KeychronDevice, KeychronProtocolDriver};
 pub use mchose::{MchoseDevice, MchoseProtocolDriver};
 pub use ninjutso::{NinjutsoDevice, NinjutsoProtocolDriver};
+pub use pulsar_fusion::{PulsarFusionDevice, PulsarFusionProtocolDriver};
 pub use razer::{RazerDevice, RazerProtocolDriver};
 pub use vaxee::{VaxeeDevice, VaxeeProtocolDriver};
 pub use wooting::{
@@ -747,6 +749,7 @@ pub fn detect_hardware_devices() -> Result<Vec<Box<dyn MouseDevice>>> {
     })?;
     let drivers: Vec<Box<dyn DeviceDriver>> = vec![
         Box::new(CompxProtocolDriver),
+        Box::new(PulsarFusionProtocolDriver),
         Box::new(Compx64ProtocolDriver),
         Box::new(Hidpp20ProtocolDriver),
         Box::new(RazerProtocolDriver),
