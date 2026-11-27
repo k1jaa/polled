@@ -31,6 +31,7 @@ use crate::osd::OsdController;
 use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::profiles_ui::ProfilesUiState;
 use crate::single_instance::SingleInstanceGuard;
+use crate::taskbar_widget::{primary_mouse_battery, TaskbarWidgetController};
 use crate::theme::{Palette, ThemeMode};
 use crate::tray::{find_own_main_hwnd, TrayAction, TrayController};
 
@@ -229,6 +230,7 @@ fn build_non_elevated_confirm_warning(check: &CheckReport) -> String {
 /// Messages sent from background worker/tray/IPC threads back to the `egui` UI thread.
 pub(crate) enum WorkerMsg {
     TraySyncAutoSwitch(bool),
+    TraySyncTaskbarWidget(bool),
     TrayAction(TrayAction),
     HotkeyTriggered(HotkeyAction),
     ScanFinished {
@@ -263,6 +265,7 @@ pub(crate) enum WorkerMsg {
         message: String,
     },
     UpdateCheckFinished(Result<UpdateCheckResult, String>),
+    TrayUpdateCheckFinished(Result<UpdateCheckResult, String>),
     UpdateInstallProgress(String),
     UpdateInstallFinished(Result<InstalledUpdate, String>),
     DaemonCachedScan(ScanSummary),
@@ -274,6 +277,7 @@ pub(crate) enum WorkerMsg {
 struct StandaloneHost {
     hotkey_manager: HotkeyManager,
     osd: OsdController,
+    taskbar_widget: TaskbarWidgetController,
     tray: TrayController,
     _instance_guard: SingleInstanceGuard,
 }
@@ -362,6 +366,9 @@ impl PolledApp {
                     DaemonToUiMsg::CachedUpdateCheck(info) => WorkerMsg::DaemonCachedUpdate(info),
                     DaemonToUiMsg::TraySyncAutoSwitch(enabled) => {
                         WorkerMsg::TraySyncAutoSwitch(enabled)
+                    }
+                    DaemonToUiMsg::TraySyncTaskbarWidget(enabled) => {
+                        WorkerMsg::TraySyncTaskbarWidget(enabled)
                     }
                     DaemonToUiMsg::ReadFromMouseFinished {
                         device_name,
@@ -509,11 +516,34 @@ impl PolledApp {
         let hotkey_manager =
             HotkeyManager::start(settings.hotkeys.clone(), tx.clone(), Arc::clone(&wake));
 
+        instance_guard.record_running_daemon(&paths.daemon_state_path());
+
         let show_hwnd = Arc::clone(&main_hwnd);
         let show_ctx = cc.egui_ctx.clone();
-        instance_guard.start_show_listener(Arc::new(move || {
-            crate::tray::show_and_focus(&show_hwnd, &show_ctx);
-        }));
+        let quit_hwnd = Arc::clone(&main_hwnd);
+        let quit_ctx = cc.egui_ctx.clone();
+        let quit_flag = Arc::clone(&quit_requested);
+        instance_guard.start_event_listener(
+            Arc::new(move || {
+                crate::tray::show_and_focus(&show_hwnd, &show_ctx);
+            }),
+            Arc::new(move || {
+                quit_flag.store(true, Ordering::SeqCst);
+                crate::tray::request_native_close(&quit_hwnd);
+                quit_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                quit_ctx.request_repaint();
+            }),
+        );
+
+        let widget_hwnd = Arc::clone(&main_hwnd);
+        let widget_ctx = cc.egui_ctx.clone();
+        let taskbar_widget = TaskbarWidgetController::start(
+            settings.alerts.taskbar_battery_widget,
+            settings.alerts.clamped_threshold(),
+            Arc::new(move || {
+                crate::tray::show_and_focus(&widget_hwnd, &widget_ctx);
+            }),
+        );
 
         let tx_tray = tx.clone();
         let wake_tray = Arc::clone(&wake);
@@ -522,6 +552,7 @@ impl PolledApp {
         let tray_quit = Arc::clone(&quit_requested);
         let tray = TrayController::new(
             settings.auto_switch_on_startup,
+            settings.alerts.taskbar_battery_widget,
             Arc::new(move |action| {
                 match &action {
                     TrayAction::Open => {
@@ -581,6 +612,7 @@ impl PolledApp {
             host: AppHost::Standalone(Box::new(StandaloneHost {
                 hotkey_manager,
                 osd: OsdController::start(),
+                taskbar_widget,
                 tray,
                 _instance_guard: instance_guard,
             })),
@@ -1038,6 +1070,9 @@ impl PolledApp {
                 WorkerMsg::TraySyncAutoSwitch(enabled) => {
                     self.settings.auto_switch_on_startup = enabled;
                 }
+                WorkerMsg::TraySyncTaskbarWidget(enabled) => {
+                    self.settings.alerts.taskbar_battery_widget = enabled;
+                }
                 WorkerMsg::TrayAction(action) => match action {
                     TrayAction::Open => crate::tray::show_and_focus(&self.main_hwnd, ctx),
                     TrayAction::ScanNow => {
@@ -1111,6 +1146,33 @@ impl PolledApp {
                             .save_atomic(&AppPaths::default_user_dir().settings_path());
                         self.profile_runtime
                             .send(ProfileRuntimeCmd::SetAutoSwitch(next));
+                    }
+                    TrayAction::ToggleTaskbarWidget => {
+                        let next = !self.settings.alerts.taskbar_battery_widget;
+                        self.settings.alerts.taskbar_battery_widget = next;
+                        let _ = self
+                            .settings
+                            .save_atomic(&AppPaths::default_user_dir().settings_path());
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::UpdateAlertConfig(
+                                self.settings.alerts.clone(),
+                            ));
+                        self.sync_tray_from_snapshot();
+                    }
+                    TrayAction::CheckUpdates => {
+                        if self.available_update().is_some() {
+                            self.update_banner_dismissed = false;
+                            crate::tray::show_and_focus(&self.main_hwnd, ctx);
+                        } else if !self.update_checking {
+                            self.update_checking = true;
+                            let tx_upd = self.tx.clone();
+                            let ctx_upd = ctx.clone();
+                            std::thread::spawn(move || {
+                                let res = check_latest_github_release().map_err(|e| e.to_string());
+                                let _ = tx_upd.send(WorkerMsg::TrayUpdateCheckFinished(res));
+                                ctx_upd.request_repaint();
+                            });
+                        }
                     }
                     TrayAction::Quit => {
                         self.quit_requested.store(true, Ordering::SeqCst);
@@ -1234,6 +1296,12 @@ impl PolledApp {
                     self.update_checking = false;
                     match res {
                         Ok(info) => {
+                            if let AppHost::Standalone(host) = &self.host {
+                                host.tray.set_available_update(
+                                    info.update_available
+                                        .then_some(info.latest_version.as_str()),
+                                );
+                            }
                             self.sync_update_to_host(&info);
                             self.update_result = Some(Ok(info));
                         }
@@ -1241,6 +1309,37 @@ impl PolledApp {
                             // Silent startup check failure (e.g. offline boot) — ignore quietly.
                         }
                         Err(err) => {
+                            self.update_result = Some(Err(err));
+                        }
+                    }
+                }
+                WorkerMsg::TrayUpdateCheckFinished(res) => {
+                    self.update_checking = false;
+                    match res {
+                        Ok(info) => {
+                            if let AppHost::Standalone(host) = &self.host {
+                                host.tray.set_available_update(
+                                    info.update_available
+                                        .then_some(info.latest_version.as_str()),
+                                );
+                            }
+                            if info.update_available {
+                                notify_update_available(&info);
+                                self.show_osd_pill(
+                                    format!("Polled v{} Available", info.latest_version),
+                                    "Click Update Available in tray to view & install",
+                                );
+                            } else {
+                                self.show_osd_pill(
+                                    "Polled · Up to Date",
+                                    format!("Running latest release v{}", info.current_version),
+                                );
+                            }
+                            self.sync_update_to_host(&info);
+                            self.update_result = Some(Ok(info));
+                        }
+                        Err(err) => {
+                            self.show_osd_pill("Polled · Update Check Failed", err.clone());
                             self.update_result = Some(Err(err));
                         }
                     }
@@ -1314,15 +1413,22 @@ impl PolledApp {
     }
 
     fn sync_tray_from_snapshot(&mut self) {
-        let Some(snap) = self.profiles_ui.runtime_snapshot.as_ref() else {
-            return;
-        };
+        let snap = self.profiles_ui.runtime_snapshot.as_ref();
         if let AppHost::Standalone(host) = &mut self.host {
-            host.tray.sync_from_snapshot(
-                snap,
-                self.settings.alerts.battery_tray_icon,
+            host.tray
+                .set_taskbar_widget_checked(self.settings.alerts.taskbar_battery_widget);
+            host.taskbar_widget.update(
+                self.settings.alerts.taskbar_battery_widget,
+                snap.and_then(primary_mouse_battery),
                 self.settings.alerts.clamped_threshold(),
             );
+            if let Some(snap) = snap {
+                host.tray.sync_from_snapshot(
+                    snap,
+                    self.settings.alerts.battery_tray_icon,
+                    self.settings.alerts.clamped_threshold(),
+                );
+            }
         }
     }
 }
@@ -2765,6 +2871,13 @@ impl eframe::App for PolledApp {
                     ui.checkbox(
                         &mut self.settings.alerts.battery_tray_icon,
                         "Show wireless mouse battery % on system tray icon",
+                    );
+                    ui.checkbox(
+                        &mut self.settings.alerts.taskbar_battery_widget,
+                        "Pin wireless mouse battery % directly on Windows taskbar (next to tray)",
+                    )
+                    .on_hover_text(
+                        "Draws a crisp transparent vector mouse icon and live battery % directly beside the Windows 10/11 tray overflow chevron. Auto-hides in fullscreen games, opens Polled on click, zero game hooks.",
                     );
                     ui.horizontal(|ui| {
                         ui.checkbox(

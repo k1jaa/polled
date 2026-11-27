@@ -19,6 +19,7 @@ mod osd;
 mod profile_runtime;
 mod profiles_ui;
 mod single_instance;
+mod taskbar_widget;
 mod theme;
 mod tray;
 
@@ -27,15 +28,62 @@ use std::time::Duration;
 use eframe::egui;
 use single_instance::{InstanceLock, SingleInstanceGuard};
 
-/// Acquires the single-instance lock; when relaunching after an in-place update (`--after-update`),
-/// waits quietly up to 8 seconds for the previous daemon to release the mutex without waking it.
+/// Acquires the single-instance lock.
+///
+/// - When relaunching after an in-place update (`--after-update`), waits quietly up to 8 seconds
+///   for the previous daemon to release the mutex without waking it.
+/// - When launching a strictly newer version while an older daemon holds the mutex (detected via
+///   `%LOCALAPPDATA%\Polled\daemon.json`), signals the older daemon to quit cleanly and waits up
+///   to 8 seconds to take over automatically instead of popping open the stale tray instance.
 pub(crate) fn acquire_instance_guard(
     signal_existing_to_show: bool,
     wait_for_previous_exit: bool,
 ) -> InstanceLock {
     if !wait_for_previous_exit {
-        return SingleInstanceGuard::acquire(signal_existing_to_show);
+        match SingleInstanceGuard::acquire(false) {
+            InstanceLock::Primary(guard) => return InstanceLock::Primary(guard),
+            InstanceLock::AlreadyRunning => {
+                let paths = polled_core::AppPaths::default_user_dir();
+                let current_pid = std::process::id();
+                let current_version = env!("CARGO_PKG_VERSION");
+
+                if let Some(running) =
+                    single_instance::read_running_daemon_info(&paths.daemon_state_path())
+                {
+                    if single_instance::should_take_over_running_daemon(
+                        &running,
+                        current_pid,
+                        current_version,
+                    ) {
+                        // Prefer the zero-contention Win32 named quit event (works even if a `--ui`
+                        // window is open or in standalone mode); fall back to IPC if unavailable.
+                        let signaled = SingleInstanceGuard::signal_existing_to_quit();
+                        if !signaled {
+                            if let Ok(client) = ipc::IpcClient::connect(running.pid, |_| {}, || {})
+                            {
+                                client.send(ipc::UiToDaemonMsg::RequestQuitDaemon);
+                                std::thread::sleep(Duration::from_millis(120));
+                            }
+                        }
+                        for _ in 0..80 {
+                            if let InstanceLock::Primary(guard) =
+                                SingleInstanceGuard::acquire(false)
+                            {
+                                return InstanceLock::Primary(guard);
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                }
+
+                if signal_existing_to_show {
+                    let _ = SingleInstanceGuard::signal_existing_to_show();
+                }
+                return InstanceLock::AlreadyRunning;
+            }
+        }
     }
+
     for _ in 0..80 {
         if let InstanceLock::Primary(guard) = SingleInstanceGuard::acquire(false) {
             return InstanceLock::Primary(guard);

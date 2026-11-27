@@ -18,6 +18,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Seamless Newer-Version Daemon Auto-Takeover (`paths.rs`, `single_instance.rs`, `main.rs`, `daemon.rs`, `app.rs`):**
+  - Persists the active primary instance's PID, version, and exe path in `%LOCALAPPDATA%\Polled\daemon.json` (with PID-guarded cleanup on exit) and adds a zero-contention Win32 takeover-quit event (`Local\PolledGuiQuitEvent`).
+  - Manually launching a newer `polled-gui.exe` while an older version sits in the system tray now automatically asks the older daemon to exit cleanly and takes over the single-instance lock instead of focusing the outdated version.
+- **Pulsar Pro 64B & HyperX Pulsefire Haste Mouse Backends (`devices/pulsar_pro.rs`, `devices/hyperx.rs`):**
+  - Added read-back-verified support (`SupportTier::ImplementedFromDocs`, confirm-gated, zero destructive opcodes) for **Pulsar Pro 8K Wireless Receiver (`3710:5405`)** and **Pulsar ZywOo The Chosen X Wired (`3710:7401`)** (DPI `50–32000`, X/Y DPI, 6 stages + DPI lock, `125–8000 Hz`, LOD `0.7/1.0/2.0 mm`, debounce `0–20 ms`, Motion Sync / Ripple / Angle Snap, sleep `10–1800 s`, live battery %).
+  - Added read-back-verified **Volatile RAM** direct-mode support for **HyperX Pulsefire Haste** wired & wireless (`0951:1727`, `03f0:0f8f`, `03f0:048e`, `03f0:028e` — DPI `200–16000`, 5 stages + DPI lock, LOD `1.0/2.0 mm`, live wireless battery %, zero flash wear on auto-switch; polling rate omitted because firmware lacks read-back).
+- **Opt-In Pure-Win32 Windows 10/11 Taskbar Battery Widget & Tray Update Actions (`taskbar_widget.rs`, `tray.rs`, `settings.rs`, `ipc.rs`, `daemon.rs`, `app.rs`):**
+  - Added an opt-in **Taskbar Battery Widget** (`taskbar_battery_widget`, default `false`, toggleable in **Settings → Tray Icon & Notifications** and the system tray right-click menu) that draws an anti-aliased vector mouse icon and live battery percentage (`93%`) directly on the Windows 10/11 taskbar immediately left of the tray `^` chevron using `UpdateLayeredWindow` (`ULW_ALPHA`) — DPI-scaled, dark/light taskbar theme aware, amber on low battery, emerald + bolt when charging, auto-hides in fullscreen games, click to open Polled, 0% CPU when disabled, zero game hooks or Explorer injection.
+  - Added **Check for Updates** directly to the system tray right-click menu, dynamically updating to **`Update Available (vX.Y.Z)...`** when a newer release is found and opening straight to Polled's 1-click update banner on click.
+
 ---
 
 ## [0.14.4] - 2026-11-27

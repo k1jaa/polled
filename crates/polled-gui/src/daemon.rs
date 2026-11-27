@@ -77,6 +77,7 @@ mod win32_daemon {
     use crate::osd::OsdController;
     use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
     use crate::single_instance::{InstanceLock, SingleInstanceGuard};
+    use crate::taskbar_widget::TaskbarWidgetController;
     use crate::theme::ThemeMode;
     use crate::tray::{TrayAction, TrayController};
 
@@ -84,6 +85,7 @@ mod win32_daemon {
 
     enum DaemonSignal {
         ShowRequested,
+        QuitRequested,
     }
 
     struct DaemonState {
@@ -96,6 +98,7 @@ mod win32_daemon {
         latest_snapshot: Option<ProfileRuntimeSnapshot>,
         latest_scan: Option<ScanSummary>,
         latest_update: Option<UpdateCheckResult>,
+        tray_update_checking: bool,
         pending_open_bench: bool,
         pending_focus_on_connect: bool,
         trimmed_after_boot: bool,
@@ -113,6 +116,7 @@ mod win32_daemon {
         ipc_server: IpcServer,
         hotkey_manager: HotkeyManager,
         osd: OsdController,
+        taskbar_widget: TaskbarWidgetController,
         tray: TrayController,
         profile_runtime: ProfileRuntimeHandle,
         _instance_guard: SingleInstanceGuard,
@@ -128,10 +132,14 @@ mod win32_daemon {
                 return;
             }
 
-            // 1. Single-instance wake signals (user launched `polled-gui.exe` again).
+            // 1. Single-instance wake & newer-version takeover quit signals.
             while let Ok(sig) = self.signal_rx.try_recv() {
                 match sig {
                     DaemonSignal::ShowRequested => self.spawn_or_focus_ui(false),
+                    DaemonSignal::QuitRequested => {
+                        self.begin_shutdown();
+                        return;
+                    }
                 }
             }
 
@@ -185,6 +193,11 @@ mod win32_daemon {
                         self.tray.sync_from_snapshot(
                             &snap,
                             self.settings.alerts.battery_tray_icon,
+                            self.settings.alerts.clamped_threshold(),
+                        );
+                        self.taskbar_widget.sync_from_snapshot(
+                            &snap,
+                            self.settings.alerts.taskbar_battery_widget,
                             self.settings.alerts.clamped_threshold(),
                         );
                         self.latest_snapshot = Some((*snap).clone());
@@ -284,16 +297,57 @@ mod win32_daemon {
                             .send(DaemonToUiMsg::TraySyncAutoSwitch(enabled));
                     }
                     WorkerMsg::UpdateCheckFinished(Ok(info)) => {
+                        self.tray.set_available_update(
+                            info.update_available
+                                .then_some(info.latest_version.as_str()),
+                        );
                         if info.update_available {
                             notify_update_available(&info);
                         }
                         self.latest_update = Some(info.clone());
                         let _ = self.ipc_server.send(DaemonToUiMsg::CachedUpdateCheck(info));
                     }
+                    WorkerMsg::TrayUpdateCheckFinished(res) => {
+                        self.tray_update_checking = false;
+                        match res {
+                            Ok(info) => {
+                                self.tray.set_available_update(
+                                    info.update_available
+                                        .then_some(info.latest_version.as_str()),
+                                );
+                                if info.update_available {
+                                    notify_update_available(&info);
+                                    self.osd.show(
+                                        format!("Polled v{} Available", info.latest_version),
+                                        "Click Update Available in tray to view & install"
+                                            .to_string(),
+                                        self.dark_mode,
+                                    );
+                                } else {
+                                    self.osd.show(
+                                        "Polled · Up to Date".to_string(),
+                                        format!("Running latest release v{}", info.current_version),
+                                        self.dark_mode,
+                                    );
+                                }
+                                self.latest_update = Some(info.clone());
+                                let _ =
+                                    self.ipc_server.send(DaemonToUiMsg::CachedUpdateCheck(info));
+                            }
+                            Err(err) => {
+                                self.osd.show(
+                                    "Polled · Update Check Failed".to_string(),
+                                    err,
+                                    self.dark_mode,
+                                );
+                            }
+                        }
+                    }
                     WorkerMsg::ActionFinished { .. }
                     | WorkerMsg::UpdateCheckFinished(Err(_))
                     | WorkerMsg::UpdateInstallProgress(_)
                     | WorkerMsg::UpdateInstallFinished(_)
+                    | WorkerMsg::TraySyncTaskbarWidget(_)
                     | WorkerMsg::TrayAction(_)
                     | WorkerMsg::DaemonFocusWindow
                     | WorkerMsg::DaemonShutdownUi
@@ -382,6 +436,53 @@ mod win32_daemon {
                             .ipc_server
                             .send(DaemonToUiMsg::TraySyncAutoSwitch(next));
                     }
+                    TrayAction::ToggleTaskbarWidget => {
+                        let next = !self.settings.alerts.taskbar_battery_widget;
+                        self.settings.alerts.taskbar_battery_widget = next;
+                        let paths = AppPaths::default_user_dir();
+                        let mut saved = AppSettings::load_or_default(&paths.settings_path());
+                        saved.alerts.taskbar_battery_widget = next;
+                        let _ = saved.save_atomic(&paths.settings_path());
+                        self.tray.set_taskbar_widget_checked(next);
+                        if let Some(snap) = &self.latest_snapshot {
+                            self.taskbar_widget.sync_from_snapshot(
+                                snap,
+                                next,
+                                self.settings.alerts.clamped_threshold(),
+                            );
+                        } else {
+                            self.taskbar_widget.update(
+                                next,
+                                None,
+                                self.settings.alerts.clamped_threshold(),
+                            );
+                        }
+                        self.profile_runtime
+                            .send(ProfileRuntimeCmd::UpdateAlertConfig(
+                                self.settings.alerts.clone(),
+                            ));
+                        let _ = self
+                            .ipc_server
+                            .send(DaemonToUiMsg::TraySyncTaskbarWidget(next));
+                    }
+                    TrayAction::CheckUpdates => {
+                        if self
+                            .latest_update
+                            .as_ref()
+                            .is_some_and(|u| u.update_available)
+                        {
+                            self.spawn_or_focus_ui(false);
+                        } else if !self.tray_update_checking {
+                            self.tray_update_checking = true;
+                            let tx_upd = self.worker_tx.clone();
+                            let wake_upd = Arc::clone(&self.wake);
+                            std::thread::spawn(move || {
+                                let res = check_latest_github_release().map_err(|e| e.to_string());
+                                let _ = tx_upd.send(WorkerMsg::TrayUpdateCheckFinished(res));
+                                wake_upd();
+                            });
+                        }
+                    }
                     TrayAction::Quit => {
                         self.begin_shutdown();
                         return;
@@ -395,10 +496,24 @@ mod win32_daemon {
                     UiToDaemonMsg::RuntimeCmd(cmd) => {
                         if let ProfileRuntimeCmd::UpdateAlertConfig(ref alerts) = cmd {
                             self.settings.alerts = alerts.clone();
+                            self.tray.set_taskbar_widget_checked(
+                                self.settings.alerts.taskbar_battery_widget,
+                            );
                             if let Some(snap) = &self.latest_snapshot {
                                 self.tray.sync_from_snapshot(
                                     snap,
                                     self.settings.alerts.battery_tray_icon,
+                                    self.settings.alerts.clamped_threshold(),
+                                );
+                                self.taskbar_widget.sync_from_snapshot(
+                                    snap,
+                                    self.settings.alerts.taskbar_battery_widget,
+                                    self.settings.alerts.clamped_threshold(),
+                                );
+                            } else {
+                                self.taskbar_widget.update(
+                                    self.settings.alerts.taskbar_battery_widget,
+                                    None,
                                     self.settings.alerts.clamped_threshold(),
                                 );
                             }
@@ -419,6 +534,10 @@ mod win32_daemon {
                         self.latest_scan = Some(summary);
                     }
                     UiToDaemonMsg::SyncUpdateCheck(info) => {
+                        self.tray.set_available_update(
+                            info.update_available
+                                .then_some(info.latest_version.as_str()),
+                        );
                         self.latest_update = Some(info);
                     }
                     UiToDaemonMsg::RequestQuitDaemon => {
@@ -647,6 +766,7 @@ mod win32_daemon {
 
         let own_pid = std::process::id();
         let ipc_server = IpcServer::start(own_pid, ipc_msg_tx, ipc_evt_tx, Arc::clone(&wake))?;
+        instance_guard.record_running_daemon(&paths.daemon_state_path());
 
         let profile_runtime = ProfileRuntimeHandle::start(
             store,
@@ -662,10 +782,21 @@ mod win32_daemon {
             Arc::clone(&wake),
         );
         let osd = OsdController::start();
+        let signal_tx_widget = signal_tx.clone();
+        let wake_widget = Arc::clone(&wake);
+        let taskbar_widget = TaskbarWidgetController::start(
+            settings.alerts.taskbar_battery_widget,
+            settings.alerts.clamped_threshold(),
+            Arc::new(move || {
+                let _ = signal_tx_widget.send(DaemonSignal::ShowRequested);
+                wake_widget();
+            }),
+        );
 
         let wake_tray = Arc::clone(&wake);
         let tray = TrayController::new(
             settings.auto_switch_on_startup,
+            settings.alerts.taskbar_battery_widget,
             Arc::new(move |action| {
                 let _ = tray_tx.send(action);
                 wake_tray();
@@ -673,10 +804,18 @@ mod win32_daemon {
         );
 
         let wake_show = Arc::clone(&wake);
-        instance_guard.start_show_listener(Arc::new(move || {
-            let _ = signal_tx.send(DaemonSignal::ShowRequested);
-            wake_show();
-        }));
+        let signal_tx_quit = signal_tx.clone();
+        let wake_quit = Arc::clone(&wake);
+        instance_guard.start_event_listener(
+            Arc::new(move || {
+                let _ = signal_tx.send(DaemonSignal::ShowRequested);
+                wake_show();
+            }),
+            Arc::new(move || {
+                let _ = signal_tx_quit.send(DaemonSignal::QuitRequested);
+                wake_quit();
+            }),
+        );
 
         spawn_windows_build_watcher(worker_tx.clone(), Arc::clone(&wake));
 
@@ -710,6 +849,7 @@ mod win32_daemon {
             latest_snapshot: None,
             latest_scan: None,
             latest_update: None,
+            tray_update_checking: false,
             pending_open_bench: false,
             pending_focus_on_connect: false,
             trimmed_after_boot: false,
@@ -725,6 +865,7 @@ mod win32_daemon {
             ipc_server,
             hotkey_manager,
             osd,
+            taskbar_widget,
             tray,
             profile_runtime,
             _instance_guard: instance_guard,

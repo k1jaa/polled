@@ -18,6 +18,8 @@ const ID_OPEN: &str = "open";
 const ID_SCAN: &str = "scan";
 const ID_AUTO_SWITCH: &str = "auto_switch";
 const ID_LOCK_PROFILE: &str = "lock_profile";
+const ID_TASKBAR_WIDGET: &str = "taskbar_widget";
+const ID_CHECK_UPDATES: &str = "check_updates";
 const ID_PROFILE_PREFIX: &str = "profile::";
 const ID_MOUSE_POLL_PREFIX: &str = "mouse_poll::";
 const ID_MOUSE_DPI_PREFIX: &str = "mouse_dpi::";
@@ -45,6 +47,8 @@ pub enum TrayAction {
     RestoreNativeDisplay,
     ToggleProfileLock,
     ToggleAutoSwitch,
+    ToggleTaskbarWidget,
+    CheckUpdates,
     Quit,
 }
 
@@ -108,6 +112,8 @@ pub fn parse_menu_action(id_str: &str) -> Option<TrayAction> {
         ID_RESTORE_DISPLAY => Some(TrayAction::RestoreNativeDisplay),
         ID_LOCK_PROFILE => Some(TrayAction::ToggleProfileLock),
         ID_AUTO_SWITCH => Some(TrayAction::ToggleAutoSwitch),
+        ID_TASKBAR_WIDGET => Some(TrayAction::ToggleTaskbarWidget),
+        ID_CHECK_UPDATES => Some(TrayAction::CheckUpdates),
         ID_QUIT => Some(TrayAction::Quit),
         _ => None,
     }
@@ -197,6 +203,8 @@ pub struct TrayController {
     restore_display_item: MenuItem,
     auto_switch_item: CheckMenuItem,
     lock_profile_item: CheckMenuItem,
+    taskbar_widget_item: CheckMenuItem,
+    check_updates_item: MenuItem,
     /// Cached rendered icon state: `None` = unset, `Some(None)` = default crosshair,
     /// `Some(Some((percent, charging, low_threshold)))` = dynamic battery percentage icon.
     last_icon_key: Option<Option<(u8, bool, u8)>>,
@@ -208,6 +216,7 @@ impl TrayController {
     /// so tray clicks wake the host immediately with 0% idle CPU and zero polling threads.
     pub fn new(
         initial_auto_switch: bool,
+        initial_taskbar_widget: bool,
         on_action: Arc<dyn Fn(TrayAction) + Send + Sync>,
     ) -> Self {
         let menu = Menu::new();
@@ -233,6 +242,15 @@ impl TrayController {
             initial_auto_switch,
             None,
         );
+        let taskbar_widget_item = CheckMenuItem::with_id(
+            ID_TASKBAR_WIDGET,
+            "Taskbar Battery Widget",
+            true,
+            initial_taskbar_widget,
+            None,
+        );
+        let check_updates_item =
+            MenuItem::with_id(ID_CHECK_UPDATES, "Check for Updates", true, None);
         let sep_bottom = PredefinedMenuItem::separator();
         let quit_item = MenuItem::with_id(ID_QUIT, "Quit", true, None);
         let _ = menu.append(&status_item);
@@ -248,6 +266,8 @@ impl TrayController {
         let _ = menu.append(&restore_display_item);
         let _ = menu.append(&lock_profile_item);
         let _ = menu.append(&auto_switch_item);
+        let _ = menu.append(&taskbar_widget_item);
+        let _ = menu.append(&check_updates_item);
         let _ = menu.append(&sep_bottom);
         let _ = menu.append(&quit_item);
 
@@ -310,7 +330,28 @@ impl TrayController {
             restore_display_item,
             auto_switch_item,
             lock_profile_item,
+            taskbar_widget_item,
+            check_updates_item,
             last_icon_key: Some(None),
+        }
+    }
+
+    /// Synchronizes the "Taskbar Battery Widget" tray checkmark.
+    pub fn set_taskbar_widget_checked(&self, enabled: bool) {
+        self.taskbar_widget_item.set_checked(enabled);
+    }
+
+    /// Updates the tray update action label to advertise an available release version, or resets
+    /// it back to `"Check for Updates"` when up to date.
+    pub fn set_available_update(&self, latest_version: Option<&str>) {
+        match latest_version {
+            Some(ver) if !ver.trim().is_empty() => {
+                self.check_updates_item
+                    .set_text(format!("Update Available (v{ver})..."));
+            }
+            _ => {
+                self.check_updates_item.set_text("Check for Updates");
+            }
         }
     }
 
@@ -752,3 +793,40 @@ pub(crate) fn request_native_close(main_hwnd: &AtomicIsize) {
 
 #[cfg(not(windows))]
 pub(crate) fn request_native_close(_main_hwnd: &AtomicIsize) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_static_and_prefixed_tray_menu_actions() {
+        assert_eq!(parse_menu_action(ID_OPEN), Some(TrayAction::Open));
+        assert_eq!(parse_menu_action(ID_SCAN), Some(TrayAction::ScanNow));
+        assert_eq!(
+            parse_menu_action(ID_TASKBAR_WIDGET),
+            Some(TrayAction::ToggleTaskbarWidget)
+        );
+        assert_eq!(
+            parse_menu_action(ID_CHECK_UPDATES),
+            Some(TrayAction::CheckUpdates)
+        );
+        assert_eq!(
+            parse_menu_action(ID_AUTO_SWITCH),
+            Some(TrayAction::ToggleAutoSwitch)
+        );
+        assert_eq!(parse_menu_action(ID_QUIT), Some(TrayAction::Quit));
+        assert_eq!(
+            parse_menu_action("profile::cs2"),
+            Some(TrayAction::ApplyProfile("cs2".to_string()))
+        );
+        assert_eq!(
+            parse_menu_action("mouse_poll::4000"),
+            Some(TrayAction::QuickSetMousePolling(4000))
+        );
+        assert_eq!(
+            parse_menu_action("mouse_dpi::1600"),
+            Some(TrayAction::QuickSetMouseDpi(1600))
+        );
+        assert_eq!(parse_menu_action("unknown_item"), None);
+    }
+}

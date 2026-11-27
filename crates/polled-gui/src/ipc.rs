@@ -43,6 +43,7 @@ pub enum DaemonToUiMsg {
     CachedScanSummary(ScanSummary),
     CachedUpdateCheck(UpdateCheckResult),
     TraySyncAutoSwitch(bool),
+    TraySyncTaskbarWidget(bool),
     ReadFromMouseFinished {
         device_name: Option<String>,
         settings: Option<MouseSettings>,
@@ -605,6 +606,7 @@ mod tests {
     fn roundtrip_daemon_to_ui_messages() {
         let msgs = vec![
             DaemonToUiMsg::TraySyncAutoSwitch(false),
+            DaemonToUiMsg::TraySyncTaskbarWidget(true),
             DaemonToUiMsg::ReadFromMouseFinished {
                 device_name: Some("Superlight 2".to_string()),
                 settings: Some(MouseSettings {

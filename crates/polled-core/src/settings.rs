@@ -163,6 +163,10 @@ pub struct TrayAlertConfig {
     /// Render live wireless mouse battery % & charge bar directly on the system tray icon.
     #[serde(default = "default_true")]
     pub battery_tray_icon: bool,
+    /// Opt-in transparent pure-Win32 mouse icon + battery % pinned directly on the Windows 10/11
+    /// taskbar beside the tray overflow chevron (zero hooks, auto-hides in fullscreen games).
+    #[serde(default)]
+    pub taskbar_battery_widget: bool,
     /// Send a Windows toast notification when a wireless mouse drops to or below `low_battery_threshold_pct`.
     #[serde(default = "default_true")]
     pub low_battery_toast: bool,
@@ -196,6 +200,7 @@ impl Default for TrayAlertConfig {
     fn default() -> Self {
         Self {
             battery_tray_icon: true,
+            taskbar_battery_widget: false,
             low_battery_toast: true,
             full_battery_toast: true,
             low_battery_threshold_pct: default_low_battery_threshold(),
@@ -348,6 +353,7 @@ mod tests {
             },
             alerts: TrayAlertConfig {
                 battery_tray_icon: true,
+                taskbar_battery_widget: true,
                 low_battery_toast: true,
                 full_battery_toast: false,
                 low_battery_threshold_pct: 20,

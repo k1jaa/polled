@@ -75,6 +75,12 @@ impl AppPaths {
     pub fn bench_history_path(&self) -> PathBuf {
         self.root.join("bench_history.json")
     }
+
+    /// Stores the active tray daemon's PID, version, and exe path so launching a newer version can
+    /// cleanly ask the older daemon to exit and hand over ownership.
+    pub fn daemon_state_path(&self) -> PathBuf {
+        self.root.join("daemon.json")
+    }
 }
 
 #[cfg(test)]
@@ -95,5 +101,6 @@ mod tests {
         assert_eq!(paths.state_path(), dir.path().join("state.json"));
         assert_eq!(paths.profiles_path(), dir.path().join("profiles.json"));
         assert_eq!(paths.settings_path(), dir.path().join("settings.json"));
+        assert_eq!(paths.daemon_state_path(), dir.path().join("daemon.json"));
     }
 }
