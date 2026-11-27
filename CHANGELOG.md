@@ -18,6 +18,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.15.0] - 2026-11-27
+
 ### Added
 - **Seamless Newer-Version Daemon Auto-Takeover (`paths.rs`, `single_instance.rs`, `main.rs`, `daemon.rs`, `app.rs`):**
   - Persists the active primary instance's PID, version, and exe path in `%LOCALAPPDATA%\Polled\daemon.json` (with PID-guarded cleanup on exit) and adds a zero-contention Win32 takeover-quit event (`Local\PolledGuiQuitEvent`).
