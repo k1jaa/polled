@@ -20,6 +20,26 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.15.1] - 2026-11-27
+
+### Added
+- **Custom Monochrome Tray Menu (`tray_menu.rs`, `tray.rs`, `daemon.rs`, `app.rs`):**
+  - Replaced the legacy white Win32 system tray context menu with a custom pure-Win32 popup menu styled in Polled's monochrome Dark/Light theme (`UpdateLayeredWindow` rounded card + soft drop shadow, inset status header with live mouse telemetry & `AUTO` / `LOCKED` / `MIC MUTED` badges, modern pill toggle switches, hover submenus, `Escape` & click-outside dismiss, zero OpenGL / 0% idle CPU).
+  - Right-clicking the taskbar battery widget itself also opens the new themed menu.
+
+### Changed
+- **Refined, Per-Monitor-DPI-Sharp Taskbar Battery Widget (`daemon.rs`, `taskbar_widget.rs`):**
+  - Enabled Per-Monitor DPI Awareness V2 (`SetProcessDpiAwarenessContext`) on the pure-Win32 tray daemon so the taskbar widget and popup menu render 1:1 at native physical pixels alongside Explorer.
+  - Slimmed the taskbar mouse icon (`13px` Fluent capsule outline + scroll tick, ~`1.15px` stroke) and switched percentage text to `12px` Regular `Segoe UI` to match Windows 11's native taskbar typography.
+- **Retired Legacy Battery-in-Tray-Icon Renderer (`icon.rs`, `settings.rs`, `app.rs`):**
+  - Removed the cramped percentage-inside-tray-icon mode so Polled always shows its clean monochrome crosshair icon in the system tray, leaving the Windows taskbar widget as the single crisp battery readout option.
+
+### Fixed
+- **Taskbar Battery Widget Z-Order Flicker on `^` Tray Overflow Clicks (`taskbar_widget.rs`):**
+  - Linked the taskbar popup as an owned window of `Shell_TrayWnd` (`GWLP_HWNDPARENT`) and added an out-of-context `EVENT_SYSTEM_FOREGROUND` hook so Explorer raising the taskbar never hides the widget behind it even briefly.
+
+---
+
 ## [0.15.0] - 2026-11-27
 
 ### Added
@@ -29,10 +49,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Pulsar Pro 64B & HyperX Pulsefire Haste Mouse Backends (`devices/pulsar_pro.rs`, `devices/hyperx.rs`):**
   - Added read-back-verified support (`SupportTier::ImplementedFromDocs`, confirm-gated, zero destructive opcodes) for **Pulsar Pro 8K Wireless Receiver (`3710:5405`)** and **Pulsar ZywOo The Chosen X Wired (`3710:7401`)** (DPI `50–32000`, X/Y DPI, 6 stages + DPI lock, `125–8000 Hz`, LOD `0.7/1.0/2.0 mm`, debounce `0–20 ms`, Motion Sync / Ripple / Angle Snap, sleep `10–1800 s`, live battery %).
   - Added read-back-verified **Volatile RAM** direct-mode support for **HyperX Pulsefire Haste** wired & wireless (`0951:1727`, `03f0:0f8f`, `03f0:048e`, `03f0:028e` — DPI `200–16000`, 5 stages + DPI lock, LOD `1.0/2.0 mm`, live wireless battery %, zero flash wear on auto-switch; polling rate omitted because firmware lacks read-back).
-- **Custom Monochrome Tray Menu, Taskbar Battery Widget, & Tray Update Actions (`tray_menu.rs`, `taskbar_widget.rs`, `tray.rs`, `settings.rs`, `ipc.rs`, `daemon.rs`, `app.rs`):**
-  - Replaced the legacy white Win32 system tray context menu with a custom pure-Win32 popup menu styled in Polled's monochrome Dark/Light theme (`UpdateLayeredWindow` rounded card + soft drop shadow, status header card with live mouse/profile badges, modern pill toggle switches, hover submenus, `Escape` & click-outside dismiss, zero OpenGL / 0% idle CPU).
-  - Added an opt-in **Taskbar Battery Widget** (`taskbar_battery_widget`, default `false`, toggleable in **Settings → Tray Icon & Notifications** and the tray menu) that draws a subtle, Per-Monitor-DPI-sharp vector mouse icon and live battery % directly beside the Windows 10/11 `^` tray chevron — owned by `Shell_TrayWnd` with an instant `EVENT_SYSTEM_FOREGROUND` hook to prevent taskbar z-order flicker, dark/light taskbar theme aware, amber on low battery, emerald + bolt when charging, auto-hides in fullscreen games, left-click opens Polled, right-click opens the themed tray menu, 0% CPU when disabled.
-  - Retired the cramped legacy battery-percentage-inside-tray-icon renderer so Polled always displays its clean crosshair icon in the system tray.
+- **Opt-In Pure-Win32 Windows 10/11 Taskbar Battery Widget & Tray Update Actions (`taskbar_widget.rs`, `tray.rs`, `settings.rs`, `ipc.rs`, `daemon.rs`, `app.rs`):**
+  - Added an opt-in **Taskbar Battery Widget** (`taskbar_battery_widget`, default `false`, toggleable in **Settings → Tray Icon & Notifications** and the tray menu) that draws an anti-aliased vector mouse icon and live battery percentage directly beside the Windows 10/11 `^` tray chevron — DPI-scaled, dark/light taskbar theme aware, amber on low battery, emerald + bolt when charging, auto-hides in fullscreen games, click to open Polled, 0% CPU when disabled, zero game hooks or Explorer injection.
   - Added **Check for Updates** to the tray menu, dynamically updating to **`Update Available (vX.Y.Z)`** when a newer release is found and opening straight to Polled's 1-click update banner on click.
 
 ---
