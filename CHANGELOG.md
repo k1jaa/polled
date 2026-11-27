@@ -18,6 +18,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.14.4] - 2026-11-27
+
 ### Added
 - **ASUS ROG / TUF Mouse & ROG Omni Receiver Backend (`devices/asus_rog.rs`):**
   - Added read-back-verified support (`SupportTier::ImplementedFromDocs`, confirm-gated, zero destructive/pairing/reboot opcodes) for **ASUS ROG & TUF** mice (`VID 0x0B05`) across 36 direct USB / dedicated dongle PIDs plus the **ROG Omni Multi-Device Receiver (`0x0B05:0x1ACE`)** with automatic **8K Polling Rate Booster** detection (`7D 20 02`), implemented from `OpenMouse-Project/mouse-protocol` (AGPL-3.0), `seerge/g-helper` (GPL-3.0), and `libratbag` (MIT).
