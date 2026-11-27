@@ -537,11 +537,17 @@ impl PolledApp {
 
         let widget_hwnd = Arc::clone(&main_hwnd);
         let widget_ctx = cc.egui_ctx.clone();
+        let tx_widget_menu = tx.clone();
+        let wake_widget_menu = Arc::clone(&wake);
         let taskbar_widget = TaskbarWidgetController::start(
             settings.alerts.taskbar_battery_widget,
             settings.alerts.clamped_threshold(),
             Arc::new(move || {
                 crate::tray::show_and_focus(&widget_hwnd, &widget_ctx);
+            }),
+            Arc::new(move || {
+                let _ = tx_widget_menu.send(WorkerMsg::TrayAction(TrayAction::OpenContextMenu));
+                wake_widget_menu();
             }),
         );
 
@@ -553,6 +559,7 @@ impl PolledApp {
         let tray = TrayController::new(
             settings.auto_switch_on_startup,
             settings.alerts.taskbar_battery_widget,
+            matches!(theme, ThemeMode::Dark),
             Arc::new(move |action| {
                 match &action {
                     TrayAction::Open => {
@@ -655,12 +662,11 @@ impl PolledApp {
         }
     }
 
-    fn sync_theme_to_host(&self) {
-        if let AppHost::Remote { ipc } = &self.host {
-            ipc.send(UiToDaemonMsg::UpdateThemeDark(matches!(
-                self.theme,
-                ThemeMode::Dark
-            )));
+    fn sync_theme_to_host(&mut self) {
+        let dark = matches!(self.theme, ThemeMode::Dark);
+        match &mut self.host {
+            AppHost::Remote { ipc } => ipc.send(UiToDaemonMsg::UpdateThemeDark(dark)),
+            AppHost::Standalone(host) => host.tray.set_dark_mode(dark),
         }
     }
 
@@ -1075,6 +1081,11 @@ impl PolledApp {
                 }
                 WorkerMsg::TrayAction(action) => match action {
                     TrayAction::Open => crate::tray::show_and_focus(&self.main_hwnd, ctx),
+                    TrayAction::OpenContextMenu => {
+                        if let AppHost::Standalone(host) = &self.host {
+                            host.tray.open_custom_menu_at_cursor();
+                        }
+                    }
                     TrayAction::ScanNow => {
                         let tx_scan = self.tx.clone();
                         let ctx_scan = ctx.clone();
@@ -1296,7 +1307,7 @@ impl PolledApp {
                     self.update_checking = false;
                     match res {
                         Ok(info) => {
-                            if let AppHost::Standalone(host) = &self.host {
+                            if let AppHost::Standalone(host) = &mut self.host {
                                 host.tray.set_available_update(
                                     info.update_available
                                         .then_some(info.latest_version.as_str()),
@@ -1317,7 +1328,7 @@ impl PolledApp {
                     self.update_checking = false;
                     match res {
                         Ok(info) => {
-                            if let AppHost::Standalone(host) = &self.host {
+                            if let AppHost::Standalone(host) = &mut self.host {
                                 host.tray.set_available_update(
                                     info.update_available
                                         .then_some(info.latest_version.as_str()),
@@ -1423,11 +1434,7 @@ impl PolledApp {
                 self.settings.alerts.clamped_threshold(),
             );
             if let Some(snap) = snap {
-                host.tray.sync_from_snapshot(
-                    snap,
-                    self.settings.alerts.battery_tray_icon,
-                    self.settings.alerts.clamped_threshold(),
-                );
+                host.tray.sync_from_snapshot(snap);
             }
         }
     }
@@ -2868,10 +2875,6 @@ impl eframe::App for PolledApp {
                             .color(p.text_muted),
                     );
                     ui.add_space(4.0);
-                    ui.checkbox(
-                        &mut self.settings.alerts.battery_tray_icon,
-                        "Show wireless mouse battery % on system tray icon",
-                    );
                     ui.checkbox(
                         &mut self.settings.alerts.taskbar_battery_widget,
                         "Pin wireless mouse battery % directly on Windows taskbar (next to tray)",

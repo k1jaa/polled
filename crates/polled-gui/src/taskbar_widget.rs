@@ -303,6 +303,7 @@ impl TaskbarWidgetController {
         initial_enabled: bool,
         initial_low_threshold: u8,
         on_click: Arc<dyn Fn() + Send + Sync>,
+        on_right_click: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         let state = Arc::new(Mutex::new(TaskbarWidgetState {
             enabled: initial_enabled,
@@ -318,9 +319,9 @@ impl TaskbarWidgetController {
             .name("polled-taskbar-widget".to_string())
             .spawn(move || {
                 #[cfg(windows)]
-                run_taskbar_widget_loop(state_bg, hwnd_bg, on_click);
+                run_taskbar_widget_loop(state_bg, hwnd_bg, on_click, on_right_click);
                 #[cfg(not(windows))]
-                let _ = (state_bg, hwnd_bg, on_click);
+                let _ = (state_bg, hwnd_bg, on_click, on_right_click);
             })
             .ok();
 
@@ -409,6 +410,7 @@ fn run_taskbar_widget_loop(
     shared_state: Arc<Mutex<TaskbarWidgetState>>,
     hwnd_slot: Arc<AtomicIsize>,
     on_click: Arc<dyn Fn() + Send + Sync>,
+    on_right_click: Arc<dyn Fn() + Send + Sync>,
 ) {
     use std::cell::RefCell;
     use std::ffi::{c_void, OsStr};
@@ -429,21 +431,24 @@ fn run_taskbar_widget_loop(
         MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW,
         FindWindowW, GetForegroundWindow, GetMessageW, GetWindow, GetWindowRect, IsWindowVisible,
-        KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW, SetCursor, SetTimer, SetWindowPos,
-        ShowWindow, TranslateMessage, UnregisterClassW, UpdateLayeredWindow, GW_HWNDPREV,
+        KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetTimer,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW,
+        UpdateLayeredWindow, EVENT_SYSTEM_FOREGROUND, GWLP_HWNDPARENT, GW_HWNDPREV, GW_OWNER,
         HWND_TOPMOST, IDC_HAND, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-        SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONUP,
-        WM_MOUSEMOVE, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WINEVENT_OUTOFCONTEXT, WM_APP, WM_CLOSE, WM_DESTROY,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
 
     const WM_WIDGET_REFRESH: u32 = WM_APP + 2;
+    const WM_WIDGET_ZSYNC: u32 = WM_APP + 3;
     const WM_MOUSELEAVE: u32 = 0x02A3;
     const TIMER_SYNC_ID: usize = 1;
     const TIMER_SYNC_MS: u32 = 1_000;
@@ -498,8 +503,10 @@ fn run_taskbar_widget_loop(
     }
 
     struct LocalWidget {
+        hwnd: HWND,
         shared: Arc<Mutex<TaskbarWidgetState>>,
         on_click: Arc<dyn Fn() + Send + Sync>,
+        on_right_click: Arc<dyn Fn() + Send + Sync>,
         timer_active: bool,
         visible: bool,
         hovered: bool,
@@ -510,6 +517,28 @@ fn run_taskbar_widget_loop(
 
     thread_local! {
         static LOCAL: RefCell<Option<LocalWidget>> = const { RefCell::new(None) };
+    }
+
+    /// Out-of-context WinEvent callback fired instantaneously on foreground transitions (clicking
+    /// the Windows 11 `^` tray overflow chevron, entering/leaving fullscreen games, etc.) so the
+    /// taskbar widget never disappears behind `Shell_TrayWnd` waiting for the 1s timer.
+    unsafe extern "system" fn foreground_event_proc(
+        _hook: HWINEVENTHOOK,
+        _event: u32,
+        _hwnd: HWND,
+        _id_object: i32,
+        _id_child: i32,
+        _event_thread: u32,
+        _event_time: u32,
+    ) {
+        let target = LOCAL.with(|cell| cell.borrow().as_ref().map(|l| l.hwnd));
+        if let Some(h) = target {
+            if !h.is_invalid() {
+                unsafe {
+                    let _ = PostMessageW(Some(h), WM_WIDGET_ZSYNC, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
     }
 
     fn hash_str(s: &str) -> u64 {
@@ -816,6 +845,16 @@ fn run_taskbar_widget_loop(
                 return;
             }
 
+            // Keep our popup owned by `Shell_TrayWnd` so whenever Explorer raises the taskbar
+            // (e.g., clicking the `^` overflow chevron), Windows atomically keeps our widget above
+            // the taskbar in the exact same DWM frame without flickering behind it.
+            let current_owner = unsafe { GetWindow(hwnd, GW_OWNER) }.unwrap_or_default();
+            if current_owner != taskbar_hwnd {
+                unsafe {
+                    let _ = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, taskbar_hwnd.0 as isize);
+                }
+            }
+
             let tray_cls = to_wide_null("TrayNotifyWnd");
             let Ok(tray_hwnd) = (unsafe {
                 FindWindowExW(
@@ -965,7 +1004,7 @@ fn run_taskbar_widget_loop(
                 sync_widget(hwnd, true);
                 LRESULT(0)
             }
-            WM_TIMER => {
+            WM_WIDGET_ZSYNC | WM_TIMER => {
                 sync_widget(hwnd, false);
                 LRESULT(0)
             }
@@ -1035,6 +1074,17 @@ fn run_taskbar_widget_loop(
                 }
                 LRESULT(0)
             }
+            WM_RBUTTONUP => {
+                let cb = LOCAL.with(|cell| {
+                    cell.borrow()
+                        .as_ref()
+                        .map(|local| Arc::clone(&local.on_right_click))
+                });
+                if let Some(cb) = cb {
+                    cb();
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 unsafe {
                     let _ = KillTimer(Some(hwnd), TIMER_SYNC_ID);
@@ -1051,19 +1101,6 @@ fn run_taskbar_widget_loop(
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
         }
     }
-
-    LOCAL.with(|cell| {
-        *cell.borrow_mut() = Some(LocalWidget {
-            shared: shared_state,
-            on_click,
-            timer_active: false,
-            visible: false,
-            hovered: false,
-            tracking_leave: false,
-            last_rect: None,
-            last_render: None,
-        });
-    });
 
     let class_str = format!(
         "PolledTaskbarBattery_{}",
@@ -1085,8 +1122,13 @@ fn run_taskbar_widget_loop(
         return;
     }
 
-    // Notice we intentionally omit WS_EX_TRANSPARENT so left-clicking opens Polled.
+    // Notice we intentionally omit WS_EX_TRANSPARENT so left/right clicks interact cleanly.
     let ex_style = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED;
+
+    let shell_cls = to_wide_null("Shell_TrayWnd");
+    let initial_owner = unsafe { FindWindowW(PCWSTR(shell_cls.as_ptr()), PCWSTR::null()) }
+        .ok()
+        .filter(|h| !h.is_invalid());
 
     let hwnd = match unsafe {
         CreateWindowExW(
@@ -1098,7 +1140,7 @@ fn run_taskbar_widget_loop(
             0,
             80,
             36,
-            None,
+            initial_owner,
             None,
             Some(hinstance),
             None,
@@ -1111,6 +1153,35 @@ fn run_taskbar_widget_loop(
             }
             return;
         }
+    };
+
+    LOCAL.with(|cell| {
+        *cell.borrow_mut() = Some(LocalWidget {
+            hwnd,
+            shared: shared_state,
+            on_click,
+            on_right_click,
+            timer_active: false,
+            visible: false,
+            hovered: false,
+            tracking_leave: false,
+            last_rect: None,
+            last_render: None,
+        });
+    });
+
+    // Zero-injection out-of-context hook so fullscreen switches and taskbar `^` clicks sync
+    // immediately (<1 ms) with 0% idle CPU.
+    let fg_hook = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(foreground_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
     };
 
     unsafe {
@@ -1129,6 +1200,11 @@ fn run_taskbar_widget_loop(
         }
     }
 
+    if !fg_hook.is_invalid() {
+        unsafe {
+            let _ = UnhookWinEvent(fg_hook);
+        }
+    }
     hwnd_slot.store(0, Ordering::SeqCst);
     unsafe {
         let _ = UnregisterClassW(PCWSTR(class_w.as_ptr()), Some(hinstance));

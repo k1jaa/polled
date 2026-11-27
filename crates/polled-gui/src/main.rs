@@ -22,6 +22,7 @@ mod single_instance;
 mod taskbar_widget;
 mod theme;
 mod tray;
+mod tray_menu;
 
 use std::time::Duration;
 

@@ -160,9 +160,6 @@ impl Default for HotkeyConfig {
 /// Tray icon & Windows toast notification preferences (`settings.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrayAlertConfig {
-    /// Render live wireless mouse battery % & charge bar directly on the system tray icon.
-    #[serde(default = "default_true")]
-    pub battery_tray_icon: bool,
     /// Opt-in transparent pure-Win32 mouse icon + battery % pinned directly on the Windows 10/11
     /// taskbar beside the tray overflow chevron (zero hooks, auto-hides in fullscreen games).
     #[serde(default)]
@@ -199,7 +196,6 @@ fn default_low_battery_threshold() -> u8 {
 impl Default for TrayAlertConfig {
     fn default() -> Self {
         Self {
-            battery_tray_icon: true,
             taskbar_battery_widget: false,
             low_battery_toast: true,
             full_battery_toast: true,
@@ -352,7 +348,6 @@ mod tests {
                 toggle_mic_mute: Some(HotkeyBinding::new(true, true, false, "M")),
             },
             alerts: TrayAlertConfig {
-                battery_tray_icon: true,
                 taskbar_battery_widget: true,
                 low_battery_toast: true,
                 full_battery_toast: false,

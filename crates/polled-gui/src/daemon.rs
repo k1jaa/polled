@@ -231,11 +231,7 @@ mod win32_daemon {
                                 .settings
                                 .save_atomic(&AppPaths::default_user_dir().settings_path());
                         }
-                        self.tray.sync_from_snapshot(
-                            &snap,
-                            self.settings.alerts.battery_tray_icon,
-                            self.settings.alerts.clamped_threshold(),
-                        );
+                        self.tray.sync_from_snapshot(&snap);
                         self.taskbar_widget.sync_from_snapshot(
                             &snap,
                             self.settings.alerts.taskbar_battery_widget,
@@ -397,10 +393,11 @@ mod win32_daemon {
                 }
             }
 
-            // 4. Native tray icon & context menu actions.
+            // 4. Native tray icon & custom monochrome context menu actions.
             while let Ok(action) = self.tray_rx.try_recv() {
                 match action {
                     TrayAction::Open => self.spawn_or_focus_ui(false),
+                    TrayAction::OpenContextMenu => self.tray.open_custom_menu_at_cursor(),
                     TrayAction::ScanNow => {
                         let tx_scan = self.worker_tx.clone();
                         let wake_scan = Arc::clone(&self.wake);
@@ -541,11 +538,7 @@ mod win32_daemon {
                                 self.settings.alerts.taskbar_battery_widget,
                             );
                             if let Some(snap) = &self.latest_snapshot {
-                                self.tray.sync_from_snapshot(
-                                    snap,
-                                    self.settings.alerts.battery_tray_icon,
-                                    self.settings.alerts.clamped_threshold(),
-                                );
+                                self.tray.sync_from_snapshot(snap);
                                 self.taskbar_widget.sync_from_snapshot(
                                     snap,
                                     self.settings.alerts.taskbar_battery_widget,
@@ -567,6 +560,7 @@ mod win32_daemon {
                     }
                     UiToDaemonMsg::UpdateThemeDark(dark) => {
                         self.dark_mode = dark;
+                        self.tray.set_dark_mode(dark);
                     }
                     UiToDaemonMsg::ShowOsdPill { title, subtitle } => {
                         self.osd.show(title, subtitle, self.dark_mode);
@@ -829,6 +823,8 @@ mod win32_daemon {
         let osd = OsdController::start();
         let signal_tx_widget = signal_tx.clone();
         let wake_widget = Arc::clone(&wake);
+        let tray_tx_widget = tray_tx.clone();
+        let wake_widget_menu = Arc::clone(&wake);
         let taskbar_widget = TaskbarWidgetController::start(
             settings.alerts.taskbar_battery_widget,
             settings.alerts.clamped_threshold(),
@@ -836,12 +832,17 @@ mod win32_daemon {
                 let _ = signal_tx_widget.send(DaemonSignal::ShowRequested);
                 wake_widget();
             }),
+            Arc::new(move || {
+                let _ = tray_tx_widget.send(TrayAction::OpenContextMenu);
+                wake_widget_menu();
+            }),
         );
 
         let wake_tray = Arc::clone(&wake);
         let tray = TrayController::new(
             settings.auto_switch_on_startup,
             settings.alerts.taskbar_battery_widget,
+            dark_mode,
             Arc::new(move |action| {
                 let _ = tray_tx.send(action);
                 wake_tray();

@@ -7,34 +7,17 @@ use std::sync::Arc;
 
 use eframe::egui;
 use polled_core::{BatteryStatus, SupportTier};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use crate::icon::{tray_battery_icon_image, tray_icon_image};
+use crate::icon::tray_icon_image;
 use crate::profile_runtime::{format_battery_hours_left, ProfileRuntimeSnapshot};
+use crate::tray_menu::{TrayMenuController, TrayMenuModel};
 
-const ID_STATUS: &str = "status_info";
-const ID_OPEN: &str = "open";
-const ID_SCAN: &str = "scan";
-const ID_AUTO_SWITCH: &str = "auto_switch";
-const ID_LOCK_PROFILE: &str = "lock_profile";
-const ID_TASKBAR_WIDGET: &str = "taskbar_widget";
-const ID_CHECK_UPDATES: &str = "check_updates";
-const ID_PROFILE_PREFIX: &str = "profile::";
-const ID_MOUSE_POLL_PREFIX: &str = "mouse_poll::";
-const ID_MOUSE_DPI_PREFIX: &str = "mouse_dpi::";
-const ID_MOUSE_REFRESH: &str = "mouse_refresh";
-const ID_WOOTING_PREFIX: &str = "wooting::";
-const ID_WOOTING_REFRESH: &str = "wooting_refresh";
-const ID_AUDIO_PREFIX: &str = "audio::";
-const ID_MIC_MUTE: &str = "mic_mute";
-const ID_RESTORE_DISPLAY: &str = "restore_display";
-const ID_QUIT: &str = "quit";
-
-/// High-level action emitted by the native Windows system tray icon or its context menu.
+/// High-level action emitted by the system tray icon or Polled's custom themed popup menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayAction {
     Open,
+    OpenContextMenu,
     ScanNow,
     ApplyProfile(String),
     QuickSetMousePolling(u16),
@@ -62,7 +45,7 @@ pub struct TrayWootingState {
 }
 
 /// Snapshot of the primary connected mouse used to populate the tray Mouse Quick Controls
-/// submenu, live battery icon, and rich hover tooltip.
+/// submenu and rich hover tooltip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayMouseState {
     pub name: String,
@@ -73,50 +56,8 @@ pub struct TrayMouseState {
     pub dpi_max: u16,
     pub polling_rates_hz: Vec<u16>,
     pub battery: Option<BatteryStatus>,
-    /// Rounded remaining battery runtime in 5-minute steps (keeps `Eq` stable without menu churn).
+    /// Rounded remaining battery runtime in 5-minute steps (keeps `Eq` stable).
     pub battery_mins_left: Option<u32>,
-}
-
-/// Parses a `tray_icon::menu::MenuEvent` ID string into a typed `TrayAction`.
-pub fn parse_menu_action(id_str: &str) -> Option<TrayAction> {
-    if let Some(prof_id) = id_str.strip_prefix(ID_PROFILE_PREFIX) {
-        return Some(TrayAction::ApplyProfile(prof_id.to_string()));
-    }
-    if let Some(hz_str) = id_str.strip_prefix(ID_MOUSE_POLL_PREFIX) {
-        return hz_str
-            .parse::<u16>()
-            .ok()
-            .map(TrayAction::QuickSetMousePolling);
-    }
-    if let Some(dpi_str) = id_str.strip_prefix(ID_MOUSE_DPI_PREFIX) {
-        return dpi_str
-            .parse::<u16>()
-            .ok()
-            .map(TrayAction::QuickSetMouseDpi);
-    }
-    if let Some(slot_str) = id_str.strip_prefix(ID_WOOTING_PREFIX) {
-        return slot_str
-            .parse::<u8>()
-            .ok()
-            .map(TrayAction::SwitchKeyboardProfile);
-    }
-    if let Some(audio_id) = id_str.strip_prefix(ID_AUDIO_PREFIX) {
-        return Some(TrayAction::SwitchAudioOutput(audio_id.to_string()));
-    }
-    match id_str {
-        ID_OPEN => Some(TrayAction::Open),
-        ID_SCAN => Some(TrayAction::ScanNow),
-        ID_MOUSE_REFRESH => Some(TrayAction::RefreshMouseAndBattery),
-        ID_WOOTING_REFRESH => Some(TrayAction::RefreshKeyboards),
-        ID_MIC_MUTE => Some(TrayAction::ToggleMicMute),
-        ID_RESTORE_DISPLAY => Some(TrayAction::RestoreNativeDisplay),
-        ID_LOCK_PROFILE => Some(TrayAction::ToggleProfileLock),
-        ID_AUTO_SWITCH => Some(TrayAction::ToggleAutoSwitch),
-        ID_TASKBAR_WIDGET => Some(TrayAction::ToggleTaskbarWidget),
-        ID_CHECK_UPDATES => Some(TrayAction::CheckUpdates),
-        ID_QUIT => Some(TrayAction::Quit),
-        _ => None,
-    }
 }
 
 /// Finds Polled's own top-level `HWND` on the current Win32 UI thread (including when hidden).
@@ -180,96 +121,30 @@ pub(crate) fn find_own_main_hwnd() -> isize {
     0
 }
 
-/// Holds the active Windows system tray icon and dynamic menu items alive for the lifetime of
-/// the daemon (or standalone app). Uses native Win32 event callbacks with zero polling threads.
+/// Holds the active Windows system tray icon (crisp monochrome Polled crosshair) and Polled's
+/// custom pure-Win32 themed context menu alive for the lifetime of the daemon or standalone app.
 pub struct TrayController {
     tray: Option<TrayIcon>,
-    status_item: MenuItem,
-    profiles_submenu: Submenu,
-    profile_menu_items: Vec<MenuItem>,
-    last_profile_key: (String, Vec<(String, String)>),
-    mouse_submenu: Submenu,
-    mouse_menu_items: Vec<MenuItem>,
-    mouse_menu_seps: Vec<PredefinedMenuItem>,
-    last_mouse_key: Option<Option<TrayMouseState>>,
-    wooting_submenu: Submenu,
-    wooting_menu_items: Vec<MenuItem>,
-    wooting_menu_seps: Vec<PredefinedMenuItem>,
-    last_wooting_key: Option<Option<TrayWootingState>>,
-    audio_submenu: Submenu,
-    audio_menu_items: Vec<MenuItem>,
-    last_audio_key: Vec<(String, String, bool)>,
-    mic_mute_item: CheckMenuItem,
-    restore_display_item: MenuItem,
-    auto_switch_item: CheckMenuItem,
-    lock_profile_item: CheckMenuItem,
-    taskbar_widget_item: CheckMenuItem,
-    check_updates_item: MenuItem,
-    /// Cached rendered icon state: `None` = unset, `Some(None)` = default crosshair,
-    /// `Some(Some((percent, charging, low_threshold)))` = dynamic battery percentage icon.
-    last_icon_key: Option<Option<(u8, bool, u8)>>,
+    menu: TrayMenuController,
+    model: TrayMenuModel,
 }
 
 impl TrayController {
-    /// Creates the system tray icon (must be called on a thread pumping Win32 messages) and
-    /// registers event-driven callbacks (`TrayIconEvent::set_event_handler` / `MenuEvent::set_event_handler`)
-    /// so tray clicks wake the host immediately with 0% idle CPU and zero polling threads.
+    /// Creates the system tray icon (without the legacy white Win32 popup menu) and wires left-click
+    /// to open Polled and right-click to open Polled's custom monochrome Dark/Light popup menu.
     pub fn new(
         initial_auto_switch: bool,
         initial_taskbar_widget: bool,
+        initial_dark_mode: bool,
         on_action: Arc<dyn Fn(TrayAction) + Send + Sync>,
     ) -> Self {
-        let menu = Menu::new();
-        let status_item = MenuItem::with_id(ID_STATUS, "Polled · Initializing...", false, None);
-        let sep_status = PredefinedMenuItem::separator();
-        let open_item = MenuItem::with_id(ID_OPEN, "Open Polled", true, None);
-        let scan_item = MenuItem::with_id(ID_SCAN, "Scan Now", true, None);
-        let sep_top = PredefinedMenuItem::separator();
-        let profiles_submenu = Submenu::new("Switch Profile", true);
-        let mouse_submenu = Submenu::new("Mouse Quick Controls", true);
-        let wooting_submenu = Submenu::new("Keyboard", true);
-        let audio_submenu = Submenu::new("Audio Output", true);
-        let mic_mute_item =
-            CheckMenuItem::with_id(ID_MIC_MUTE, "Mute Microphone", true, false, None);
-        let restore_display_item =
-            MenuItem::with_id(ID_RESTORE_DISPLAY, "Display: Native", false, None);
-        let lock_profile_item =
-            CheckMenuItem::with_id(ID_LOCK_PROFILE, "Lock Current Profile", true, false, None);
-        let auto_switch_item = CheckMenuItem::with_id(
-            ID_AUTO_SWITCH,
-            "Auto-Switch Profiles",
-            true,
-            initial_auto_switch,
-            None,
-        );
-        let taskbar_widget_item = CheckMenuItem::with_id(
-            ID_TASKBAR_WIDGET,
-            "Taskbar Battery Widget",
-            true,
-            initial_taskbar_widget,
-            None,
-        );
-        let check_updates_item =
-            MenuItem::with_id(ID_CHECK_UPDATES, "Check for Updates", true, None);
-        let sep_bottom = PredefinedMenuItem::separator();
-        let quit_item = MenuItem::with_id(ID_QUIT, "Quit", true, None);
-        let _ = menu.append(&status_item);
-        let _ = menu.append(&sep_status);
-        let _ = menu.append(&open_item);
-        let _ = menu.append(&scan_item);
-        let _ = menu.append(&sep_top);
-        let _ = menu.append(&profiles_submenu);
-        let _ = menu.append(&mouse_submenu);
-        let _ = menu.append(&wooting_submenu);
-        let _ = menu.append(&audio_submenu);
-        let _ = menu.append(&mic_mute_item);
-        let _ = menu.append(&restore_display_item);
-        let _ = menu.append(&lock_profile_item);
-        let _ = menu.append(&auto_switch_item);
-        let _ = menu.append(&taskbar_widget_item);
-        let _ = menu.append(&check_updates_item);
-        let _ = menu.append(&sep_bottom);
-        let _ = menu.append(&quit_item);
+        let initial_model = TrayMenuModel {
+            dark_mode: initial_dark_mode,
+            auto_switch_enabled: initial_auto_switch,
+            taskbar_widget_enabled: initial_taskbar_widget,
+            ..Default::default()
+        };
+        let menu = TrayMenuController::start(initial_model.clone(), Arc::clone(&on_action));
 
         let initial_tooltip = if initial_auto_switch {
             "Polled — Auto-Switch ON"
@@ -279,7 +154,6 @@ impl TrayController {
 
         let mut builder = TrayIconBuilder::new()
             .with_tooltip(initial_tooltip)
-            .with_menu(Box::new(menu))
             .with_menu_on_left_click(false);
 
         if let Some(icon) = tray_icon_image() {
@@ -289,79 +163,65 @@ impl TrayController {
         let tray = builder.build().ok();
 
         if tray.is_some() {
-            let on_click = Arc::clone(&on_action);
-            TrayIconEvent::set_event_handler(Some(move |event| {
-                if let TrayIconEvent::Click {
+            let on_click = on_action;
+            TrayIconEvent::set_event_handler(Some(move |event| match event {
+                TrayIconEvent::Click {
                     button: MouseButton::Left,
                     button_state: MouseButtonState::Up,
                     ..
-                } = event
-                {
-                    on_click(TrayAction::Open);
-                }
-            }));
-
-            let on_menu = on_action;
-            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-                if let Some(action) = parse_menu_action(event.id.0.as_str()) {
-                    on_menu(action);
-                }
+                } => on_click(TrayAction::Open),
+                TrayIconEvent::Click {
+                    button: MouseButton::Right,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } => on_click(TrayAction::OpenContextMenu),
+                _ => {}
             }));
         }
 
         Self {
             tray,
-            status_item,
-            profiles_submenu,
-            profile_menu_items: Vec::new(),
-            last_profile_key: (String::new(), Vec::new()),
-            mouse_submenu,
-            mouse_menu_items: Vec::new(),
-            mouse_menu_seps: Vec::new(),
-            last_mouse_key: None,
-            wooting_submenu,
-            wooting_menu_items: Vec::new(),
-            wooting_menu_seps: Vec::new(),
-            last_wooting_key: None,
-            audio_submenu,
-            audio_menu_items: Vec::new(),
-            last_audio_key: Vec::new(),
-            mic_mute_item,
-            restore_display_item,
-            auto_switch_item,
-            lock_profile_item,
-            taskbar_widget_item,
-            check_updates_item,
-            last_icon_key: Some(None),
+            menu,
+            model: initial_model,
         }
     }
 
-    /// Synchronizes the "Taskbar Battery Widget" tray checkmark.
-    pub fn set_taskbar_widget_checked(&self, enabled: bool) {
-        self.taskbar_widget_item.set_checked(enabled);
+    /// Opens Polled's custom monochrome context menu at the current cursor position.
+    pub fn open_custom_menu_at_cursor(&self) {
+        self.menu.open_at_cursor();
     }
 
-    /// Updates the tray update action label to advertise an available release version, or resets
-    /// it back to `"Check for Updates"` when up to date.
-    pub fn set_available_update(&self, latest_version: Option<&str>) {
-        match latest_version {
-            Some(ver) if !ver.trim().is_empty() => {
-                self.check_updates_item
-                    .set_text(format!("Update Available (v{ver})..."));
-            }
-            _ => {
-                self.check_updates_item.set_text("Check for Updates");
-            }
+    /// Synchronizes the custom tray popup menu's Dark / Light theme with Polled.
+    pub fn set_dark_mode(&mut self, dark_mode: bool) {
+        if self.model.dark_mode != dark_mode {
+            self.model.dark_mode = dark_mode;
+            self.menu.update_model(self.model.clone());
         }
     }
 
-    /// Convenience adapter that maps a `ProfileRuntimeSnapshot` directly into `update_status`.
-    pub fn sync_from_snapshot(
-        &mut self,
-        snap: &ProfileRuntimeSnapshot,
-        show_battery_icon: bool,
-        low_battery_threshold: u8,
-    ) {
+    /// Synchronizes the "Taskbar Battery Widget" toggle state in the custom popup menu.
+    pub fn set_taskbar_widget_checked(&mut self, enabled: bool) {
+        if self.model.taskbar_widget_enabled != enabled {
+            self.model.taskbar_widget_enabled = enabled;
+            self.menu.update_model(self.model.clone());
+        }
+    }
+
+    /// Updates the update row in the custom tray menu to advertise an available release version,
+    /// or resets it back to `"Check for Updates"` when up to date.
+    pub fn set_available_update(&mut self, latest_version: Option<&str>) {
+        let next = latest_version
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if self.model.available_update_version != next {
+            self.model.available_update_version = next;
+            self.menu.update_model(self.model.clone());
+        }
+    }
+
+    /// Synchronizes the custom tray menu model and hover tooltip from a `ProfileRuntimeSnapshot`.
+    pub fn sync_from_snapshot(&mut self, snap: &ProfileRuntimeSnapshot) {
         let battery_parts: Vec<String> = snap
             .active_devices
             .iter()
@@ -406,303 +266,23 @@ impl TrayController {
                 Vec::new()
             },
         });
-        self.update_status(
-            snap.auto_switch_enabled,
-            snap.profile_locked,
-            snap.mic_muted == Some(true),
-            snap.active_display_override.as_deref(),
-            &snap.active_profile_id,
-            &snap.active_profile_name,
-            &snap.available_profiles,
-            &snap.audio_outputs,
-            primary_mouse.as_ref(),
-            primary_wooting.as_ref(),
-            battery_summary.as_deref(),
-            show_battery_icon,
-            low_battery_threshold,
-        );
-    }
 
-    /// Synchronizes the tray menu status header, profile / mouse / audio submenus, dynamic
-    /// battery icon, checkmarks, and hover tooltip.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_status(
-        &mut self,
-        auto_switch_enabled: bool,
-        profile_locked: bool,
-        mic_muted: bool,
-        active_display_override: Option<&str>,
-        active_profile_id: &str,
-        active_profile_name: &str,
-        available_profiles: &[(String, String)],
-        audio_outputs: &[(String, String, bool)],
-        primary_mouse: Option<&TrayMouseState>,
-        primary_wooting: Option<&TrayWootingState>,
-        battery_summary: Option<&str>,
-        show_battery_icon: bool,
-        low_battery_threshold: u8,
-    ) {
-        self.auto_switch_item.set_checked(auto_switch_enabled);
-        self.lock_profile_item.set_checked(profile_locked);
-        self.mic_mute_item.set_checked(mic_muted);
-        match active_display_override {
-            Some(mode_lbl) => {
-                self.restore_display_item
-                    .set_text(format!("Restore Native Display ({mode_lbl})"));
-                self.restore_display_item.set_enabled(true);
-            }
-            None => {
-                self.restore_display_item.set_text("Display: Native");
-                self.restore_display_item.set_enabled(false);
-            }
-        }
+        self.model.auto_switch_enabled = snap.auto_switch_enabled;
+        self.model.profile_locked = snap.profile_locked;
+        self.model.mic_muted = snap.mic_muted == Some(true);
+        self.model.active_display_override = snap.active_display_override.clone();
+        self.model.active_profile_id = snap.active_profile_id.clone();
+        self.model.active_profile_name = snap.active_profile_name.clone();
+        self.model.available_profiles = snap.available_profiles.clone();
+        self.model.audio_outputs = snap.audio_outputs.clone();
+        self.model.primary_mouse = primary_mouse.clone();
+        self.model.primary_wooting = primary_wooting;
+        self.menu.update_model(self.model.clone());
 
-        let lock_tag = if profile_locked { " [LOCKED]" } else { "" };
-        let mic_tag = if mic_muted { " [MIC MUTED]" } else { "" };
-        let header_text = match battery_summary.filter(|s| !s.is_empty()) {
-            Some(batt) => format!("{active_profile_name}{lock_tag}{mic_tag} · {batt}"),
-            None => format!("Profile: {active_profile_name}{lock_tag}{mic_tag}"),
-        };
-        self.status_item.set_text(header_text);
-
-        // 1. Dynamic live battery percentage tray icon (only redraws when state changes).
-        let desired_icon_key = if show_battery_icon {
-            primary_mouse.and_then(|m| {
-                m.battery
-                    .map(|b| (b.percent.min(100), b.charging, low_battery_threshold))
-            })
-        } else {
-            None
-        };
-        if self.last_icon_key != Some(desired_icon_key) {
-            if let Some(tray) = &self.tray {
-                let icon = match desired_icon_key {
-                    Some((pct, chg, low)) => tray_battery_icon_image(pct, chg, low),
-                    None => tray_icon_image(),
-                };
-                if let Some(img) = icon {
-                    let _ = tray.set_icon(Some(img));
-                }
-            }
-            self.last_icon_key = Some(desired_icon_key);
-        }
-
-        // 2. Profile switcher submenu.
-        let next_key = (active_profile_id.to_string(), available_profiles.to_vec());
-        if next_key != self.last_profile_key {
-            for old in self.profile_menu_items.drain(..) {
-                let _ = self.profiles_submenu.remove(&old);
-            }
-            for (id, name) in available_profiles {
-                let label = if id == active_profile_id {
-                    format!("● {name}")
-                } else {
-                    format!("   {name}")
-                };
-                let item = MenuItem::with_id(format!("{ID_PROFILE_PREFIX}{id}"), label, true, None);
-                let _ = self.profiles_submenu.append(&item);
-                self.profile_menu_items.push(item);
-            }
-            self.last_profile_key = next_key;
-        }
-
-        // 3. Mouse Quick Controls submenu (live Polling Rate + DPI presets + Refresh).
-        let next_mouse_key = primary_mouse.cloned();
-        if self.last_mouse_key.as_ref() != Some(&next_mouse_key) {
-            for old in self.mouse_menu_items.drain(..) {
-                let _ = self.mouse_submenu.remove(&old);
-            }
-            for sep in self.mouse_menu_seps.drain(..) {
-                let _ = self.mouse_submenu.remove(&sep);
-            }
-
-            if let Some(mouse) = primary_mouse {
-                let mut header_parts = vec![mouse.name.clone()];
-                if let Some(dpi) = mouse.current_dpi {
-                    header_parts.push(format!("{dpi} DPI"));
-                }
-                if let Some(hz) = mouse.current_polling_hz {
-                    header_parts.push(format!("{hz} Hz"));
-                }
-                if let Some(batt) = mouse.battery {
-                    let lbl = match mouse.battery_mins_left.filter(|&m| m > 0) {
-                        Some(mins) => format!(
-                            "{} ({})",
-                            batt.compact_label(),
-                            format_battery_hours_left(mins as f32 / 60.0)
-                        ),
-                        None => batt.compact_label(),
-                    };
-                    header_parts.push(lbl);
-                }
-                let header =
-                    MenuItem::with_id("mouse_header", header_parts.join(" · "), false, None);
-                let _ = self.mouse_submenu.append(&header);
-                self.mouse_menu_items.push(header);
-
-                if !mouse.polling_rates_hz.is_empty() {
-                    let sep = PredefinedMenuItem::separator();
-                    let _ = self.mouse_submenu.append(&sep);
-                    self.mouse_menu_seps.push(sep);
-
-                    for &hz in &mouse.polling_rates_hz {
-                        let active = mouse.current_polling_hz == Some(hz);
-                        let label = if active {
-                            format!("● Polling: {hz} Hz")
-                        } else {
-                            format!("   Polling: {hz} Hz")
-                        };
-                        let item = MenuItem::with_id(
-                            format!("{ID_MOUSE_POLL_PREFIX}{hz}"),
-                            label,
-                            true,
-                            None,
-                        );
-                        let _ = self.mouse_submenu.append(&item);
-                        self.mouse_menu_items.push(item);
-                    }
-                }
-
-                let mut dpi_presets: Vec<u16> = [400u16, 800, 1600, 3200]
-                    .into_iter()
-                    .filter(|&d| d >= mouse.dpi_min && d <= mouse.dpi_max)
-                    .collect();
-                if let Some(cur) = mouse.current_dpi {
-                    if cur >= mouse.dpi_min && cur <= mouse.dpi_max && !dpi_presets.contains(&cur) {
-                        dpi_presets.push(cur);
-                        dpi_presets.sort_unstable();
-                    }
-                }
-                if !dpi_presets.is_empty() {
-                    let sep = PredefinedMenuItem::separator();
-                    let _ = self.mouse_submenu.append(&sep);
-                    self.mouse_menu_seps.push(sep);
-
-                    for dpi in dpi_presets {
-                        let active = mouse.current_dpi == Some(dpi);
-                        let label = if active {
-                            format!("● DPI: {dpi}")
-                        } else {
-                            format!("   DPI: {dpi}")
-                        };
-                        let item = MenuItem::with_id(
-                            format!("{ID_MOUSE_DPI_PREFIX}{dpi}"),
-                            label,
-                            true,
-                            None,
-                        );
-                        let _ = self.mouse_submenu.append(&item);
-                        self.mouse_menu_items.push(item);
-                    }
-                }
-
-                let sep_end = PredefinedMenuItem::separator();
-                let _ = self.mouse_submenu.append(&sep_end);
-                self.mouse_menu_seps.push(sep_end);
-            } else {
-                let empty =
-                    MenuItem::with_id("mouse_empty", "No supported mouse connected", false, None);
-                let _ = self.mouse_submenu.append(&empty);
-                self.mouse_menu_items.push(empty);
-            }
-
-            let refresh =
-                MenuItem::with_id(ID_MOUSE_REFRESH, "Refresh Mouse & Battery", true, None);
-            let _ = self.mouse_submenu.append(&refresh);
-            self.mouse_menu_items.push(refresh);
-
-            self.last_mouse_key = Some(next_mouse_key);
-        }
-
-        // 3b. Keyboard quick-switch submenu (real onboard slot names).
-        let next_wooting_key = primary_wooting.cloned();
-        if self.last_wooting_key.as_ref() != Some(&next_wooting_key) {
-            for old in self.wooting_menu_items.drain(..) {
-                let _ = self.wooting_submenu.remove(&old);
-            }
-            for sep in self.wooting_menu_seps.drain(..) {
-                let _ = self.wooting_submenu.remove(&sep);
-            }
-
-            if let Some(kb) = primary_wooting {
-                let header = MenuItem::with_id("wooting_header", &kb.name, false, None);
-                let _ = self.wooting_submenu.append(&header);
-                self.wooting_menu_items.push(header);
-
-                if !kb.profiles.is_empty() {
-                    let sep = PredefinedMenuItem::separator();
-                    let _ = self.wooting_submenu.append(&sep);
-                    self.wooting_menu_seps.push(sep);
-
-                    for (slot, slot_name) in &kb.profiles {
-                        let active = kb.active_profile == Some(*slot);
-                        let label = if active {
-                            format!("● P{} · {slot_name}", slot + 1)
-                        } else {
-                            format!("   P{} · {slot_name}", slot + 1)
-                        };
-                        let item = MenuItem::with_id(
-                            format!("{ID_WOOTING_PREFIX}{slot}"),
-                            label,
-                            true,
-                            None,
-                        );
-                        let _ = self.wooting_submenu.append(&item);
-                        self.wooting_menu_items.push(item);
-                    }
-                }
-
-                let sep_end = PredefinedMenuItem::separator();
-                let _ = self.wooting_submenu.append(&sep_end);
-                self.wooting_menu_seps.push(sep_end);
-            } else {
-                let empty = MenuItem::with_id(
-                    "wooting_empty",
-                    "No supported keyboard connected",
-                    false,
-                    None,
-                );
-                let _ = self.wooting_submenu.append(&empty);
-                self.wooting_menu_items.push(empty);
-            }
-
-            let refresh = MenuItem::with_id(ID_WOOTING_REFRESH, "Refresh Keyboards", true, None);
-            let _ = self.wooting_submenu.append(&refresh);
-            self.wooting_menu_items.push(refresh);
-
-            self.last_wooting_key = Some(next_wooting_key);
-        }
-
-        // 4. Audio output switcher submenu.
-        if audio_outputs != self.last_audio_key.as_slice() {
-            for old in self.audio_menu_items.drain(..) {
-                let _ = self.audio_submenu.remove(&old);
-            }
-            if audio_outputs.is_empty() {
-                let placeholder =
-                    MenuItem::with_id("audio_empty", "No active playback devices", false, None);
-                let _ = self.audio_submenu.append(&placeholder);
-                self.audio_menu_items.push(placeholder);
-            } else {
-                for (id, name, is_default) in audio_outputs {
-                    let label = if *is_default {
-                        format!("● {name}")
-                    } else {
-                        format!("   {name}")
-                    };
-                    let item =
-                        MenuItem::with_id(format!("{ID_AUDIO_PREFIX}{id}"), label, true, None);
-                    let _ = self.audio_submenu.append(&item);
-                    self.audio_menu_items.push(item);
-                }
-            }
-            self.last_audio_key = audio_outputs.to_vec();
-        }
-
-        // 5. Rich hover tooltip (`Polled · Mouse · 68% · 4000 Hz · Profile`).
+        // Rich hover tooltip (`Polled · Mouse · 68% · 4000 Hz · Profile`).
         if let Some(tray) = &self.tray {
             let mut parts: Vec<String> = vec!["Polled".to_string()];
-            if let Some(mouse) = primary_mouse.filter(|m| !m.is_simulator) {
+            if let Some(mouse) = primary_mouse.as_ref().filter(|m| !m.is_simulator) {
                 parts.push(mouse.name.clone());
                 if let Some(batt) = mouse.battery {
                     let lbl = match mouse.battery_mins_left.filter(|&m| m > 0) {
@@ -718,19 +298,19 @@ impl TrayController {
                 if let Some(hz) = mouse.current_polling_hz {
                     parts.push(format!("{hz} Hz"));
                 }
-            } else if let Some(batt) = battery_summary.filter(|s| !s.is_empty()) {
+            } else if let Some(batt) = battery_summary.as_deref().filter(|s| !s.is_empty()) {
                 parts.push(batt.to_string());
             }
 
-            let profile_part = if profile_locked {
-                format!("{active_profile_name} [LOCKED]")
-            } else if auto_switch_enabled {
-                active_profile_name.to_string()
+            let profile_part = if snap.profile_locked {
+                format!("{} [LOCKED]", snap.active_profile_name)
+            } else if snap.auto_switch_enabled {
+                snap.active_profile_name.clone()
             } else {
-                format!("{active_profile_name} (Auto OFF)")
+                format!("{} (Auto OFF)", snap.active_profile_name)
             };
             parts.push(profile_part);
-            if mic_muted {
+            if snap.mic_muted == Some(true) {
                 parts.push("MIC MUTED".to_string());
             }
 
@@ -793,40 +373,3 @@ pub(crate) fn request_native_close(main_hwnd: &AtomicIsize) {
 
 #[cfg(not(windows))]
 pub(crate) fn request_native_close(_main_hwnd: &AtomicIsize) {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_static_and_prefixed_tray_menu_actions() {
-        assert_eq!(parse_menu_action(ID_OPEN), Some(TrayAction::Open));
-        assert_eq!(parse_menu_action(ID_SCAN), Some(TrayAction::ScanNow));
-        assert_eq!(
-            parse_menu_action(ID_TASKBAR_WIDGET),
-            Some(TrayAction::ToggleTaskbarWidget)
-        );
-        assert_eq!(
-            parse_menu_action(ID_CHECK_UPDATES),
-            Some(TrayAction::CheckUpdates)
-        );
-        assert_eq!(
-            parse_menu_action(ID_AUTO_SWITCH),
-            Some(TrayAction::ToggleAutoSwitch)
-        );
-        assert_eq!(parse_menu_action(ID_QUIT), Some(TrayAction::Quit));
-        assert_eq!(
-            parse_menu_action("profile::cs2"),
-            Some(TrayAction::ApplyProfile("cs2".to_string()))
-        );
-        assert_eq!(
-            parse_menu_action("mouse_poll::4000"),
-            Some(TrayAction::QuickSetMousePolling(4000))
-        );
-        assert_eq!(
-            parse_menu_action("mouse_dpi::1600"),
-            Some(TrayAction::QuickSetMouseDpi(1600))
-        );
-        assert_eq!(parse_menu_action("unknown_item"), None);
-    }
-}
