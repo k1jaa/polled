@@ -18,6 +18,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.14.2] - 2026-11-27
+
 ### Added
 - **Pulsar Fusion 2 / Sonix 64-Byte Mouse & 8K Dongle Backend (`devices/pulsar_fusion.rs`):**
   - Added read-back-verified support (`SupportTier::ImplementedFromDocs`, confirm-gated, zero destructive opcodes) for the **Pulsar 8K Wireless Dongle (`3710:5403`)**, **Pulsar 1K Wireless Dongle (`3710:5402`)**, **Pulsar Feinmann F01 8K (`3710:5404`)**, **Pulsar X3 / X3 LHD (`3710:3409`/`3410`)**, **Xlite v4 (`3710:3401`)**, **X2A v3 (`3710:3404`)**, and wired Sonix models (`3710:1401–1404`), implemented from `packerlschupfer/pulsar-mouse-linux` (MIT) and `OpenMouse-Project/mouse-protocol` (AGPL-3.0).
