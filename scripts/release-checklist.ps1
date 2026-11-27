@@ -49,8 +49,9 @@ try {
 
     Write-Host "[5/6] Staging portable release ZIP..."
     $DistDir = Join-Path $RepoRoot "dist"
-    $StageDir = Join-Path $DistDir "polled-v$Version-windows-x86_64"
-    $ZipPath = Join-Path $DistDir "polled-v$Version-windows-x86_64.zip"
+    $StageDir = Join-Path $DistDir "polled-v$Version-windows-x64"
+    $ZipName = "polled-v$Version-windows-x64.zip"
+    $ZipPath = Join-Path $DistDir $ZipName
     if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
     if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
     New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
@@ -60,32 +61,35 @@ try {
     Copy-Item (Join-Path $RepoRoot "README.md") $StageDir
     Copy-Item (Join-Path $RepoRoot "LICENSE") $StageDir
     Copy-Item (Join-Path $RepoRoot "CHANGELOG.md") $StageDir
+    $DocsStage = Join-Path $StageDir "docs"
+    New-Item -ItemType Directory -Path $DocsStage -Force | Out-Null
+    Copy-Item (Join-Path $RepoRoot "docs\COMPATIBILITY.md") $DocsStage
+    Copy-Item (Join-Path $RepoRoot "docs\SYSTEM_MODIFICATIONS.md") $DocsStage
 
     Compress-Archive -Path (Join-Path $StageDir "*") -DestinationPath $ZipPath -CompressionLevel Optimal
 
-    $ZipHash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash.ToUpperInvariant()
-    $CliHash = (Get-FileHash $CliExe -Algorithm SHA256).Hash.ToUpperInvariant()
-    $GuiHash = (Get-FileHash $GuiExe -Algorithm SHA256).Hash.ToUpperInvariant()
+    $ZipHash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $ZipHashUpper = $ZipHash.ToUpperInvariant()
+    $CliHash = (Get-FileHash $CliExe -Algorithm SHA256).Hash.ToLowerInvariant()
+    $GuiHash = (Get-FileHash $GuiExe -Algorithm SHA256).Hash.ToLowerInvariant()
 
-    $ChecksumsPath = Join-Path $DistDir "SHA256SUMS-v$Version.txt"
-    @(
-        "$ZipHash  polled-v$Version-windows-x86_64.zip"
-        "$GuiHash  polled-gui.exe"
-        "$CliHash  polled.exe"
-    ) | Set-Content -Path $ChecksumsPath -Encoding ASCII
+    $ChecksumsPath = Join-Path $DistDir "SHA256SUMS.txt"
+    "$ZipHash  $ZipName" | Set-Content -Path $ChecksumsPath -Encoding ASCII
 
-    Write-Host "[6/6] Updating WinGet installer manifest SHA-256 preview..."
+    Write-Host "[6/6] Release packaging summary"
     Write-Host ""
     Write-Host "Release archive ready:" -ForegroundColor Green
     Write-Host "  ZIP:       $ZipPath"
     Write-Host "  SHA-256:   $ZipHash"
+    Write-Host "  polled-gui: $GuiHash"
+    Write-Host "  polled:     $CliHash"
     Write-Host "  Checksums: $ChecksumsPath"
     Write-Host ""
     Write-Host "Next steps to publish:" -ForegroundColor Yellow
-    Write-Host "  1. git tag -a v$Version -m 'Release v$Version' && git push origin main --tags"
-    Write-Host "  2. Upload ZIP + SHA256SUMS to https://github.com/k1jaa/polled/releases/new?tag=v$Version"
-    Write-Host "  3. Set InstallerSha256 in packaging/winget/k1jaa.Polled.installer.yaml to:"
-    Write-Host "     $ZipHash"
+    Write-Host "  1. git push origin main; git tag v$Version; git push origin v$Version"
+    Write-Host "  2. Wait for GitHub Actions release.yml to publish polled-v$Version-windows-x64.zip + SHA256SUMS.txt"
+    Write-Host "  3. For WinGet first-time PR, copy the published release ZIP SHA-256 (uppercase) into:"
+    Write-Host "     packaging/winget/k1jaa.Polled.installer.yaml (example local hash: $ZipHashUpper)"
     Write-Host "  4. Validate with: winget validate --manifest packaging/winget"
 } finally {
     Pop-Location

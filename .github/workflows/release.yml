@@ -67,10 +67,50 @@ jobs:
           $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $zipPath" | Set-Content -Encoding ascii "SHA256SUMS.txt"
 
+          $ver = $tag.TrimStart('v')
+          $changelog = Get-Content "CHANGELOG.md" -Raw
+          $pattern = "(?ms)^## \[$([regex]::Escape($ver))\][^\r\n]*\r?\n(.*?)(?=^---\s*$|^## \[|\z)"
+          $section = ""
+          if ($changelog -match $pattern) {
+            $section = $Matches[1].Trim()
+          }
+          if ([string]::IsNullOrWhiteSpace($section)) {
+            $section = "See [CHANGELOG.md](https://github.com/k1jaa/polled/blob/$tag/CHANGELOG.md) for full release notes."
+          }
+
+          @(
+            $section
+            ""
+            "---"
+            ""
+            "### Download & Verification"
+            "- **Portable Windows x64:** ``$zipPath`` (extract anywhere and run ``polled-gui.exe``)"
+            "- **Already on Polled v0.14.3+?** Click **Check for Updates -> Install Update** inside Settings to verify SHA-256 and update in place."
+            "- **SHA-256:** ``$hash``"
+            "- **Full Changelog:** [CHANGELOG.md](https://github.com/k1jaa/polled/blob/$tag/CHANGELOG.md)"
+          ) -join "`n" | Set-Content -Encoding utf8 "RELEASE_NOTES.md"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          name: "Polled ${{ github.ref_name }}"
+          body_path: RELEASE_NOTES.md
           files: |
             polled-*-windows-x64.zip
             SHA256SUMS.txt
+
+  publish-winget:
+    name: Submit WinGet Manifest Update
+    needs: release-windows
+    # Enable once the initial k1jaa.Polled manifest PR is merged into microsoft/winget-pkgs:
+    # 1. Add repo secret WINGET_GITHUB_TOKEN (fine-grained PAT with public_repo access to your winget-pkgs fork)
+    # 2. Set repo variable WINGET_AUTO_PUBLISH=true
+    if: vars.WINGET_AUTO_PUBLISH == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Submit updated manifest to microsoft/winget-pkgs
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: k1jaa.Polled
+          installers-regex: 'polled-v.*-windows-x64\.zip$'
+          token: ${{ secrets.WINGET_GITHUB_TOKEN }}
