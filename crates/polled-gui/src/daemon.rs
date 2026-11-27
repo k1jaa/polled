@@ -24,6 +24,47 @@ pub fn run_daemon(_start_minimized: bool, _wait_for_previous_exit: bool) -> Resu
 }
 
 #[cfg(windows)]
+pub(crate) fn enable_per_monitor_dpi_awareness() {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::{PCSTR, PCWSTR};
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
+
+    // `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` == `(DPI_AWARENESS_CONTEXT)-4`.
+    const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+    type SetDpiCtxFn = unsafe extern "system" fn(isize) -> i32;
+
+    let user32: Vec<u16> = OsStr::new("user32.dll")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: `user32.dll` is always loaded in Win32 GUI/daemon processes; `GetProcAddress`
+    // dynamically resolves `SetProcessDpiAwarenessContext` on Windows 10 1703+ / Windows 11.
+    let set_v2 = unsafe {
+        GetModuleHandleW(PCWSTR(user32.as_ptr()))
+            .ok()
+            .and_then(|hmod| {
+                GetProcAddress(
+                    hmod,
+                    PCSTR(c"SetProcessDpiAwarenessContext".as_ptr().cast()),
+                )
+            })
+            .is_some_and(|proc| {
+                let func: SetDpiCtxFn = std::mem::transmute(proc);
+                func(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0
+            })
+    };
+    if !set_v2 {
+        // Fallback for older Windows builds.
+        unsafe {
+            let _ = SetProcessDPIAware();
+        }
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn trim_process_working_set() {
     use windows::Win32::System::Memory::{
         SetProcessWorkingSetSizeEx, SETPROCESSWORKINGSETSIZEEX_FLAGS,
@@ -689,6 +730,10 @@ mod win32_daemon {
     }
 
     pub fn run(start_minimized: bool, wait_for_previous_exit: bool) -> Result<(), String> {
+        // Opt into native Per-Monitor DPI Awareness V2 before creating any Win32 windows so the
+        // taskbar battery widget and OSD render 1:1 at physical pixels alongside Explorer's tray.
+        super::enable_per_monitor_dpi_awareness();
+
         let mut instance_guard =
             match crate::acquire_instance_guard(!start_minimized, wait_for_previous_exit) {
                 InstanceLock::Primary(guard) => guard,

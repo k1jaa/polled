@@ -73,9 +73,9 @@ pub(crate) fn widget_foreground_rgb(
         }
         Some(_) => {
             if light_taskbar {
-                (24, 24, 27) // crisp charcoal on light taskbar
+                (28, 28, 32) // crisp charcoal on light taskbar
             } else {
-                (244, 244, 246) // crisp off-white on dark taskbar
+                (234, 234, 238) // subtle Windows 11 taskbar off-white
             }
         }
         None => {
@@ -202,8 +202,9 @@ pub(crate) fn rasterize_pill_backdrop(
     }
 }
 
-/// Rasterizes a crisp anti-aliased vector mouse silhouette (rounded body, button seam, scroll
-/// wheel, and optional charging bolt accent) into a top-down premultiplied 32-bit BGRA buffer.
+/// Rasterizes a subtle, crisp Fluent-style vector mouse silhouette (slender rounded capsule +
+/// single center scroll-wheel tick, plus a tiny charging bolt when plugged in) into a top-down
+/// premultiplied 32-bit BGRA buffer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rasterize_mouse_icon(
     pixels: &mut [u8],
@@ -215,17 +216,17 @@ pub(crate) fn rasterize_mouse_icon(
     rgb: (u8, u8, u8),
     charging: bool,
 ) {
-    let icon_w = icon_h * 0.68;
+    let icon_w = icon_h * 0.64;
     let hx = icon_w * 0.5;
     let hy = icon_h * 0.5;
-    let corner_r = (hx * 0.92).min(hy * 0.62);
-    let stroke_half = (icon_h * 0.052).clamp(0.65, 1.7);
+    let corner_r = (hx * 0.94).min(hy * 0.58);
+    // Subtle ~1.15px stroke at 100% scale, scaling smoothly with DPI to match Explorer's `^` chevron.
+    let stroke_half = (icon_h * 0.043).clamp(0.48, 1.25);
 
-    // Upper button seam & scroll wheel coordinates relative to center.
-    let split_y = center_y - hy * 0.16;
-    let wheel_top = center_y - hy * 0.68;
-    let wheel_bot = center_y - hy * 0.30;
-    let wheel_half = (stroke_half * 1.15).max(0.85);
+    // Minimalist single scroll-wheel tick in the upper center (no heavy horizontal cross-bar).
+    let wheel_top = center_y - hy * 0.62;
+    let wheel_bot = center_y - hy * 0.14;
+    let wheel_half = (stroke_half * 1.05).max(0.55);
 
     let min_x = ((center_x - hx - stroke_half - 2.0).floor().max(0.0)) as usize;
     let max_x = ((center_x + hx + stroke_half + 2.0).ceil() as usize).min(width);
@@ -240,37 +241,16 @@ pub(crate) fn rasterize_mouse_icon(
             let body_sd = sd_rounded_box(px, py, center_x, center_y, hx, hy, corner_r);
             let outline_sd = body_sd.abs() - stroke_half;
 
-            // Only draw interior features strictly inside the mouse body.
             let mut min_sd = outline_sd;
             if body_sd < 0.5 {
-                // Horizontal button divider line across upper mouse shell.
-                let hline_sd = sd_segment(
-                    px,
-                    py,
-                    center_x - hx + stroke_half * 0.6,
-                    split_y,
-                    center_x + hx - stroke_half * 0.6,
-                    split_y,
-                ) - stroke_half * 0.72;
-                // Center vertical seam above the horizontal divider.
-                let vline_sd = sd_segment(
-                    px,
-                    py,
-                    center_x,
-                    center_y - hy + stroke_half * 0.6,
-                    center_x,
-                    split_y,
-                ) - stroke_half * 0.65;
-                // Rounded scroll wheel capsule.
                 let wheel_sd =
                     sd_segment(px, py, center_x, wheel_top, center_x, wheel_bot) - wheel_half;
-
-                min_sd = min_sd.min(hline_sd).min(vline_sd).min(wheel_sd);
+                min_sd = min_sd.min(wheel_sd);
 
                 if charging {
                     // Compact lightning bolt in the lower mouse body.
                     let bx = center_x;
-                    let by = center_y + hy * 0.36;
+                    let by = center_y + hy * 0.34;
                     let bh = hy * 0.34;
                     let bw = hx * 0.34;
                     let s1 = sd_segment(
@@ -297,7 +277,7 @@ pub(crate) fn rasterize_mouse_icon(
                         bx - bw * 0.25,
                         by + bh,
                     );
-                    let bolt_sd = s1.min(s2).min(s3) - (stroke_half * 0.75).max(0.6);
+                    let bolt_sd = s1.min(s2).min(s3) - (stroke_half * 0.85).max(0.5);
                     min_sd = min_sd.min(bolt_sd);
                 }
             }
@@ -445,7 +425,7 @@ fn run_taskbar_widget_loop(
         GetDC, GetMonitorInfoW, MonitorFromWindow, ReleaseDC, SelectObject, SetBkColor, SetBkMode,
         SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER,
         BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-        DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_SEMIBOLD,
+        DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_NORMAL,
         MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -554,7 +534,7 @@ fn run_taskbar_widget_loop(
                 0,
                 0,
                 0,
-                FW_SEMIBOLD.0 as i32,
+                FW_NORMAL.0 as i32,
                 0,
                 0,
                 0,
@@ -668,13 +648,13 @@ fn run_taskbar_widget_loop(
                 txt_slice.fill(0);
 
                 // 1. Pill hover highlight (or invisible alpha=1 click hitbox).
-                let pill_r = (6.0 * scale).clamp(4.0, 12.0);
+                let pill_r = (5.0 * scale).clamp(4.0, 10.0);
                 rasterize_pill_backdrop(dst_slice, w, h, hovered, light_taskbar, pill_r);
 
-                // 2. Anti-aliased SDF vector mouse icon on the left side.
-                let pad_x = (8.0 * scale).round();
-                let icon_h = (17.5 * scale).clamp(12.0, 38.0);
-                let icon_w = icon_h * 0.68;
+                // 2. Subtle Fluent-style anti-aliased vector mouse icon on the left side.
+                let pad_x = (6.0 * scale).round();
+                let icon_h = (13.0 * scale).clamp(10.0, 30.0);
+                let icon_w = icon_h * 0.64;
                 let icon_cx = pad_x + icon_w * 0.5;
                 let icon_cy = h as f32 * 0.5;
                 rasterize_mouse_icon(dst_slice, w, h, icon_cx, icon_cy, icon_h, rgb, charging);
@@ -682,7 +662,7 @@ fn run_taskbar_widget_loop(
                 // 3. Render anti-aliased white text onto black scratch DIB, then composite using
                 //    exact luminance as per-pixel alpha so GDI never leaves alpha=0 holes.
                 let old_txt_bmp = unsafe { SelectObject(text_dc, txt_bmp.into()) };
-                let font_px = (14.5 * scale).round().clamp(11.0, 32.0) as i32;
+                let font_px = (12.0 * scale).round().clamp(10.0, 28.0) as i32;
                 let face = to_wide_null("Segoe UI");
                 let font = unsafe {
                     CreateFontW(
@@ -690,7 +670,7 @@ fn run_taskbar_widget_loop(
                         0,
                         0,
                         0,
-                        FW_SEMIBOLD.0 as i32,
+                        FW_NORMAL.0 as i32,
                         0,
                         0,
                         0,
@@ -703,12 +683,13 @@ fn run_taskbar_widget_loop(
                     )
                 };
                 let old_font = unsafe { SelectObject(text_dc, font.into()) };
-                let text_left = (pad_x + icon_w + 6.0 * scale).round() as i32;
+                let text_left = (pad_x + icon_w + 4.5 * scale).round() as i32;
+                let optical_nudge = -(1.0 * scale).round() as i32;
                 let mut text_rc = RECT {
                     left: text_left,
-                    top: 0,
+                    top: optical_nudge,
                     right: width - (4.0 * scale).round() as i32,
-                    bottom: height,
+                    bottom: height + optical_nudge,
                 };
                 let mut wide: Vec<u16> = label.encode_utf16().collect();
                 unsafe {
@@ -887,15 +868,15 @@ fn run_taskbar_widget_loop(
 
             let scale = (bar_h as f32 / 48.0).clamp(0.75, 2.5);
             let label = widget_label_text(st.battery);
-            let font_px = (14.5 * scale).round().clamp(11.0, 32.0) as i32;
+            let font_px = (12.0 * scale).round().clamp(10.0, 28.0) as i32;
             let text_w = measure_label_px(&label, font_px);
-            let pad_x = (8.0 * scale).round() as i32;
-            let icon_w = ((17.5 * scale).clamp(12.0, 38.0) * 0.68).ceil() as i32;
-            let gap_icon_text = (6.0 * scale).round() as i32;
-            let widget_w = (pad_x + icon_w + gap_icon_text + text_w + pad_x).clamp(58, 220);
-            let widget_h = (bar_h - (8.0 * scale).round() as i32).clamp(24, bar_h);
+            let pad_x = (6.0 * scale).round() as i32;
+            let icon_w = ((13.0 * scale).clamp(10.0, 30.0) * 0.64).ceil() as i32;
+            let gap_icon_text = (4.5 * scale).round() as i32;
+            let widget_w = (pad_x + icon_w + gap_icon_text + text_w + pad_x).clamp(48, 200);
+            let widget_h = (bar_h - (10.0 * scale).round() as i32).clamp(22, bar_h);
 
-            let tray_gap = (4.0 * scale).round() as i32;
+            let tray_gap = (2.0 * scale).round() as i32;
             let x = (tray_rect.left - widget_w - tray_gap).max(bar_rect.left + 8);
             let y = bar_rect.top + (bar_h - widget_h) / 2;
 
