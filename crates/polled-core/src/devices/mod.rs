@@ -10,12 +10,14 @@ pub mod dry_run;
 pub mod endgame_gear;
 pub mod finalmouse;
 pub mod hidpp20;
+pub mod hyperx;
 pub mod incott;
 pub mod keyboards;
 pub mod keychron;
 pub mod mchose;
 pub mod ninjutso;
 pub mod pulsar_fusion;
+pub mod pulsar_pro;
 pub mod razer;
 pub mod vaxee;
 pub mod wooting;
@@ -35,6 +37,7 @@ pub use dry_run::DryRunDevice;
 pub use endgame_gear::{EndgameGearOp1Device, EndgameGearOp1ProtocolDriver};
 pub use finalmouse::{FinalmouseDevice, FinalmouseProtocolDriver};
 pub use hidpp20::{Hidpp20Device, Hidpp20ProtocolDriver};
+pub use hyperx::{HyperxDevice, HyperxProtocolDriver};
 pub use incott::{IncottDevice, IncottProtocolDriver};
 pub use keyboards::{
     detect_all_keyboards, KeyboardBrand, KeyboardCapabilities, KeyboardDevice, KeyboardProfileSlot,
@@ -44,6 +47,7 @@ pub use keychron::{KeychronDevice, KeychronProtocolDriver};
 pub use mchose::{MchoseDevice, MchoseProtocolDriver};
 pub use ninjutso::{NinjutsoDevice, NinjutsoProtocolDriver};
 pub use pulsar_fusion::{PulsarFusionDevice, PulsarFusionProtocolDriver};
+pub use pulsar_pro::{PulsarProDevice, PulsarProProtocolDriver};
 pub use razer::{RazerDevice, RazerProtocolDriver};
 pub use vaxee::{VaxeeDevice, VaxeeProtocolDriver};
 pub use wooting::{
@@ -752,6 +756,7 @@ pub fn detect_hardware_devices() -> Result<Vec<Box<dyn MouseDevice>>> {
     let drivers: Vec<Box<dyn DeviceDriver>> = vec![
         Box::new(CompxProtocolDriver),
         Box::new(PulsarFusionProtocolDriver),
+        Box::new(PulsarProProtocolDriver),
         Box::new(Compx64ProtocolDriver),
         Box::new(Hidpp20ProtocolDriver),
         Box::new(RazerProtocolDriver),
@@ -763,6 +768,7 @@ pub fn detect_hardware_devices() -> Result<Vec<Box<dyn MouseDevice>>> {
         Box::new(IncottProtocolDriver),
         Box::new(KeychronProtocolDriver),
         Box::new(AsusRogProtocolDriver),
+        Box::new(HyperxProtocolDriver),
     ];
     let mut devices = Vec::new();
     for driver in &drivers {
