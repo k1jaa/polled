@@ -18,6 +18,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.15.2] - 2026-11-27
+
 ### Fixed
 - **Taskbar Battery Widget & Custom Tray Menu on StartAllBack / ExplorerPatcher / Compact Windows 10 Taskbars (`daemon.rs`, `taskbar_widget.rs`, `tray_menu.rs`, `settings.rs`, `app.rs`):**
   - Switched DPI scaling from `taskbar_height / 48.0` to real monitor DPI (`GetDpiForWindow` / `LOGPIXELSY`) so compact 32–40px custom taskbars render at full crisp native font and icon size matching the Windows clock.
