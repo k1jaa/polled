@@ -62,6 +62,9 @@ pub enum PolledError {
     #[error("Invalid profile data: {0}")]
     InvalidProfile(String),
 
+    #[error("Update error: {0}")]
+    Update(String),
+
     #[error("Unsupported platform: Polled requires Windows 10 or Windows 11")]
     UnsupportedPlatform,
 }

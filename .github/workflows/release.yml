@@ -18,6 +18,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify git tag matches Cargo.toml workspace version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $expected = $tag.TrimStart('v')
+          $cargo = Get-Content "Cargo.toml" -Raw
+          if ($cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+            throw "Could not find workspace version in Cargo.toml"
+          }
+          $actual = $Matches[1]
+          if ($actual -ne $expected) {
+            throw "Tag $tag does not match Cargo.toml version $actual. Bump Cargo.toml and tag the release prep commit."
+          }
+          Write-Host "Verified tag $tag matches Cargo.toml version $actual."
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

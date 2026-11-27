@@ -72,7 +72,9 @@ pub use settings::{
     HotkeyBinding, HotkeyConfig, ThemePreference, TrayAlertConfig,
 };
 pub use update::{
-    check_latest_github_release, is_newer_version, parse_github_release_json, UpdateCheckResult,
+    check_latest_github_release, cleanup_stale_update_backups, download_and_install_update,
+    is_allowed_release_download_url, is_newer_version, parse_github_release_json,
+    parse_sha256sums_for_file, sha256_hex, InstalledUpdate, UpdateCheckResult,
     GITHUB_RELEASES_WEB_URL,
 };
 pub use win::{

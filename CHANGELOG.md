@@ -10,13 +10,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Unsigned Windows binaries:** Release executables (`polled.exe`, `polled-gui.exe`) are not yet signed with a commercial code-signing certificate, so Windows Defender SmartScreen may prompt on first run. Every release ships `SHA256SUMS.txt` and builds publicly via GitHub Actions.
 - **Unverified mouse models (`Implemented from docs`):** Only **Pulsar X2 CrazyLight Mini Wireless** (`3710:5406`) and **LAMZU 4K Receiver** (`3554:f510`) have been verified on physical hardware in Polled. Razer, CompX 64B (WLMouse / LAMZU Maya X & Inca / Attack Shark / Vancer / RAWM), Endgame Gear, Finalmouse, VAXEE, Ninjutso, MCHOSE, Incott, Keychron, Logitech HID++ 2.0, and Wave 2 CompX 17B models (VGN, Scyrox V8, ATK/VXE R1, G-Wolves XVI:0, Hitscan Hyperlight) are implemented from open-source protocol documentation and prompt for confirmation before the first write in a session (see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
 - **Onboard flash writes:** Most wireless gaming mice persist settings to onboard memory rather than RAM; Polled mitigates flash wear via register diffing, focus debouncing, and a 4-writes / 60-second sliding-window cap.
-- **No automatic background updater:** Polled stays offline by default with an on-demand **Check for Updates** button (Settings / `--check-update`) and an optional opt-in **Check for updates once on startup** toggle over Win32 WinHTTP that notifies you and opens the GitHub Releases page; portable ZIPs are never downloaded or overwritten silently in the background.
+- **No silent background auto-updater:** Polled stays offline by default with an on-demand **Check for Updates** button (Settings / `--check-update`), an optional opt-in startup update check, and a user-clicked **Install Update** button that verifies `SHA256SUMS.txt` before swapping portable binaries in place; updates are never downloaded or installed silently without your click.
 - **Minimum window size:** The GUI enforces a minimum viewport of `740×540` px to avoid crowding Bench plots and Profile editors.
 - **Version metadata in `v0.2.0`:** The `v0.2.0` tagged binaries reported `0.1.0` from `polled --version` because workspace `Cargo.toml` was not bumped prior to tagging `v0.2.0` (fixed in `v0.2.1`+).
 
 ---
 
 ## [Unreleased]
+
+### Added
+- **1-Click SHA-256-Verified In-App Updater (`update.rs`, `main.rs`, `daemon.rs`, `app.rs`):**
+  - Added an **Install vX.Y.Z** button in the update banner and **Settings -> Updates** whenever a newer GitHub Release ships both `polled-v*-windows-x64.zip` and `SHA256SUMS.txt`.
+  - Downloads strictly from `https://github.com/k1jaa/polled/releases/download/...` over native WinHTTP, verifies the ZIP's FIPS 180-4 SHA-256 digest byte-for-byte against `SHA256SUMS.txt`, extracts via Windows built-in `System32\tar.exe` with zip-slip & PE header validation, performs an atomic rename-in-place swap (`*.exe` -> `*.exe.old` with automatic rollback on error, zero `.bat`/PowerShell scripts), cleanly hands off the tray daemon (`--after-update`), and cleans up `.old` backups automatically.
+- **Release Tag Verification Guard (`.github/workflows/release.yml`):**
+  - Added an automatic CI check that fails release builds if the pushed `v*` git tag does not match `[workspace.package].version` in `Cargo.toml`.
 
 ---
 

@@ -11,11 +11,12 @@ use chrono::Local;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 use polled_core::win::{RegHive, WindowsEnv};
 use polled_core::{
-    check_latest_github_release, curated_custom_tweak_presets, export_setup_bundle_json,
-    is_autostart_enabled, parse_setup_bundle_json, restore_setup_bundle, set_autostart_enabled,
-    AppPaths, AppSettings, CheckReport, CustomTweakDef, CustomTweakStore, CustomValueKind,
-    HealthEngine, HotkeyBinding, MouseSettings, PolledError, ScanSummary, Severity, SupportTier,
-    ThemePreference, UpdateCheckResult, GITHUB_RELEASES_WEB_URL,
+    check_latest_github_release, curated_custom_tweak_presets, download_and_install_update,
+    export_setup_bundle_json, is_autostart_enabled, parse_setup_bundle_json, restore_setup_bundle,
+    set_autostart_enabled, AppPaths, AppSettings, CheckReport, CustomTweakDef, CustomTweakStore,
+    CustomValueKind, HealthEngine, HotkeyBinding, InstalledUpdate, MouseSettings, PolledError,
+    ScanSummary, Severity, SupportTier, ThemePreference, UpdateCheckResult,
+    GITHUB_RELEASES_WEB_URL,
 };
 
 use crate::elevation::{run_elevated_cli, ElevatedAction};
@@ -262,6 +263,8 @@ pub(crate) enum WorkerMsg {
         message: String,
     },
     UpdateCheckFinished(Result<UpdateCheckResult, String>),
+    UpdateInstallProgress(String),
+    UpdateInstallFinished(Result<InstalledUpdate, String>),
     DaemonCachedScan(ScanSummary),
     DaemonCachedUpdate(UpdateCheckResult),
     DaemonFocusWindow,
@@ -305,6 +308,9 @@ pub struct PolledApp {
     update_checking: bool,
     update_result: Option<Result<UpdateCheckResult, String>>,
     update_banner_dismissed: bool,
+    update_installing: bool,
+    update_install_status: Option<String>,
+    update_install_error: Option<String>,
     custom_tweak_draft: CustomTweakDraft,
 
     profiles_ui: ProfilesUiState,
@@ -446,6 +452,9 @@ impl PolledApp {
             update_checking: false,
             update_result: None,
             update_banner_dismissed: false,
+            update_installing: false,
+            update_install_status: None,
+            update_install_error: None,
             custom_tweak_draft: CustomTweakDraft::default(),
             profiles_ui,
             profile_runtime,
@@ -561,6 +570,9 @@ impl PolledApp {
             update_checking: false,
             update_result: None,
             update_banner_dismissed: false,
+            update_installing: false,
+            update_install_status: None,
+            update_install_error: None,
             custom_tweak_draft: CustomTweakDraft::default(),
             profiles_ui,
             profile_runtime,
@@ -667,6 +679,36 @@ impl PolledApp {
                     }
                 }
             }
+            ctx_bg.request_repaint();
+        });
+    }
+
+    fn start_install_update(&mut self, ctx: &egui::Context, info: UpdateCheckResult) {
+        if self.update_installing {
+            return;
+        }
+        let Some(install_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        else {
+            self.update_install_error =
+                Some("Could not locate Polled's installation folder.".to_string());
+            return;
+        };
+
+        self.update_installing = true;
+        self.update_install_error = None;
+        self.update_install_status = Some(format!("Preparing v{} update...", info.latest_version));
+
+        let tx = self.tx.clone();
+        let ctx_bg = ctx.clone();
+        std::thread::spawn(move || {
+            let res = download_and_install_update(&info, &install_dir, |step| {
+                let _ = tx.send(WorkerMsg::UpdateInstallProgress(step.to_string()));
+                ctx_bg.request_repaint();
+            })
+            .map_err(|e| e.to_string());
+            let _ = tx.send(WorkerMsg::UpdateInstallFinished(res));
             ctx_bg.request_repaint();
         });
     }
@@ -1203,6 +1245,51 @@ impl PolledApp {
                         }
                     }
                 }
+                WorkerMsg::UpdateInstallProgress(step) => {
+                    self.update_install_status = Some(step);
+                }
+                WorkerMsg::UpdateInstallFinished(res) => match res {
+                    Ok(installed) => {
+                        let mut cmd = std::process::Command::new(&installed.new_gui_exe);
+                        cmd.arg("--after-update");
+                        if !self.is_remote_daemon_mode() {
+                            cmd.arg("--standalone");
+                        }
+                        match cmd.spawn() {
+                            Ok(_) => {
+                                self.update_install_status = Some(format!(
+                                    "Installed v{} — restarting...",
+                                    installed.version
+                                ));
+                                self.quit_requested.store(true, Ordering::SeqCst);
+                                self.input_lab_ui.stop_background_monitors();
+                                self.keyboard_ui.stop_analog_stream();
+                                match &self.host {
+                                    AppHost::Remote { ipc } => {
+                                        ipc.send(UiToDaemonMsg::RequestQuitDaemon);
+                                    }
+                                    AppHost::Standalone(_) => {
+                                        crate::tray::request_native_close(&self.main_hwnd);
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                self.update_installing = false;
+                                self.update_install_status = None;
+                                self.update_install_error = Some(format!(
+                                    "Updated binaries on disk, but failed to relaunch {}: {err}. Restart Polled manually.",
+                                    installed.new_gui_exe.display()
+                                ));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.update_installing = false;
+                        self.update_install_status = None;
+                        self.update_install_error = Some(err);
+                    }
+                },
                 WorkerMsg::DaemonCachedScan(scan) => {
                     if self.summary.is_none() {
                         self.summary = Some(scan);
@@ -1620,46 +1707,103 @@ impl eframe::App for PolledApp {
                 ui.set_max_width(content_w);
 
                 if let Some(upd) = self.available_update().cloned() {
-                    if !self.update_banner_dismissed {
+                    if !self.update_banner_dismissed || self.update_installing {
+                        let mut install_now = false;
                         let mut open_release = false;
                         let mut open_settings = false;
                         let mut dismiss_banner = false;
+                        let can_install = upd.can_self_update();
                         banner_frame(ui, p, content_w, Some(p.info), mode, |ui| {
                             ui.horizontal(|ui| {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.add(ghost_button("Dismiss", p)).clicked() {
-                                            dismiss_banner = true;
-                                        }
-                                        if ui.add(secondary_button("Notes", p)).clicked() {
-                                            open_settings = true;
-                                        }
-                                        if ui.add(primary_button("Open Release", p)).clicked() {
-                                            open_release = true;
+                                        if !self.update_installing {
+                                            if ui.add(ghost_button("Dismiss", p)).clicked() {
+                                                dismiss_banner = true;
+                                            }
+                                            if ui.add(secondary_button("Notes", p)).clicked() {
+                                                open_settings = true;
+                                            }
+                                            if can_install {
+                                                if ui
+                                                    .add(secondary_button("Open Release", p))
+                                                    .clicked()
+                                                {
+                                                    open_release = true;
+                                                }
+                                                if ui
+                                                    .add(primary_button(
+                                                        &format!("Install v{}", upd.latest_version),
+                                                        p,
+                                                    ))
+                                                    .on_hover_text(
+                                                        "Downloads the official GitHub Release ZIP, verifies its SHA-256 against SHA256SUMS.txt, swaps Polled binaries in place, and restarts.",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    install_now = true;
+                                                }
+                                            } else if ui
+                                                .add(primary_button("Open Release", p))
+                                                .clicked()
+                                            {
+                                                open_release = true;
+                                            }
                                         }
                                         ui.with_layout(
                                             egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(format!(
-                                                            "Polled v{} is available (current v{}).",
-                                                            upd.latest_version, upd.current_version
-                                                        ))
-                                                        .size(12.0)
-                                                        .strong()
-                                                        .color(p.text),
-                                                    )
-                                                    .wrap(),
-                                                );
+                                                if self.update_installing {
+                                                    ui.spinner();
+                                                    let step = self
+                                                        .update_install_status
+                                                        .as_deref()
+                                                        .unwrap_or("Installing update...");
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(step)
+                                                                .size(12.0)
+                                                                .strong()
+                                                                .color(p.text),
+                                                        )
+                                                        .wrap(),
+                                                    );
+                                                } else {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(format!(
+                                                                "Polled v{} is available (current v{}).",
+                                                                upd.latest_version, upd.current_version
+                                                            ))
+                                                            .size(12.0)
+                                                            .strong()
+                                                            .color(p.text),
+                                                        )
+                                                        .wrap(),
+                                                    );
+                                                }
                                             },
                                         );
                                     },
                                 );
                             });
+                            if let Some(err) = &self.update_install_error {
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("Update failed: {err}"))
+                                            .size(11.5)
+                                            .color(p.warn),
+                                    )
+                                    .wrap(),
+                                );
+                            }
                         });
                         ui.add_space(10.0);
+                        if install_now {
+                            self.start_install_update(ctx, upd.clone());
+                        }
                         if open_release {
                             let _ = std::process::Command::new("cmd")
                                 .args(["/C", "start", "", &upd.release_url])
@@ -2918,6 +3062,11 @@ impl eframe::App for PolledApp {
                     );
                     ui.add_space(6.0);
                     let mut check_updates_clicked = false;
+                    let mut install_update_target: Option<UpdateCheckResult> = None;
+                    let self_updatable = self
+                        .available_update()
+                        .filter(|info| info.can_self_update())
+                        .cloned();
                     ui.horizontal_wrapped(|ui| {
                         let check_lbl = if self.update_checking {
                             "Checking GitHub..."
@@ -2925,10 +3074,32 @@ impl eframe::App for PolledApp {
                             "Check for Updates"
                         };
                         if ui
-                            .add_enabled(!self.update_checking, secondary_button(check_lbl, p))
+                            .add_enabled(
+                                !self.update_checking && !self.update_installing,
+                                secondary_button(check_lbl, p),
+                            )
                             .clicked()
                         {
                             check_updates_clicked = true;
+                        }
+                        if let Some(ref upd) = self_updatable {
+                            let install_lbl = if self.update_installing {
+                                "Installing..."
+                            } else {
+                                "Install Update"
+                            };
+                            if ui
+                                .add_enabled(
+                                    !self.update_installing,
+                                    primary_button(install_lbl, p),
+                                )
+                                .on_hover_text(
+                                    "Downloads the official GitHub Release ZIP, verifies SHA256SUMS.txt, swaps binaries in place, and restarts Polled.",
+                                )
+                                .clicked()
+                            {
+                                install_update_target = Some(upd.clone());
+                            }
                         }
                         let open_url = match &self.update_result {
                             Some(Ok(info)) => info.release_url.clone(),
@@ -2942,7 +3113,36 @@ impl eframe::App for PolledApp {
                     });
                     if check_updates_clicked {
                         self.update_banner_dismissed = false;
+                        self.update_install_error = None;
                         self.start_update_check(ctx, false, false);
+                    }
+                    if let Some(target) = install_update_target {
+                        self.start_install_update(ctx, target);
+                    }
+                    if self.update_installing {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(
+                                    self.update_install_status
+                                        .as_deref()
+                                        .unwrap_or("Installing update..."),
+                                )
+                                .size(11.5)
+                                .color(p.info),
+                            );
+                        });
+                    } else if let Some(err) = &self.update_install_error {
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Update install failed: {err}"))
+                                    .size(11.5)
+                                    .color(p.warn),
+                            )
+                            .wrap(),
+                        );
                     }
                     if let Some(res) = &self.update_result {
                         ui.add_space(6.0);

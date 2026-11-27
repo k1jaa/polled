@@ -2,7 +2,7 @@
 
 **A lightweight, open-source Windows 10/11 tray utility for competitive input health checks, per-game mouse & keyboard profiles, and 1K–8K hardware benchmarking.**
 
-Pure Rust (~3 MB idle tray RAM with zero GPU/OpenGL memory while minimized, no Electron/WebView2, no account, no telemetry, zero background network calls by default with an optional opt-in startup update check, and **100% anti-cheat safe** — standard Win32 user-mode APIs only, no kernel drivers or game hooks).
+Pure Rust (~3 MB idle tray RAM with zero GPU/OpenGL memory while minimized, no Electron/WebView2, no account, no telemetry, zero background network calls by default with an optional opt-in startup update check & 1-click SHA-256-verified in-app updater, and **100% anti-cheat safe** — standard Win32 user-mode APIs only, no kernel drivers or game hooks).
 
 > [!WARNING]
 > **Experimental (`0.x`):** Polled modifies Windows settings and sends USB HID configuration commands to supported peripherals. Every Windows change is snapshotted first for one-click rollback, and unverified (`Implemented from docs`) devices require explicit confirmation before writing. Provided **"AS IS"** under [AGPL-3.0-or-later](LICENSE).

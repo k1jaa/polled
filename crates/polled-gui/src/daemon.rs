@@ -14,12 +14,12 @@
 //! `[X]` exits the UI child process and returns 100% of GPU memory back to Windows immediately.
 
 #[cfg(windows)]
-pub fn run_daemon(start_minimized: bool) -> Result<(), String> {
-    win32_daemon::run(start_minimized)
+pub fn run_daemon(start_minimized: bool, wait_for_previous_exit: bool) -> Result<(), String> {
+    win32_daemon::run(start_minimized, wait_for_previous_exit)
 }
 
 #[cfg(not(windows))]
-pub fn run_daemon(_start_minimized: bool) -> Result<(), String> {
+pub fn run_daemon(_start_minimized: bool, _wait_for_previous_exit: bool) -> Result<(), String> {
     Err("Pure-Win32 background daemon is only supported on Windows.".to_string())
 }
 
@@ -292,6 +292,8 @@ mod win32_daemon {
                     }
                     WorkerMsg::ActionFinished { .. }
                     | WorkerMsg::UpdateCheckFinished(Err(_))
+                    | WorkerMsg::UpdateInstallProgress(_)
+                    | WorkerMsg::UpdateInstallFinished(_)
                     | WorkerMsg::TrayAction(_)
                     | WorkerMsg::DaemonFocusWindow
                     | WorkerMsg::DaemonShutdownUi
@@ -567,11 +569,13 @@ mod win32_daemon {
         }
     }
 
-    pub fn run(start_minimized: bool) -> Result<(), String> {
-        let mut instance_guard = match SingleInstanceGuard::acquire(!start_minimized) {
-            InstanceLock::Primary(guard) => guard,
-            InstanceLock::AlreadyRunning => return Ok(()),
-        };
+    pub fn run(start_minimized: bool, wait_for_previous_exit: bool) -> Result<(), String> {
+        let mut instance_guard =
+            match crate::acquire_instance_guard(!start_minimized, wait_for_previous_exit) {
+                InstanceLock::Primary(guard) => guard,
+                InstanceLock::AlreadyRunning => return Ok(()),
+            };
+        crate::spawn_stale_backup_cleanup(wait_for_previous_exit);
 
         let class_str = format!("PolledDaemonHost_{}", std::process::id());
         let class_w: Vec<u16> = OsStr::new(&class_str)
