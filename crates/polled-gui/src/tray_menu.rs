@@ -958,13 +958,12 @@ fn run_tray_menu_loop(
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
-        GetCursorPos, GetMessageW, GetWindowRect, LoadCursorW, PostQuitMessage, RegisterClassW,
-        SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage,
-        UnregisterClassW, UpdateLayeredWindow, HWND_TOPMOST, IDC_ARROW, IDC_HAND, MSG,
-        SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, ULW_ALPHA,
-        WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONUP,
-        WM_MOUSEMOVE, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_POPUP,
+        GetCursorPos, GetMessageW, LoadCursorW, PostQuitMessage, RegisterClassW, SetCursor,
+        SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW,
+        UpdateLayeredWindow, HWND_TOPMOST, IDC_ARROW, IDC_HAND, MSG, SWP_NOACTIVATE,
+        SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, ULW_ALPHA, WA_INACTIVE, WM_ACTIVATE,
+        WM_APP, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_SETCURSOR,
+        WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
 
     const WM_MENU_OPEN: u32 = WM_APP + 20;
@@ -977,16 +976,9 @@ fn run_tray_menu_loop(
 
     fn current_taskbar_scale() -> f32 {
         let shell_cls = to_wide_null("Shell_TrayWnd");
-        if let Ok(tb) = unsafe { FindWindowW(PCWSTR(shell_cls.as_ptr()), PCWSTR::null()) } {
-            let mut rc = RECT::default();
-            if !tb.is_invalid() && unsafe { GetWindowRect(tb, &mut rc) }.is_ok() {
-                let h = (rc.bottom - rc.top).min(rc.right - rc.left);
-                if h >= 24 {
-                    return (h as f32 / 48.0).clamp(0.85, 2.5);
-                }
-            }
-        }
-        1.0
+        let tb =
+            unsafe { FindWindowW(PCWSTR(shell_cls.as_ptr()), PCWSTR::null()) }.unwrap_or_default();
+        crate::daemon::window_dpi_scale(tb)
     }
 
     fn work_area_at(pt: POINT) -> (i32, i32, i32, i32) {

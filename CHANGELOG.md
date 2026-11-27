@@ -18,6 +18,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Taskbar Battery Widget & Custom Tray Menu on StartAllBack / ExplorerPatcher / Compact Windows 10 Taskbars (`daemon.rs`, `taskbar_widget.rs`, `tray_menu.rs`, `settings.rs`, `app.rs`):**
+  - Switched DPI scaling from `taskbar_height / 48.0` to real monitor DPI (`GetDpiForWindow` / `LOGPIXELSY`) so compact 32–40px custom taskbars render at full crisp native font and icon size matching the Windows clock.
+  - Anchored the taskbar widget horizontally and vertically to the leftmost visible `Button` (`^` overflow chevron) / `SysPager` child inside `TrayNotifyWnd` when present (falling back to `TrayNotifyWnd` on stock Windows 11), eliminating extra padding gaps and vertical misalignment on StartAllBack & classic Windows 10 taskbars.
+  - Added an optional **X offset (`-600..=600 px`)** control beside the Taskbar Battery Widget checkbox in **Settings → Tray Icon & Notifications** for pixel-perfect placement on any custom dock or taskbar mod.
+
 ---
 
 ## [0.15.1] - 2026-11-27

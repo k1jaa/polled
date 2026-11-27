@@ -542,6 +542,7 @@ impl PolledApp {
         let taskbar_widget = TaskbarWidgetController::start(
             settings.alerts.taskbar_battery_widget,
             settings.alerts.clamped_threshold(),
+            settings.alerts.clamped_taskbar_offset_x(),
             Arc::new(move || {
                 crate::tray::show_and_focus(&widget_hwnd, &widget_ctx);
             }),
@@ -1432,6 +1433,7 @@ impl PolledApp {
                 self.settings.alerts.taskbar_battery_widget,
                 snap.and_then(primary_mouse_battery),
                 self.settings.alerts.clamped_threshold(),
+                self.settings.alerts.clamped_taskbar_offset_x(),
             );
             if let Some(snap) = snap {
                 host.tray.sync_from_snapshot(snap);
@@ -2875,13 +2877,29 @@ impl eframe::App for PolledApp {
                             .color(p.text_muted),
                     );
                     ui.add_space(4.0);
-                    ui.checkbox(
-                        &mut self.settings.alerts.taskbar_battery_widget,
-                        "Pin wireless mouse battery % directly on Windows taskbar (next to tray)",
-                    )
-                    .on_hover_text(
-                        "Draws a crisp transparent vector mouse icon and live battery % directly beside the Windows 10/11 tray overflow chevron. Auto-hides in fullscreen games, opens Polled on click, zero game hooks.",
-                    );
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.settings.alerts.taskbar_battery_widget,
+                            "Pin wireless mouse battery % on Windows taskbar",
+                        )
+                        .on_hover_text(
+                            "Draws a subtle vector mouse icon and live battery % directly beside the Windows 10/11 tray overflow chevron. Auto-hides in fullscreen games, left-click opens Polled, right-click opens quick controls.",
+                        );
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("X offset:").size(11.5).color(p.text_muted));
+                        ui.add_enabled(
+                            self.settings.alerts.taskbar_battery_widget,
+                            egui::DragValue::new(
+                                &mut self.settings.alerts.taskbar_widget_offset_x,
+                            )
+                            .range(-600..=600)
+                            .speed(2)
+                            .suffix(" px"),
+                        )
+                        .on_hover_text(
+                            "Optional horizontal nudge for custom taskbars (StartAllBack, ExplorerPatcher, Windhawk). 0 = automatic.",
+                        );
+                    });
                     ui.horizontal(|ui| {
                         ui.checkbox(
                             &mut self.settings.alerts.low_battery_toast,
@@ -3341,6 +3359,8 @@ impl eframe::App for PolledApp {
             } else if save_hk {
                 self.settings.alerts.low_battery_threshold_pct =
                     self.settings.alerts.clamped_threshold();
+                self.settings.alerts.taskbar_widget_offset_x =
+                    self.settings.alerts.clamped_taskbar_offset_x();
                 let _ = self
                     .settings
                     .save_atomic(&AppPaths::default_user_dir().settings_path());

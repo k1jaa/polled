@@ -28,6 +28,7 @@ pub struct TaskbarWidgetState {
     pub enabled: bool,
     pub battery: Option<BatteryStatus>,
     pub low_battery_threshold: u8,
+    pub offset_x: i32,
 }
 
 impl Default for TaskbarWidgetState {
@@ -36,8 +37,36 @@ impl Default for TaskbarWidgetState {
             enabled: false,
             battery: None,
             low_battery_threshold: 15,
+            offset_x: 0,
         }
     }
+}
+
+/// Computes the final `(x, y)` placement of the taskbar battery widget inside `bar_rect`
+/// anchored immediately left of `anchor_rect` (the visible `^` chevron / `TrayNotifyWnd`),
+/// vertically centered on `anchor_rect`, with optional logical `offset_x` adjustment.
+pub(crate) fn compute_widget_position(
+    bar_rect: (i32, i32, i32, i32),
+    anchor_rect: (i32, i32, i32, i32),
+    widget_w: i32,
+    widget_h: i32,
+    scale: f32,
+    offset_x: i32,
+) -> (i32, i32) {
+    let (bar_l, bar_t, bar_r, bar_b) = bar_rect;
+    let (anc_l, anc_t, _anc_r, anc_b) = anchor_rect;
+    let tray_gap = (2.0 * scale).round() as i32;
+    let offset_px = (offset_x as f32 * scale).round() as i32;
+    let min_x = bar_l + 4;
+    let max_x = (bar_r - widget_w - 4).max(min_x);
+    let x = (anc_l - widget_w - tray_gap + offset_px).clamp(min_x, max_x);
+
+    let anc_h = anc_b - anc_t;
+    let ideal_y = anc_t + (anc_h - widget_h) / 2;
+    let min_y = bar_t;
+    let max_y = (bar_b - widget_h).max(min_y);
+    let y = ideal_y.clamp(min_y, max_y);
+    (x, y)
 }
 
 /// Extracts the primary mouse's battery status from a runtime snapshot (preferring physical
@@ -302,6 +331,7 @@ impl TaskbarWidgetController {
     pub fn start(
         initial_enabled: bool,
         initial_low_threshold: u8,
+        initial_offset_x: i32,
         on_click: Arc<dyn Fn() + Send + Sync>,
         on_right_click: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
@@ -309,6 +339,7 @@ impl TaskbarWidgetController {
             enabled: initial_enabled,
             battery: None,
             low_battery_threshold: initial_low_threshold,
+            offset_x: initial_offset_x,
         }));
         let hwnd = Arc::new(AtomicIsize::new(0));
 
@@ -332,13 +363,20 @@ impl TaskbarWidgetController {
         }
     }
 
-    /// Updates enabled state, battery reading, and low-battery threshold, waking the Win32 widget
-    /// thread only when the visible state actually changes.
-    pub fn update(&self, enabled: bool, battery: Option<BatteryStatus>, low_threshold: u8) {
+    /// Updates enabled state, battery reading, low-battery threshold, and optional X offset,
+    /// waking the Win32 widget thread only when the visible state actually changes.
+    pub fn update(
+        &self,
+        enabled: bool,
+        battery: Option<BatteryStatus>,
+        low_threshold: u8,
+        offset_x: i32,
+    ) {
         let next = TaskbarWidgetState {
             enabled,
             battery,
             low_battery_threshold: low_threshold,
+            offset_x,
         };
         let changed = if let Ok(mut guard) = self.state.lock() {
             if *guard == next {
@@ -361,8 +399,14 @@ impl TaskbarWidgetController {
         snap: &ProfileRuntimeSnapshot,
         enabled: bool,
         low_threshold: u8,
+        offset_x: i32,
     ) {
-        self.update(enabled, primary_mouse_battery(snap), low_threshold);
+        self.update(
+            enabled,
+            primary_mouse_battery(snap),
+            low_threshold,
+            offset_x,
+        );
     }
 
     fn post_refresh(&self) {
@@ -905,7 +949,43 @@ fn run_taskbar_widget_loop(
                 }
             }
 
-            let scale = (bar_h as f32 / 48.0).clamp(0.75, 2.5);
+            // On classic Windows 10, StartAllBack, and ExplorerPatcher taskbars, `TrayNotifyWnd`
+            // often carries extra left padding around its child `Button` (`^` overflow chevron)
+            // and `SysPager` (tray icon strip). Picking the leftmost visible child snaps cleanly
+            // right beside `^`, while falling back to `tray_rect` on stock Windows 11 XAML.
+            let mut anchor_rect = tray_rect;
+            let mut best_child: Option<RECT> = None;
+            for cls in ["Button", "SysPager"] {
+                let cls_w = to_wide_null(cls);
+                if let Ok(child) = unsafe {
+                    FindWindowExW(
+                        Some(tray_hwnd),
+                        None,
+                        PCWSTR(cls_w.as_ptr()),
+                        PCWSTR::null(),
+                    )
+                } {
+                    if !child.is_invalid() && unsafe { IsWindowVisible(child) }.as_bool() {
+                        let mut crc = RECT::default();
+                        if unsafe { GetWindowRect(child, &mut crc) }.is_ok()
+                            && crc.right > crc.left
+                            && crc.bottom > crc.top
+                            && crc.left >= tray_rect.left
+                            && crc.right <= tray_rect.right + 4
+                        {
+                            best_child = match best_child {
+                                Some(prev) if prev.left <= crc.left => Some(prev),
+                                _ => Some(crc),
+                            };
+                        }
+                    }
+                }
+            }
+            if let Some(child_rc) = best_child {
+                anchor_rect = child_rc;
+            }
+
+            let scale = crate::daemon::window_dpi_scale(taskbar_hwnd);
             let label = widget_label_text(st.battery);
             let font_px = (12.0 * scale).round().clamp(10.0, 28.0) as i32;
             let text_w = measure_label_px(&label, font_px);
@@ -913,11 +993,21 @@ fn run_taskbar_widget_loop(
             let icon_w = ((13.0 * scale).clamp(10.0, 30.0) * 0.64).ceil() as i32;
             let gap_icon_text = (4.5 * scale).round() as i32;
             let widget_w = (pad_x + icon_w + gap_icon_text + text_w + pad_x).clamp(48, 200);
-            let widget_h = (bar_h - (10.0 * scale).round() as i32).clamp(22, bar_h);
+            let widget_h = (bar_h - (6.0 * scale).round() as i32).clamp(20, bar_h);
 
-            let tray_gap = (2.0 * scale).round() as i32;
-            let x = (tray_rect.left - widget_w - tray_gap).max(bar_rect.left + 8);
-            let y = bar_rect.top + (bar_h - widget_h) / 2;
+            let (x, y) = compute_widget_position(
+                (bar_rect.left, bar_rect.top, bar_rect.right, bar_rect.bottom),
+                (
+                    anchor_rect.left,
+                    anchor_rect.top,
+                    anchor_rect.right,
+                    anchor_rect.bottom,
+                ),
+                widget_w,
+                widget_h,
+                scale,
+                st.offset_x,
+            );
 
             let light_taskbar = is_light_taskbar();
             let rgb = widget_foreground_rgb(st.battery, st.low_battery_threshold, light_taskbar);
@@ -1312,5 +1402,23 @@ mod tests {
             }
         }
         assert!(bright_pixels > 40, "expected crisp mouse outline pixels");
+    }
+
+    #[test]
+    fn widget_position_anchors_to_chevron_and_honors_x_offset() {
+        // Compact 38px StartAllBack taskbar at 100% DPI with inset `^` chevron child.
+        let bar = (0, 1042, 1920, 1080);
+        let chevron = (1760, 1046, 1784, 1076);
+        let (x0, y0) = compute_widget_position(bar, chevron, 60, 32, 1.0, 0);
+        assert_eq!(x0, 1760 - 60 - 2);
+        assert_eq!(y0, 1045); // vertically centered on chevron (1046 + (30 - 32)/2 = 1045)
+
+        // Positive offset nudges right, negative nudges left, clamped inside bar bounds.
+        let (x_pos, _) = compute_widget_position(bar, chevron, 60, 32, 1.0, 10);
+        assert_eq!(x_pos, x0 + 10);
+        let (x_neg, _) = compute_widget_position(bar, chevron, 60, 32, 1.0, -25);
+        assert_eq!(x_neg, x0 - 25);
+        let (x_clamped, _) = compute_widget_position(bar, chevron, 60, 32, 1.0, 600);
+        assert_eq!(x_clamped, 1920 - 60 - 4);
     }
 }

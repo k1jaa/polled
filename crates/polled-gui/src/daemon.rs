@@ -64,6 +64,58 @@ pub(crate) fn enable_per_monitor_dpi_awareness() {
     }
 }
 
+/// Returns the true monitor DPI scale factor (`1.0` at 96 DPI, `1.25` at 120 DPI, `1.5` at 144 DPI,
+/// etc.) for `hwnd` using `GetDpiForWindow` with fallback to `GetDeviceCaps(LOGPIXELSY)`.
+///
+/// Using real monitor DPI instead of `taskbar_height / 48.0` ensures consistent font & icon sizing
+/// on compact Windows 10, StartAllBack, ExplorerPatcher, and Windhawk taskbars.
+#[cfg(windows)]
+pub(crate) fn window_dpi_scale(hwnd: windows::Win32::Foundation::HWND) -> f32 {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::{PCSTR, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, LOGPIXELSY};
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    type GetDpiForWindowFn = unsafe extern "system" fn(HWND) -> u32;
+
+    if !hwnd.is_invalid() {
+        let user32: Vec<u16> = OsStr::new("user32.dll")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // SAFETY: `user32.dll` is loaded in every Win32 process; `GetDpiForWindow` is available on
+        // Windows 10 1607+ and returns 0 on error.
+        let dpi = unsafe {
+            GetModuleHandleW(PCWSTR(user32.as_ptr()))
+                .ok()
+                .and_then(|hmod| GetProcAddress(hmod, PCSTR(c"GetDpiForWindow".as_ptr().cast())))
+                .map(|proc| {
+                    let func: GetDpiForWindowFn = std::mem::transmute(proc);
+                    func(hwnd)
+                })
+                .unwrap_or(0)
+        };
+        if dpi >= 72 {
+            return (dpi as f32 / 96.0).clamp(0.75, 2.5);
+        }
+    }
+
+    let dc = unsafe { GetDC(None) };
+    if !dc.is_invalid() {
+        let dpi = unsafe { GetDeviceCaps(Some(dc), LOGPIXELSY) };
+        unsafe {
+            let _ = ReleaseDC(None, dc);
+        }
+        if dpi >= 72 {
+            return (dpi as f32 / 96.0).clamp(0.75, 2.5);
+        }
+    }
+    1.0
+}
+
 #[cfg(windows)]
 pub(crate) fn trim_process_working_set() {
     use windows::Win32::System::Memory::{
@@ -236,6 +288,7 @@ mod win32_daemon {
                             &snap,
                             self.settings.alerts.taskbar_battery_widget,
                             self.settings.alerts.clamped_threshold(),
+                            self.settings.alerts.clamped_taskbar_offset_x(),
                         );
                         self.latest_snapshot = Some((*snap).clone());
                         let _ = self.ipc_server.send(DaemonToUiMsg::RuntimeSnapshot(snap));
@@ -487,12 +540,14 @@ mod win32_daemon {
                                 snap,
                                 next,
                                 self.settings.alerts.clamped_threshold(),
+                                self.settings.alerts.clamped_taskbar_offset_x(),
                             );
                         } else {
                             self.taskbar_widget.update(
                                 next,
                                 None,
                                 self.settings.alerts.clamped_threshold(),
+                                self.settings.alerts.clamped_taskbar_offset_x(),
                             );
                         }
                         self.profile_runtime
@@ -543,12 +598,14 @@ mod win32_daemon {
                                     snap,
                                     self.settings.alerts.taskbar_battery_widget,
                                     self.settings.alerts.clamped_threshold(),
+                                    self.settings.alerts.clamped_taskbar_offset_x(),
                                 );
                             } else {
                                 self.taskbar_widget.update(
                                     self.settings.alerts.taskbar_battery_widget,
                                     None,
                                     self.settings.alerts.clamped_threshold(),
+                                    self.settings.alerts.clamped_taskbar_offset_x(),
                                 );
                             }
                         }
@@ -828,6 +885,7 @@ mod win32_daemon {
         let taskbar_widget = TaskbarWidgetController::start(
             settings.alerts.taskbar_battery_widget,
             settings.alerts.clamped_threshold(),
+            settings.alerts.clamped_taskbar_offset_x(),
             Arc::new(move || {
                 let _ = signal_tx_widget.send(DaemonSignal::ShowRequested);
                 wake_widget();

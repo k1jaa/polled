@@ -164,6 +164,10 @@ pub struct TrayAlertConfig {
     /// taskbar beside the tray overflow chevron (zero hooks, auto-hides in fullscreen games).
     #[serde(default)]
     pub taskbar_battery_widget: bool,
+    /// Optional horizontal nudge in logical pixels (`-600..=600`, `0` = automatic) for custom
+    /// taskbars (StartAllBack, ExplorerPatcher, Windhawk, floating docks).
+    #[serde(default)]
+    pub taskbar_widget_offset_x: i32,
     /// Send a Windows toast notification when a wireless mouse drops to or below `low_battery_threshold_pct`.
     #[serde(default = "default_true")]
     pub low_battery_toast: bool,
@@ -197,6 +201,7 @@ impl Default for TrayAlertConfig {
     fn default() -> Self {
         Self {
             taskbar_battery_widget: false,
+            taskbar_widget_offset_x: 0,
             low_battery_toast: true,
             full_battery_toast: true,
             low_battery_threshold_pct: default_low_battery_threshold(),
@@ -211,6 +216,11 @@ impl TrayAlertConfig {
     /// Returns the low-battery alert threshold clamped to a safe `5..=50` percent range.
     pub fn clamped_threshold(&self) -> u8 {
         self.low_battery_threshold_pct.clamp(5, 50)
+    }
+
+    /// Returns the optional taskbar battery widget horizontal offset clamped to `-600..=600` px.
+    pub fn clamped_taskbar_offset_x(&self) -> i32 {
+        self.taskbar_widget_offset_x.clamp(-600, 600)
     }
 
     /// Hysteresis recovery percentage (`threshold + 10%`) before re-arming the low-battery toast.
@@ -349,6 +359,7 @@ mod tests {
             },
             alerts: TrayAlertConfig {
                 taskbar_battery_widget: true,
+                taskbar_widget_offset_x: 12,
                 low_battery_toast: true,
                 full_battery_toast: false,
                 low_battery_threshold_pct: 20,
