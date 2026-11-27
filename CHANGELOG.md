@@ -18,6 +18,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.14.3] - 2026-11-27
+
 ### Added
 - **1-Click SHA-256-Verified In-App Updater (`update.rs`, `main.rs`, `daemon.rs`, `app.rs`):**
   - Added an **Install vX.Y.Z** button in the update banner and **Settings -> Updates** whenever a newer GitHub Release ships both `polled-v*-windows-x64.zip` and `SHA256SUMS.txt`.

@@ -2473,7 +2473,7 @@ dependencies = [
 
 [[package]]
 name = "polled-cli"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "clap",
  "polled-core",
@@ -2482,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "polled-core"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "base64",
  "chrono",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "polled-gui"
-version = "0.14.2"
+version = "0.14.3"
 dependencies = [
  "chrono",
  "eframe",
