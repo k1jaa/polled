@@ -2,8 +2,8 @@
 // Copyright (C) 2026 k1jaa
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Strictly on-demand GitHub Releases update checker backed by native Win32 `WinHTTP`
-//! (zero external HTTP crates, zero background telemetry or startup calls).
+//! On-demand (and optional opt-in startup) GitHub Releases update checker backed by native
+//! Win32 `WinHTTP` (zero external HTTP crates, zero telemetry, offline by default).
 
 use serde::{Deserialize, Serialize};
 
@@ -102,7 +102,8 @@ pub fn parse_github_release_json(
 
 /// Queries GitHub Releases API once over TLS (`WinHTTP`) to compare against `CARGO_PKG_VERSION`.
 ///
-/// Only ever invoked when the user explicitly clicks **Check for Updates** or passes `--check-update`.
+/// Only invoked when the user explicitly clicks **Check for Updates**, passes `--check-update`,
+/// or opts in to **Check for updates once on startup** in Settings.
 pub fn check_latest_github_release() -> Result<UpdateCheckResult> {
     #[cfg(windows)]
     {

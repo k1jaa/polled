@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use polled_core::{HotkeyConfig, MouseSettings, ScanSummary};
+use polled_core::{HotkeyConfig, MouseSettings, ScanSummary, UpdateCheckResult};
 use serde::{Deserialize, Serialize};
 
 use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeSnapshot};
@@ -32,6 +32,7 @@ pub enum UiToDaemonMsg {
     UpdateThemeDark(bool),
     ShowOsdPill { title: String, subtitle: String },
     SyncScanSummary(ScanSummary),
+    SyncUpdateCheck(UpdateCheckResult),
     RequestQuitDaemon,
 }
 
@@ -40,6 +41,7 @@ pub enum UiToDaemonMsg {
 pub enum DaemonToUiMsg {
     RuntimeSnapshot(Box<ProfileRuntimeSnapshot>),
     CachedScanSummary(ScanSummary),
+    CachedUpdateCheck(UpdateCheckResult),
     TraySyncAutoSwitch(bool),
     ReadFromMouseFinished {
         device_name: Option<String>,

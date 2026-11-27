@@ -9,7 +9,7 @@ use std::time::Duration;
 use notify_rust::Notification;
 use polled_core::checks::state::PolledState;
 use polled_core::win::{SystemEnv, WindowsEnv};
-use polled_core::{AppPaths, HealthEngine, ScanSummary};
+use polled_core::{AppPaths, HealthEngine, ScanSummary, UpdateCheckResult};
 
 use crate::app::WorkerMsg;
 
@@ -71,6 +71,16 @@ pub fn notify_profile_switched(profile_name: &str, details: &str) {
     } else {
         details.to_string()
     };
+    let _ = Notification::new().summary(&title).body(&body).show();
+}
+
+/// Sends a one-shot Windows notification when an opt-in startup update check finds a newer release.
+pub fn notify_update_available(info: &UpdateCheckResult) {
+    let title = format!("Polled v{} available", info.latest_version);
+    let body = format!(
+        "You are running v{}. Open Polled -> Settings to view release notes and download.",
+        info.current_version
+    );
     let _ = Notification::new().summary(&title).body(&body).show();
 }
 

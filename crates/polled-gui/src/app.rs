@@ -23,7 +23,9 @@ use crate::hotkeys::{HotkeyAction, HotkeyManager};
 use crate::input_lab_ui::{InputLabNavAction, InputLabUiState};
 use crate::ipc::{DaemonToUiMsg, IpcClient, UiToDaemonMsg};
 use crate::keyboard_ui::KeyboardUiState;
-use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
+use crate::notifications::{
+    notify_if_regressed, notify_update_available, spawn_windows_build_watcher,
+};
 use crate::osd::OsdController;
 use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
 use crate::profiles_ui::ProfilesUiState;
@@ -261,6 +263,7 @@ pub(crate) enum WorkerMsg {
     },
     UpdateCheckFinished(Result<UpdateCheckResult, String>),
     DaemonCachedScan(ScanSummary),
+    DaemonCachedUpdate(UpdateCheckResult),
     DaemonFocusWindow,
     DaemonShutdownUi,
 }
@@ -301,6 +304,7 @@ pub struct PolledApp {
     setup_backup_error: Option<String>,
     update_checking: bool,
     update_result: Option<Result<UpdateCheckResult, String>>,
+    update_banner_dismissed: bool,
     custom_tweak_draft: CustomTweakDraft,
 
     profiles_ui: ProfilesUiState,
@@ -349,6 +353,7 @@ impl PolledApp {
                 let worker_msg = match msg {
                     DaemonToUiMsg::RuntimeSnapshot(snap) => WorkerMsg::ProfileRuntimeUpdated(snap),
                     DaemonToUiMsg::CachedScanSummary(scan) => WorkerMsg::DaemonCachedScan(scan),
+                    DaemonToUiMsg::CachedUpdateCheck(info) => WorkerMsg::DaemonCachedUpdate(info),
                     DaemonToUiMsg::TraySyncAutoSwitch(enabled) => {
                         WorkerMsg::TraySyncAutoSwitch(enabled)
                     }
@@ -440,6 +445,7 @@ impl PolledApp {
             setup_backup_error: None,
             update_checking: false,
             update_result: None,
+            update_banner_dismissed: false,
             custom_tweak_draft: CustomTweakDraft::default(),
             profiles_ui,
             profile_runtime,
@@ -554,6 +560,7 @@ impl PolledApp {
             setup_backup_error: None,
             update_checking: false,
             update_result: None,
+            update_banner_dismissed: false,
             custom_tweak_draft: CustomTweakDraft::default(),
             profiles_ui,
             profile_runtime,
@@ -574,6 +581,9 @@ impl PolledApp {
         };
 
         app.start_scan(&cc.egui_ctx, true);
+        if app.settings.check_updates_on_startup {
+            app.start_update_check(&cc.egui_ctx, true, true);
+        }
         app
     }
 
@@ -614,6 +624,51 @@ impl PolledApp {
         if let AppHost::Remote { ipc } = &self.host {
             ipc.send(UiToDaemonMsg::SyncScanSummary(summary.clone()));
         }
+    }
+
+    fn sync_update_to_host(&self, info: &UpdateCheckResult) {
+        if let AppHost::Remote { ipc } = &self.host {
+            ipc.send(UiToDaemonMsg::SyncUpdateCheck(info.clone()));
+        }
+    }
+
+    fn available_update(&self) -> Option<&UpdateCheckResult> {
+        self.update_result
+            .as_ref()
+            .and_then(|res| res.as_ref().ok())
+            .filter(|info| info.update_available)
+    }
+
+    fn start_update_check(&mut self, ctx: &egui::Context, silent_errors: bool, notify_toast: bool) {
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        if !silent_errors {
+            self.update_result = None;
+        }
+        let tx = self.tx.clone();
+        let ctx_bg = ctx.clone();
+        std::thread::spawn(move || {
+            let res = check_latest_github_release().map_err(|e| e.to_string());
+            match res {
+                Ok(info) => {
+                    if notify_toast && info.update_available {
+                        notify_update_available(&info);
+                    }
+                    let _ = tx.send(WorkerMsg::UpdateCheckFinished(Ok(info)));
+                }
+                Err(err) => {
+                    if !silent_errors {
+                        let _ = tx.send(WorkerMsg::UpdateCheckFinished(Err(err)));
+                    } else {
+                        // Silently clear `update_checking` without overwriting any previous state.
+                        let _ = tx.send(WorkerMsg::UpdateCheckFinished(Err(String::new())));
+                    }
+                }
+            }
+            ctx_bg.request_repaint();
+        });
     }
 
     fn start_scan(&mut self, ctx: &egui::Context, notify_regressions: bool) {
@@ -1135,12 +1190,27 @@ impl PolledApp {
                 }
                 WorkerMsg::UpdateCheckFinished(res) => {
                     self.update_checking = false;
-                    self.update_result = Some(res);
+                    match res {
+                        Ok(info) => {
+                            self.sync_update_to_host(&info);
+                            self.update_result = Some(Ok(info));
+                        }
+                        Err(err) if err.is_empty() => {
+                            // Silent startup check failure (e.g. offline boot) — ignore quietly.
+                        }
+                        Err(err) => {
+                            self.update_result = Some(Err(err));
+                        }
+                    }
                 }
                 WorkerMsg::DaemonCachedScan(scan) => {
                     if self.summary.is_none() {
                         self.summary = Some(scan);
                     }
+                }
+                WorkerMsg::DaemonCachedUpdate(info) => {
+                    self.update_checking = false;
+                    self.update_result = Some(Ok(info));
                 }
                 WorkerMsg::DaemonFocusWindow => {
                     crate::tray::show_and_focus(&self.main_hwnd, ctx);
@@ -1516,8 +1586,11 @@ impl eframe::App for PolledApp {
                         if nav_utility_item(ui, p, self.theme.label(), None) {
                             toggle_theme = true;
                         }
-                        let settings_badge =
-                            self.settings.hotkeys.enabled.then_some(("HK", p.info));
+                        let settings_badge = if self.available_update().is_some() {
+                            Some(("NEW", p.info))
+                        } else {
+                            self.settings.hotkeys.enabled.then_some(("HK", p.info))
+                        };
                         if nav_utility_item(ui, p, "Settings", settings_badge) {
                             self.hotkeys_modal_open = true;
                         }
@@ -1545,6 +1618,61 @@ impl eframe::App for PolledApp {
             .show(ctx, |ui| {
                 let content_w = ui.available_width().max(320.0);
                 ui.set_max_width(content_w);
+
+                if let Some(upd) = self.available_update().cloned() {
+                    if !self.update_banner_dismissed {
+                        let mut open_release = false;
+                        let mut open_settings = false;
+                        let mut dismiss_banner = false;
+                        banner_frame(ui, p, content_w, Some(p.info), mode, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.add(ghost_button("Dismiss", p)).clicked() {
+                                            dismiss_banner = true;
+                                        }
+                                        if ui.add(secondary_button("Notes", p)).clicked() {
+                                            open_settings = true;
+                                        }
+                                        if ui.add(primary_button("Open Release", p)).clicked() {
+                                            open_release = true;
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(format!(
+                                                            "Polled v{} is available (current v{}).",
+                                                            upd.latest_version, upd.current_version
+                                                        ))
+                                                        .size(12.0)
+                                                        .strong()
+                                                        .color(p.text),
+                                                    )
+                                                    .wrap(),
+                                                );
+                                            },
+                                        );
+                                    },
+                                );
+                            });
+                        });
+                        ui.add_space(10.0);
+                        if open_release {
+                            let _ = std::process::Command::new("cmd")
+                                .args(["/C", "start", "", &upd.release_url])
+                                .spawn();
+                        }
+                        if open_settings {
+                            self.hotkeys_modal_open = true;
+                        }
+                        if dismiss_banner {
+                            self.update_banner_dismissed = true;
+                        }
+                    }
+                }
 
                 if self.active_view == ActiveView::Profiles {
                     self.profiles_ui.render(
@@ -2763,7 +2891,7 @@ impl eframe::App for PolledApp {
                     ui.add_space(8.0);
 
                     ui.label(
-                        RichText::new("UPDATES (STRICTLY ON-DEMAND)")
+                        RichText::new("UPDATES")
                             .size(10.5)
                             .strong()
                             .color(p.text_muted),
@@ -2772,7 +2900,7 @@ impl eframe::App for PolledApp {
                     ui.add(
                         egui::Label::new(
                             RichText::new(format!(
-                                "Current version: v{}. Polled never phones home — update checks only query GitHub Releases when you click Check Now.",
+                                "Current version: v{}. Polled stays offline by default — checks only query GitHub Releases when you click Check for Updates or opt in below.",
                                 env!("CARGO_PKG_VERSION")
                             ))
                             .size(11.5)
@@ -2781,6 +2909,15 @@ impl eframe::App for PolledApp {
                         .wrap(),
                     );
                     ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut self.settings.check_updates_on_startup,
+                        "Check for updates once on startup (opt-in)",
+                    )
+                    .on_hover_text(
+                        "Queries GitHub Releases once when Polled launches and shows a quiet banner/notification if a newer version is available. Off by default; never downloads or installs automatically.",
+                    );
+                    ui.add_space(6.0);
+                    let mut check_updates_clicked = false;
                     ui.horizontal_wrapped(|ui| {
                         let check_lbl = if self.update_checking {
                             "Checking GitHub..."
@@ -2791,16 +2928,7 @@ impl eframe::App for PolledApp {
                             .add_enabled(!self.update_checking, secondary_button(check_lbl, p))
                             .clicked()
                         {
-                            self.update_checking = true;
-                            self.update_result = None;
-                            let tx = self.tx.clone();
-                            let ctx_bg = ctx.clone();
-                            std::thread::spawn(move || {
-                                let res =
-                                    check_latest_github_release().map_err(|e| e.to_string());
-                                let _ = tx.send(WorkerMsg::UpdateCheckFinished(res));
-                                ctx_bg.request_repaint();
-                            });
+                            check_updates_clicked = true;
                         }
                         let open_url = match &self.update_result {
                             Some(Ok(info)) => info.release_url.clone(),
@@ -2812,6 +2940,10 @@ impl eframe::App for PolledApp {
                                 .spawn();
                         }
                     });
+                    if check_updates_clicked {
+                        self.update_banner_dismissed = false;
+                        self.start_update_check(ctx, false, false);
+                    }
                     if let Some(res) = &self.update_result {
                         ui.add_space(6.0);
                         match res {
@@ -2906,8 +3038,14 @@ impl eframe::App for PolledApp {
                         self.settings.audio_cycle_device_ids.clone(),
                     ));
                 self.sync_tray_from_snapshot();
+                if self.settings.check_updates_on_startup
+                    && self.update_result.is_none()
+                    && !self.update_checking
+                {
+                    self.start_update_check(ctx, true, false);
+                }
                 self.status_message =
-                    Some("Saved tray, notification, and global hotkey settings.".to_string());
+                    Some("Saved tray, notification, hotkey, and update settings.".to_string());
                 self.hotkeys_modal_open = false;
             } else if close_hk {
                 self.hotkeys_modal_open = false;

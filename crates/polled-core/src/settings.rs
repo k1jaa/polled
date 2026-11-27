@@ -234,6 +234,10 @@ pub struct AppSettings {
     /// skipping unused HDMI monitor audio outputs). Empty = cycle all active playback devices.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio_cycle_device_ids: Vec<String>,
+    /// Opt-in startup update check (`false` by default so Polled stays 100% offline unless enabled).
+    /// When enabled, Polled queries GitHub Releases once on launch and notifies if a newer version is out.
+    #[serde(default)]
+    pub check_updates_on_startup: bool,
 }
 
 fn default_schema_version() -> u32 {
@@ -249,6 +253,7 @@ impl Default for AppSettings {
             hotkeys: HotkeyConfig::default(),
             alerts: TrayAlertConfig::default(),
             audio_cycle_device_ids: Vec::new(),
+            check_updates_on_startup: false,
         }
     }
 }
@@ -354,17 +359,20 @@ mod tests {
                 "{0.0.0.00000000}.{headset-guid}".to_string(),
                 "{0.0.0.00000000}.{speakers-guid}".to_string(),
             ],
+            check_updates_on_startup: true,
         };
         custom.save_atomic(&path).unwrap();
         assert_eq!(AppSettings::load_or_default(&path), custom);
+        assert!(AppSettings::load_or_default(&path).check_updates_on_startup);
         assert_eq!(custom.alerts.clamped_threshold(), 20);
         assert_eq!(custom.alerts.reset_threshold(), 30);
 
-        // Legacy settings.json without `alerts` still deserializes cleanly with defaults.
+        // Legacy settings.json without `alerts` or `check_updates_on_startup` still deserializes cleanly with defaults.
         let legacy_json = r#"{"schema_version":1,"theme":"dark","auto_switch_on_startup":true}"#;
         fs::write(&path, legacy_json).unwrap();
         let loaded_legacy = AppSettings::load_or_default(&path);
         assert!(loaded_legacy.auto_switch_on_startup);
+        assert!(!loaded_legacy.check_updates_on_startup);
         assert_eq!(loaded_legacy.alerts, TrayAlertConfig::default());
         assert_eq!(
             custom.hotkeys.cycle_profile.as_ref().unwrap().win32_vk(),

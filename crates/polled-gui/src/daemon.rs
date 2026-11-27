@@ -54,7 +54,10 @@ mod win32_daemon {
     use std::time::{Duration, Instant};
 
     use polled_core::win::WindowsEnv;
-    use polled_core::{AppPaths, AppSettings, HealthEngine, ProfileStore, ScanSummary};
+    use polled_core::{
+        check_latest_github_release, AppPaths, AppSettings, HealthEngine, ProfileStore,
+        ScanSummary, UpdateCheckResult,
+    };
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -68,7 +71,9 @@ mod win32_daemon {
     use crate::app::WorkerMsg;
     use crate::hotkeys::{HotkeyAction, HotkeyManager};
     use crate::ipc::{DaemonToUiMsg, IpcServer, IpcServerEvent, UiToDaemonMsg};
-    use crate::notifications::{notify_if_regressed, spawn_windows_build_watcher};
+    use crate::notifications::{
+        notify_if_regressed, notify_update_available, spawn_windows_build_watcher,
+    };
     use crate::osd::OsdController;
     use crate::profile_runtime::{ProfileRuntimeCmd, ProfileRuntimeHandle, ProfileRuntimeSnapshot};
     use crate::single_instance::{InstanceLock, SingleInstanceGuard};
@@ -90,6 +95,7 @@ mod win32_daemon {
         profile_locked: bool,
         latest_snapshot: Option<ProfileRuntimeSnapshot>,
         latest_scan: Option<ScanSummary>,
+        latest_update: Option<UpdateCheckResult>,
         pending_open_bench: bool,
         pending_focus_on_connect: bool,
         trimmed_after_boot: bool,
@@ -142,6 +148,11 @@ mod win32_daemon {
                             let _ = self
                                 .ipc_server
                                 .send(DaemonToUiMsg::CachedScanSummary(scan.clone()));
+                        }
+                        if let Some(update) = &self.latest_update {
+                            let _ = self
+                                .ipc_server
+                                .send(DaemonToUiMsg::CachedUpdateCheck(update.clone()));
                         }
                         if self.pending_focus_on_connect {
                             self.pending_focus_on_connect = false;
@@ -272,12 +283,20 @@ mod win32_daemon {
                             .ipc_server
                             .send(DaemonToUiMsg::TraySyncAutoSwitch(enabled));
                     }
+                    WorkerMsg::UpdateCheckFinished(Ok(info)) => {
+                        if info.update_available {
+                            notify_update_available(&info);
+                        }
+                        self.latest_update = Some(info.clone());
+                        let _ = self.ipc_server.send(DaemonToUiMsg::CachedUpdateCheck(info));
+                    }
                     WorkerMsg::ActionFinished { .. }
-                    | WorkerMsg::UpdateCheckFinished(_)
+                    | WorkerMsg::UpdateCheckFinished(Err(_))
                     | WorkerMsg::TrayAction(_)
                     | WorkerMsg::DaemonFocusWindow
                     | WorkerMsg::DaemonShutdownUi
-                    | WorkerMsg::DaemonCachedScan(_) => {}
+                    | WorkerMsg::DaemonCachedScan(_)
+                    | WorkerMsg::DaemonCachedUpdate(_) => {}
                 }
             }
 
@@ -396,6 +415,9 @@ mod win32_daemon {
                     }
                     UiToDaemonMsg::SyncScanSummary(summary) => {
                         self.latest_scan = Some(summary);
+                    }
+                    UiToDaemonMsg::SyncUpdateCheck(info) => {
+                        self.latest_update = Some(info);
                     }
                     UiToDaemonMsg::RequestQuitDaemon => {
                         self.begin_shutdown();
@@ -654,6 +676,25 @@ mod win32_daemon {
 
         spawn_windows_build_watcher(worker_tx.clone(), Arc::clone(&wake));
 
+        if settings.check_updates_on_startup {
+            let tx_upd = worker_tx.clone();
+            let wake_upd = Arc::clone(&wake);
+            let delay = if start_minimized {
+                Duration::from_secs(4)
+            } else {
+                Duration::ZERO
+            };
+            std::thread::spawn(move || {
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                if let Ok(info) = check_latest_github_release() {
+                    let _ = tx_upd.send(WorkerMsg::UpdateCheckFinished(Ok(info)));
+                    wake_upd();
+                }
+            });
+        }
+
         let auto_switch_enabled = settings.auto_switch_on_startup;
         let mut state = DaemonState {
             hwnd,
@@ -664,6 +705,7 @@ mod win32_daemon {
             profile_locked: false,
             latest_snapshot: None,
             latest_scan: None,
+            latest_update: None,
             pending_open_bench: false,
             pending_focus_on_connect: false,
             trimmed_after_boot: false,
